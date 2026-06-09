@@ -2817,10 +2817,18 @@ def _run_certify_checks(
         x = torch.randn(1, T, cfg.n_embd, device=device, dtype=dtype, requires_grad=True)
         y = block(x, cos_sin, None)
         worst = 0.0
+        past_signal = 0.0
         for t in (0, T // 2, T - 2):
-            (g,) = torch.autograd.grad(y[0, t].sum(), x, retain_graph=True)
+            (g,) = torch.autograd.grad(y[0, t].sum(), x, retain_graph=True, allow_unused=True)
+            if g is None:
+                continue  # no dependence on x at all: past_signal stays 0 -> vacuity guard trips below
             if t + 1 < T:
                 worst = max(worst, float(g[0, t + 1 :].abs().max()))
+            past_signal = max(past_signal, float(g[0, : t + 1].abs().max()))
+        if past_signal == 0.0:
+            # Vacuity guard: an output that depends on NO input would trivially satisfy
+            # the future-gradient condition. That is a broken mechanism, not a causal one.
+            return float("inf")
         return worst
 
     for mech in mechanisms:
@@ -2830,7 +2838,10 @@ def _run_certify_checks(
             "causality",
             lambda m=mech: causality_measure(m),
             tolerance=1e-12,
-            detail="max |d y[t] / d x[t+k]| over t in {0, T/2, T-2}, k >= 1 (must be exactly 0)",
+            detail=(
+                "max |d y[t] / d x[t+k]| over t in {0, T/2, T-2}, k >= 1 (must be exactly 0); "
+                "inf = vacuity guard tripped (output has no input dependence at all)"
+            ),
         )
 
     # ----- standard: scaffolding invariants -----
