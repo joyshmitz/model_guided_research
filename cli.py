@@ -2672,5 +2672,817 @@ def regressions(
             raise typer.Exit(code=1)
 
 
+# ---------------------------------------------------------------------------
+# mgr certify — per-mechanism mathematical invariant checks (br: model_guided_research-5ki.1)
+#
+# Verifies each nanochat attention mechanism's DEFINING mathematical invariant
+# directly against the production torch modules, with dtype-aware tolerances.
+# The shared causality certificate (no gradient flow from the future) runs for
+# every mechanism. Exit code is nonzero if any check fails.
+# ---------------------------------------------------------------------------
+
+_CERTIFY_MECHANISMS: list[str] = [
+    "standard",
+    "tropical",
+    "ultrametric",
+    "simplicial",
+    "quaternion",
+    "braid",
+    "fractal",
+    "octonion",
+    "surreal",
+    "reversible",
+    "gauge",
+]
+
+
+def _certify_tiny_config(mechanism: str):
+    """Build a tiny GPTConfig for `mechanism` satisfying its structural constraints."""
+    from nanochat.gpt import GPTConfig
+
+    kwargs: dict[str, Any] = dict(
+        sequence_len=64,
+        vocab_size=128,
+        n_layer=1,
+        n_head=2,
+        n_kv_head=2,
+        n_embd=64,  # head_dim = 32: divisible by 4 (quaternion) and 8 (octonion), even (RoPE/gauge)
+        attention_type=mechanism,
+    )
+    if mechanism == "reversible":
+        # Sub-attention gets n_head//2 = 1 query head; n_kv_head must divide it.
+        kwargs["n_kv_head"] = 1
+    if mechanism == "tropical":
+        kwargs["tropical_record_margins"] = True
+    return GPTConfig(**kwargs)
+
+
+def _certify_cos_sin(T: int, head_dim: int, device: Any, dtype: Any) -> tuple[Any, Any]:
+    """Rotary cos/sin matching GPT._precompute_rotary_embeddings, in the requested dtype."""
+    import torch
+
+    channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+    inv_freq = 1.0 / (10000 ** (channel_range / head_dim))
+    t = torch.arange(T, dtype=torch.float32, device=device)
+    freqs = torch.outer(t, inv_freq)
+    cos, sin = freqs.cos().to(dtype), freqs.sin().to(dtype)
+    return cos[None, :, None, :], sin[None, :, None, :]
+
+
+def _run_certify_checks(
+    mechanisms: list[str],
+    *,
+    device_str: str = "cpu",
+    dtype_str: str = "fp32",
+    seed: int = 42,
+) -> list[dict[str, Any]]:
+    """
+    Run the invariant checks for the requested mechanisms and return one record per
+    check: {mechanism, check, family, status, measured, tolerance, comparator,
+    duration_ms, detail}. status is "pass" | "fail" | "error".
+
+    Pass criterion: measured <= tolerance (comparator "le", default) or
+    measured >= tolerance (comparator "ge", used for separation witnesses that
+    must be bounded AWAY from zero, e.g. octonion non-associativity).
+    """
+    import copy
+
+    import torch
+
+    from nanochat.gpt import Block
+    from nanochat.model_utils import apply_rotary_emb, causal_attn_mask
+    from nanochat.model_utils import norm as rmsnorm
+
+    device = torch.device(device_str)
+    if dtype_str not in {"fp32", "bf16"}:
+        raise ValueError(f"dtype must be 'fp32' or 'bf16', got {dtype_str!r}")
+    dtype = torch.float32 if dtype_str == "fp32" else torch.bfloat16
+
+    def fp_tol(base: float) -> float:
+        # bf16 has ~8 bits of mantissa; loosen float-comparison tolerances accordingly.
+        return base if dtype_str == "fp32" else max(base * 512.0, 5e-2)
+
+    checks: list[dict[str, Any]] = []
+
+    def add_check(
+        mechanism: str,
+        name: str,
+        family: str,
+        fn: Any,
+        *,
+        tolerance: float,
+        comparator: str = "le",
+        detail: str = "",
+    ) -> None:
+        t0 = time.perf_counter()
+        try:
+            measured = float(fn())
+            if comparator == "le":
+                status = "pass" if measured <= tolerance else "fail"
+            else:
+                status = "pass" if measured >= tolerance else "fail"
+            error = None
+        except Exception as exc:  # noqa: BLE001 - report, don't crash the suite
+            measured = float("nan")
+            status = "error"
+            error = f"{type(exc).__name__}: {exc}"
+        duration_ms = (time.perf_counter() - t0) * 1000.0
+        checks.append(
+            {
+                "mechanism": mechanism,
+                "check": name,
+                "family": family,
+                "status": status,
+                "measured": measured,
+                "tolerance": tolerance,
+                "comparator": comparator,
+                "duration_ms": round(duration_ms, 3),
+                "detail": detail if error is None else f"{detail} [{error}]".strip(),
+            }
+        )
+
+    def make_block(mechanism: str) -> Any:
+        torch.manual_seed(seed)
+        cfg = _certify_tiny_config(mechanism)
+        block = Block(cfg, 0).to(device=device, dtype=dtype)
+        block.eval()
+        return block, cfg
+
+    # ----- shared causality certificate (the single most important check) -----
+    def causality_measure(mechanism: str) -> float:
+        block, cfg = make_block(mechanism)
+        T = 8
+        head_dim = cfg.n_embd // cfg.n_head
+        cos_sin = _certify_cos_sin(T, head_dim, device, dtype)
+        x = torch.randn(1, T, cfg.n_embd, device=device, dtype=dtype, requires_grad=True)
+        y = block(x, cos_sin, None)
+        worst = 0.0
+        for t in (0, T // 2, T - 2):
+            (g,) = torch.autograd.grad(y[0, t].sum(), x, retain_graph=True)
+            if t + 1 < T:
+                worst = max(worst, float(g[0, t + 1 :].abs().max()))
+        return worst
+
+    for mech in mechanisms:
+        add_check(
+            mech,
+            "causality_no_future_grad",
+            "causality",
+            lambda m=mech: causality_measure(m),
+            tolerance=1e-12,
+            detail="max |d y[t] / d x[t+k]| over t in {0, T/2, T-2}, k >= 1 (must be exactly 0)",
+        )
+
+    # ----- standard: scaffolding invariants -----
+    if "standard" in mechanisms:
+
+        def rope_norm_measure() -> float:
+            torch.manual_seed(seed)
+            T, H, D = 8, 2, 32
+            cos, sin = _certify_cos_sin(T, D, device, torch.float32)
+            x = torch.randn(1, T, H, D, device=device)
+            y = apply_rotary_emb(x, cos, sin)
+            d = D // 2
+            pn_in = torch.sqrt(x[..., :d] ** 2 + x[..., d:] ** 2)
+            pn_out = torch.sqrt(y[..., :d] ** 2 + y[..., d:] ** 2)
+            return float((pn_in - pn_out).abs().max())
+
+        def mask_structure_measure() -> float:
+            mismatches = 0
+            m = causal_attn_mask(8, 8, device=device)
+            mismatches += int((m != torch.tril(torch.ones(8, 8, dtype=torch.bool, device=device))).sum())
+            m = causal_attn_mask(1, 9, device=device)
+            mismatches += int((~m).sum())
+            m = causal_attn_mask(4, 12, device=device)
+            expect = torch.zeros(4, 12, dtype=torch.bool, device=device)
+            expect[:, :8] = True
+            expect[:, 8:] = torch.tril(torch.ones(4, 4, dtype=torch.bool, device=device))
+            mismatches += int((m != expect).sum())
+            return float(mismatches)
+
+        def rmsnorm_measure() -> float:
+            torch.manual_seed(seed)
+            x = torch.randn(4, 8, 64, device=device)
+            y = rmsnorm(x)
+            rms = torch.sqrt((y**2).mean(dim=-1))
+            return float((rms - 1.0).abs().max())
+
+        def softmax_rows_measure() -> float:
+            torch.manual_seed(seed)
+            scores = torch.randn(1, 2, 8, 8, device=device)
+            scores = scores.masked_fill(~causal_attn_mask(8, 8, device=device), float("-inf"))
+            p = torch.softmax(scores, dim=-1)
+            return float((p.sum(dim=-1) - 1.0).abs().max())
+
+        add_check("standard", "rope_pairwise_norm_preservation", "classical", rope_norm_measure, tolerance=1e-5)
+        add_check(
+            "standard",
+            "causal_mask_structure",
+            "classical",
+            mask_structure_measure,
+            tolerance=0.0,
+            detail="mismatch count vs spec across train/decode/chunk regimes",
+        )
+        add_check("standard", "rmsnorm_unit_rms", "classical", rmsnorm_measure, tolerance=1e-3)
+        add_check("standard", "softmax_row_stochastic", "classical", softmax_rows_measure, tolerance=1e-6)
+
+    # ----- tropical: 1-Lipschitz, gauge invariance, margin consistency -----
+    if "tropical" in mechanisms:
+        from nanochat.tropical_attention_torch import tropical_max_plus_attention
+
+        def _trop_inputs():
+            torch.manual_seed(seed)
+            q = torch.randn(1, 2, 8, 32, device=device)
+            k = torch.randn(1, 2, 8, 32, device=device)
+            v = torch.randn(1, 2, 8, 32, device=device)
+            return q, k, v
+
+        def trop_lipschitz_measure(which: str) -> float:
+            q, k, v = _trop_inputs()
+            eps = 0.123
+            y0, _ = tropical_max_plus_attention(q, k, v, gauge_fix=False, score_center=False, return_margins=False)
+            delta = torch.empty_like(q if which == "q" else v).uniform_(-eps, eps)
+            if which == "q":
+                y1, _ = tropical_max_plus_attention(
+                    q + delta, k, v, gauge_fix=False, score_center=False, return_margins=False
+                )
+            else:
+                y1, _ = tropical_max_plus_attention(
+                    q, k, v + delta, gauge_fix=False, score_center=False, return_margins=False
+                )
+            return float((y1 - y0).abs().max() / eps)
+
+        def trop_center_invariance_measure() -> float:
+            q, k, v = _trop_inputs()
+            y0, _ = tropical_max_plus_attention(q, k, v, gauge_fix=False, score_center=False, return_margins=False)
+            y1, _ = tropical_max_plus_attention(q, k, v, gauge_fix=False, score_center=True, return_margins=False)
+            diff = y1 - y0  # must be constant across the feature dim (a pure per-query gauge shift)
+            spread = diff.amax(dim=-1) - diff.amin(dim=-1)
+            return float(spread.abs().max())
+
+        def trop_margin_measure() -> float:
+            q, k, v = _trop_inputs()
+            _, gamma = tropical_max_plus_attention(q, k, v, gauge_fix=False, score_center=False, return_margins=True)
+            if gamma is None:
+                raise RuntimeError("tropical_max_plus_attention returned no margins despite return_margins=True")
+            scores = torch.max(q.unsqueeze(3) + k.unsqueeze(2), dim=-1).values
+            scores = scores.masked_fill(~causal_attn_mask(8, 8, device=device), float("-inf"))
+            logits = scores.unsqueeze(-1) + v.unsqueeze(2)
+            srt, _ = torch.sort(logits, dim=3, descending=True)
+            gamma_bf = (srt[..., 0, :] - srt[..., 1, :]).amin(dim=-1)
+            both_finite = torch.isfinite(gamma) & torch.isfinite(gamma_bf)
+            inf_mismatch = float((torch.isfinite(gamma) != torch.isfinite(gamma_bf)).sum())
+            max_diff = float((gamma - gamma_bf).abs().masked_fill(~both_finite, 0.0).max())
+            return max_diff + inf_mismatch
+
+        add_check(
+            "tropical",
+            "lipschitz_1_sup_norm_q",
+            "classical",
+            lambda: trop_lipschitz_measure("q"),
+            tolerance=1.0 + 1e-6,
+            detail="sup-norm output change / eps under q-perturbation",
+        )
+        add_check(
+            "tropical",
+            "lipschitz_1_sup_norm_v",
+            "classical",
+            lambda: trop_lipschitz_measure("v"),
+            tolerance=1.0 + 1e-6,
+            detail="sup-norm output change / eps under v-perturbation",
+        )
+        add_check(
+            "tropical",
+            "score_center_pure_gauge_shift",
+            "classical",
+            trop_center_invariance_measure,
+            tolerance=1e-5,
+            detail="centering must shift outputs by a per-query constant only",
+        )
+        add_check(
+            "tropical",
+            "margin_matches_bruteforce",
+            "classical",
+            trop_margin_measure,
+            tolerance=1e-6,
+            detail="recorded gamma vs sort-based runner-up gap (+ count of inf mismatches)",
+        )
+
+    # ----- quaternion: algebra laws + rotor norm preservation (fp64) -----
+    if "quaternion" in mechanisms:
+        from nanochat.quaternion_attention_torch import qconj, qmul, qnormalize
+
+        def _quats() -> tuple[Any, Any, Any]:
+            torch.manual_seed(seed)
+            a = torch.randn(512, 4, dtype=torch.float64, device=device)
+            b = torch.randn(512, 4, dtype=torch.float64, device=device)
+            c = torch.randn(512, 4, dtype=torch.float64, device=device)
+            return a, b, c
+
+        def q_assoc_measure() -> float:
+            a, b, c = _quats()
+            return float((qmul(qmul(a, b), c) - qmul(a, qmul(b, c))).abs().max())
+
+        def q_norm_mult_measure() -> float:
+            a, b, _ = _quats()
+            lhs = qmul(a, b).norm(dim=-1)
+            return float((lhs - a.norm(dim=-1) * b.norm(dim=-1)).abs().max())
+
+        def q_conj_antihom_measure() -> float:
+            a, b, _ = _quats()
+            return float((qconj(qmul(a, b)) - qmul(qconj(b), qconj(a))).abs().max())
+
+        def q_rotor_norm_measure() -> float:
+            a, b, _ = _quats()
+            rotor = qnormalize(a)
+            return float((qmul(rotor, b).norm(dim=-1) - b.norm(dim=-1)).abs().max())
+
+        add_check("quaternion", "qmul_associativity", "classical", q_assoc_measure, tolerance=1e-10)
+        add_check("quaternion", "qmul_norm_multiplicative", "classical", q_norm_mult_measure, tolerance=1e-10)
+        add_check("quaternion", "qconj_antihomomorphism", "classical", q_conj_antihom_measure, tolerance=1e-10)
+        add_check("quaternion", "rotor_norm_preservation", "classical", q_rotor_norm_measure, tolerance=1e-10)
+
+    # ----- octonion: division-algebra laws + non-associativity witness (fp64) -----
+    if "octonion" in mechanisms:
+        from nanochat.octonion_attention_torch import oconj, omul
+
+        def _octs() -> tuple[Any, Any, Any]:
+            torch.manual_seed(seed)
+            a = torch.randn(512, 8, dtype=torch.float64, device=device)
+            b = torch.randn(512, 8, dtype=torch.float64, device=device)
+            c = torch.randn(512, 8, dtype=torch.float64, device=device)
+            return a, b, c
+
+        def o_norm_mult_measure() -> float:
+            a, b, _ = _octs()
+            return float((omul(a, b).norm(dim=-1) - a.norm(dim=-1) * b.norm(dim=-1)).abs().max())
+
+        def o_alternativity_measure() -> float:
+            a, b, _ = _octs()
+            left = (omul(a, omul(a, b)) - omul(omul(a, a), b)).abs().max()
+            right = (omul(omul(b, a), a) - omul(b, omul(a, a))).abs().max()
+            return float(torch.maximum(left, right))
+
+        def o_nonassoc_witness_measure() -> float:
+            a, b, c = _octs()
+            return float((omul(omul(a, b), c) - omul(a, omul(b, c))).abs().max())
+
+        def o_conj_scalar_measure() -> float:
+            a, _, _ = _octs()
+            prod = omul(a, oconj(a))
+            scalar_err = (prod[..., 0] - a.norm(dim=-1) ** 2).abs().max()
+            imag_err = prod[..., 1:].abs().max()
+            return float(torch.maximum(scalar_err, imag_err))
+
+        add_check("octonion", "omul_norm_multiplicative", "classical", o_norm_mult_measure, tolerance=1e-9)
+        add_check("octonion", "omul_alternativity", "classical", o_alternativity_measure, tolerance=1e-9)
+        add_check(
+            "octonion",
+            "omul_nonassociativity_witness",
+            "classical",
+            o_nonassoc_witness_measure,
+            tolerance=1e-2,
+            comparator="ge",
+            detail="associator must be bounded AWAY from zero (guards against an associative shortcut)",
+        )
+        add_check("octonion", "o_times_conj_is_norm_squared", "classical", o_conj_scalar_measure, tolerance=1e-9)
+
+    # ----- reversible: round-trip + custom-autograd gradient parity -----
+    if "reversible" in mechanisms:
+
+        def rev_roundtrip_measure() -> float:
+            block, cfg = make_block("reversible")
+            sb = block.special_block
+            T = 8
+            cos_sin = _certify_cos_sin(T, 32, device, dtype)
+            x = torch.randn(1, T, cfg.n_embd, device=device, dtype=dtype)
+            with torch.no_grad():
+                y = sb(x, cos_sin, None)
+                xr = sb.inverse(y, cos_sin, None)
+            return float((x - xr).abs().max())
+
+        def rev_grad_parity_measure() -> float:
+            from nanochat.reversible_block_torch import ReversibleFunction
+
+            block, cfg = make_block("reversible")
+            sb = block.special_block.float()
+            sb_ref = copy.deepcopy(sb)
+            T = 8
+            cos_sin = _certify_cos_sin(T, 32, device, torch.float32)
+            torch.manual_seed(seed + 1)
+            x = torch.randn(1, T, cfg.n_embd, device=device)
+            w = torch.randn_like(x)
+
+            xa = x.clone().requires_grad_(True)
+            loss_a = (sb_ref(xa, cos_sin, None) * w).sum()
+            grads_a = torch.autograd.grad(loss_a, [xa, *sb_ref.parameters()])
+
+            xb = x.clone().requires_grad_(True)
+            yb = ReversibleFunction.apply(xb, cos_sin, None, sb.f_block, sb.g_block)
+            (yb * w).sum().backward()
+            grads_b = [xb.grad, *(p.grad for p in sb.parameters())]
+
+            worst = 0.0
+            for ga, gb in zip(grads_a, grads_b, strict=True):
+                if gb is None:
+                    return float("inf")
+                denom = float(ga.abs().max()) + 1e-8
+                worst = max(worst, float((ga - gb).abs().max()) / denom)
+            return worst
+
+        add_check(
+            "reversible",
+            "forward_inverse_roundtrip",
+            "classical",
+            rev_roundtrip_measure,
+            tolerance=fp_tol(1e-5),
+            detail="max |x - inverse(forward(x))|",
+        )
+        add_check(
+            "reversible",
+            "custom_autograd_grad_parity",
+            "classical",
+            rev_grad_parity_measure,
+            tolerance=1e-4,
+            detail="max relative grad diff: ReversibleFunction vs naive autograd",
+        )
+
+    # ----- gauge: rotation orthogonality, inverse consistency, additivity -----
+    if "gauge" in mechanisms:
+
+        def _gauge_setup() -> tuple[Any, Any, Any]:
+            block, cfg = make_block("gauge")
+            gb = block.special_block.float()
+            torch.manual_seed(seed + 2)
+            x = torch.randn(1, 8, cfg.n_embd, device=device)
+            th = torch.randn(1, 8, cfg.n_embd // 2, device=device)
+            return gb, x, th
+
+        def gauge_roundtrip_measure() -> float:
+            gb, x, th = _gauge_setup()
+            xr = gb._apply_rotations(gb._apply_rotations(x, th), th, inverse=True)
+            return float((x - xr).abs().max())
+
+        def gauge_norm_measure() -> float:
+            gb, x, th = _gauge_setup()
+            y = gb._apply_rotations(x, th)
+            pn_in = torch.sqrt(x[..., 0::2] ** 2 + x[..., 1::2] ** 2)
+            pn_out = torch.sqrt(y[..., 0::2] ** 2 + y[..., 1::2] ** 2)
+            return float((pn_in - pn_out).abs().max())
+
+        def gauge_additivity_measure() -> float:
+            gb, x, th = _gauge_setup()
+            torch.manual_seed(seed + 12)
+            th2 = torch.randn_like(th)
+            y_seq = gb._apply_rotations(gb._apply_rotations(x, th), th2)
+            y_sum = gb._apply_rotations(x, th + th2)
+            return float((y_seq - y_sum).abs().max())
+
+        add_check(
+            "gauge",
+            "rotation_inverse_roundtrip",
+            "classical",
+            gauge_roundtrip_measure,
+            tolerance=1e-5,
+            detail="R(-theta) R(theta) = I (orthogonality of the Givens transport)",
+        )
+        add_check("gauge", "rotation_pairwise_norm_preservation", "classical", gauge_norm_measure, tolerance=1e-5)
+        add_check(
+            "gauge",
+            "rotation_additivity_cumsum_law",
+            "classical",
+            gauge_additivity_measure,
+            tolerance=1e-5,
+            detail="R(t2) R(t1) = R(t1+t2): the property that justifies cumsum-as-transport",
+        )
+
+    # ----- ultrametric: strong triangle inequality on hard digits (exact) -----
+    if "ultrametric" in mechanisms:
+
+        def ultra_triangle_measure() -> float:
+            block, _cfg = make_block("ultrametric")
+            attn = block.attn.float()
+            torch.manual_seed(seed + 3)
+            feats = torch.randn(1, 2, 12, 32, device=device)
+            digits = attn._digits_hard_int(attn.to_digits_q(feats))  # (1, 2, 12, K) integer digits
+            d = digits[0, 0]  # (12, K)
+            n = d.size(0)
+            matches = (d.unsqueeze(0) == d.unsqueeze(1)).to(torch.int64)  # (n, n, K)
+            lcp = matches.cumprod(dim=-1).sum(dim=-1)  # (n, n) exact LCP depths
+            worst = 0
+            for i in range(n):
+                for j in range(n):
+                    for kk in range(n):
+                        lower = min(int(lcp[i, j]), int(lcp[j, kk]))
+                        worst = max(worst, lower - int(lcp[i, kk]))
+            return float(worst)
+
+        add_check(
+            "ultrametric",
+            "strong_triangle_inequality_lcp",
+            "classical",
+            ultra_triangle_measure,
+            tolerance=0.0,
+            detail="lcp(x,z) >= min(lcp(x,y), lcp(y,z)) over all triples (exact, integer)",
+        )
+
+    # ----- braid: YBE law + restricted-law separation + payload invariance -----
+    if "braid" in mechanisms:
+        from nanochat.braid_attention_torch import BraidCausalSelfAttention as _Braid
+
+        def _braid_strands() -> list[Any]:
+            torch.manual_seed(seed + 4)
+            return [torch.randn(64, 8, dtype=torch.float64, device=device) for _ in range(6)]
+
+        def _ybe_residual(update: Any) -> float:
+            ax, ay, bx, by, cx, cy = _braid_strands()
+
+            def apply12(ax, ay, bx, by, cx, cy):
+                nax, nay, nbx, nby = update(ax, ay, bx, by)
+                return nax, nay, nbx, nby, cx, cy
+
+            def apply23(ax, ay, bx, by, cx, cy):
+                nbx, nby, ncx, ncy = update(bx, by, cx, cy)
+                return ax, ay, nbx, nby, ncx, ncy
+
+            lhs = apply12(*apply23(*apply12(ax, ay, bx, by, cx, cy)))
+            rhs = apply23(*apply12(*apply23(ax, ay, bx, by, cx, cy)))
+            return float(torch.max(torch.abs(torch.stack(lhs, dim=-1) - torch.stack(rhs, dim=-1))))
+
+        def braid_payload_measure() -> float:
+            ax, ay, bx, by, _, _ = _braid_strands()
+            worst = 0.0
+            for update in (_Braid._crossing_update_restricted, _Braid._crossing_update_ybe):
+                _, nay, _, nby = update(ax, ay, bx, by)
+                inp = torch.sort(torch.stack([ay, by], dim=0), dim=0).values
+                out = torch.sort(torch.stack([nay, nby], dim=0), dim=0).values
+                worst = max(worst, float((inp - out).abs().max()))
+            return worst
+
+        add_check(
+            "braid",
+            "ybe_law_holds",
+            "classical",
+            lambda: _ybe_residual(_Braid._crossing_update_ybe),
+            tolerance=1e-10,
+            detail="R3 residual for the swap-output crossing law",
+        )
+        add_check(
+            "braid",
+            "restricted_law_violates_ybe",
+            "classical",
+            lambda: _ybe_residual(_Braid._crossing_update_restricted),
+            tolerance=1e-3,
+            comparator="ge",
+            detail="separation witness: the heuristic law must NOT satisfy YBE (proves the test has teeth)",
+        )
+        add_check(
+            "braid",
+            "payload_multiset_invariance",
+            "classical",
+            braid_payload_measure,
+            tolerance=0.0,
+            detail="crossings must preserve the payload multiset {y} exactly",
+        )
+
+    # ----- simplicial: mass conservation through 1-hop and 2-hop paths -----
+    if "simplicial" in mechanisms:
+
+        def simplicial_mass_measure() -> float:
+            torch.manual_seed(seed + 5)
+            scores = torch.randn(1, 2, 8, 8, device=device)
+            scores = scores.masked_fill(~causal_attn_mask(8, 8, device=device), float("-inf"))
+            att = torch.softmax(scores, dim=-1)
+            c = 0.731
+            v = torch.full((1, 2, 8, 32), c, device=device)
+            y1 = att @ v
+            y2 = att @ y1
+            return float(torch.maximum((y1 - c).abs().max(), (y2 - c).abs().max()))
+
+        add_check(
+            "simplicial",
+            "mass_conservation_two_hop",
+            "classical",
+            simplicial_mass_measure,
+            tolerance=1e-5,
+            detail="row-stochastic 1-hop and 2-hop aggregation must preserve constants",
+        )
+
+    # ----- fractal: router branch distributions are simplex-valued -----
+    if "fractal" in mechanisms:
+
+        def fractal_router_measure() -> float:
+            import torch.nn.functional as t_func
+
+            block, _cfg = make_block("fractal")
+            attn = block.attn.float()
+            torch.manual_seed(seed + 6)
+            feats = torch.randn(1, 2, 8, 32, device=device)
+            route = attn.router(feats).view(1, 2, 8, attn.depth, attn.m)
+            probs = t_func.softmax(route, dim=-1)
+            sums_err = (probs.sum(dim=-1) - 1.0).abs().max()
+            neg_err = (-probs).clamp_min(0.0).max()
+            return float(torch.maximum(sums_err, neg_err))
+
+        add_check(
+            "fractal",
+            "router_branch_simplex",
+            "classical",
+            fractal_router_measure,
+            tolerance=1e-6,
+            detail="per-depth branch distributions must lie on the m-simplex",
+        )
+
+    # ----- surreal: scale/direction decomposition laws -----
+    if "surreal" in mechanisms:
+        from nanochat.surreal_torch import SurrealLayer
+
+        def _surreal_layer() -> Any:
+            torch.manual_seed(seed + 7)
+            return SurrealLayer(64, 64, bias=False).to(device=device).float()
+
+        def surreal_norm_measure() -> float:
+            import torch.nn.functional as t_func
+
+            layer = _surreal_layer()
+            with torch.no_grad():
+                layer.weight_s.uniform_(-1.0, 1.0)
+                w = torch.exp(layer.weight_s) * t_func.normalize(layer.weight_v, dim=1)
+                return float((w.norm(dim=1, keepdim=True) - torch.exp(layer.weight_s)).abs().max())
+
+        def surreal_linearity_measure() -> float:
+            layer = _surreal_layer()
+            torch.manual_seed(seed + 8)
+            x = torch.randn(4, 64, device=device)
+            c = 3.7
+            with torch.no_grad():
+                return float((layer(c * x) - c * layer(x)).abs().max())
+
+        def surreal_s_shift_measure() -> float:
+            layer = _surreal_layer()
+            torch.manual_seed(seed + 9)
+            x = torch.randn(4, 64, device=device)
+            delta = 0.9
+            with torch.no_grad():
+                y0 = layer(x)
+                layer.weight_s.add_(delta)
+                y1 = layer(x)
+                return float((y1 - math.exp(delta) * y0).abs().max())
+
+        add_check(
+            "surreal",
+            "row_norm_equals_exp_scale",
+            "classical",
+            surreal_norm_measure,
+            tolerance=1e-5,
+            detail="||w_row|| = exp(s_row): the scale/direction decomposition",
+        )
+        add_check("surreal", "layer_linearity", "classical", surreal_linearity_measure, tolerance=1e-4)
+        add_check(
+            "surreal",
+            "scale_shift_equivariance",
+            "classical",
+            surreal_s_shift_measure,
+            tolerance=1e-4,
+            detail="s -> s + d must scale outputs by exp(d) exactly",
+        )
+
+    return checks
+
+
+@app.command()
+def certify(
+    mechanism: Annotated[
+        list[str] | None,
+        typer.Option("--mechanism", "-m", help="Mechanism(s) to certify (default: all)"),
+    ] = None,
+    device: Annotated[str, typer.Option(help="Device: cpu | cuda")] = "cpu",
+    dtype: Annotated[str, typer.Option(help="Dtype for module-level checks: fp32 | bf16")] = "fp32",
+    seed: Annotated[int, typer.Option(help="Seed for all randomized checks")] = 42,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show per-check detail column")] = False,
+    artifacts_dir: Annotated[Path | None, typer.Option(help="Write summary.json/run.md under this dir")] = None,
+    run_id: Annotated[str | None, typer.Option(help="Run id (default: timestamp)")] = None,
+):
+    """
+    Certify the mathematical invariants of the nanochat attention mechanisms.
+
+    Runs the shared causality certificate for every mechanism plus per-mechanism
+    invariant checks (Lipschitz bounds, algebra laws, round-trips, conservation).
+    Exits nonzero if any check fails.
+    """
+    mechanisms = list(mechanism) if mechanism else list(_CERTIFY_MECHANISMS)
+    unknown = [m for m in mechanisms if m not in _CERTIFY_MECHANISMS]
+    if unknown:
+        console.print(f"[bold red]Unknown mechanism(s):[/bold red] {unknown}. Valid: {_CERTIFY_MECHANISMS}")
+        raise typer.Exit(code=2)
+
+    git_info = _get_git_info()
+    rid = run_id or _default_run_id()
+    console.print(
+        Panel(
+            f"mechanisms: [cyan]{', '.join(mechanisms)}[/cyan]\n"
+            f"device: [cyan]{device}[/cyan] · dtype: [cyan]{dtype}[/cyan] · seed: [cyan]{seed}[/cyan]\n"
+            f"git: [cyan]{git_info['commit']}[/cyan]{' (dirty)' if git_info['dirty'] else ''}",
+            title="[bold]mgr certify — mathematical invariant checks[/bold]",
+            border_style="blue",
+        )
+    )
+
+    t_start = time.perf_counter()
+    checks = _run_certify_checks(mechanisms, device_str=device, dtype_str=dtype, seed=seed)
+    total_s = time.perf_counter() - t_start
+
+    table = Table(box=box.SIMPLE_HEAVY)
+    table.add_column("Mechanism", style="cyan")
+    table.add_column("Check")
+    table.add_column("Family", style="dim")
+    table.add_column("Status")
+    table.add_column("Measured", justify="right")
+    table.add_column("Tolerance", justify="right")
+    table.add_column("ms", justify="right", style="dim")
+    if verbose:
+        table.add_column("Detail", style="dim", max_width=60)
+    n_pass = n_fail = n_error = 0
+    for c in checks:
+        if c["status"] == "pass":
+            n_pass += 1
+            status = "[green]PASS[/green]"
+        elif c["status"] == "fail":
+            n_fail += 1
+            status = "[bold red]FAIL[/bold red]"
+        else:
+            n_error += 1
+            status = "[bold red]ERROR[/bold red]"
+        cmp_sym = "<=" if c["comparator"] == "le" else ">="
+        row = [
+            c["mechanism"],
+            c["check"],
+            c["family"],
+            status,
+            f"{c['measured']:.3e}",
+            f"{cmp_sym} {c['tolerance']:.3e}",
+            f"{c['duration_ms']:.1f}",
+        ]
+        if verbose:
+            row.append(c["detail"])
+        table.add_row(*row)
+    console.print(table)
+
+    color = "green" if (n_fail + n_error) == 0 else "red"
+    console.print(
+        Panel(
+            f"[bold {color}]{n_pass} passed · {n_fail} failed · {n_error} errored[/bold {color}]"
+            f" · {len(checks)} checks in {total_s:.1f}s",
+            border_style=color,
+        )
+    )
+    for c in checks:
+        if c["status"] != "pass":
+            cmp_sym = "<=" if c["comparator"] == "le" else ">="
+            console.print(
+                f"[red]✗ {c['mechanism']}.{c['check']}[/red] measured={c['measured']:.3e} "
+                f"({cmp_sym} {c['tolerance']:.3e} required) — "
+                f"repro: [bold]mgr certify -m {c['mechanism']} --seed {seed} --device {device} --dtype {dtype}[/bold]"
+                + (f"\n  [dim]{c['detail']}[/dim]" if c["detail"] else "")
+            )
+
+    if artifacts_dir is not None:
+        run_dir = artifacts_dir / "certs" / "nanochat" / rid
+        summary = {
+            "schema_version": 1,
+            "kind": "certify",
+            "run_id": rid,
+            "seed": seed,
+            "device": device,
+            "dtype": dtype,
+            "git": git_info,
+            "mechanisms": mechanisms,
+            "checks": checks,
+            "counts": {"pass": n_pass, "fail": n_fail, "error": n_error},
+            "duration_s": round(total_s, 3),
+        }
+        lines = [
+            "# mgr certify",
+            "",
+            f"- run_id: `{rid}` · seed: {seed} · device: {device} · dtype: {dtype}",
+            f"- git: `{git_info['commit']}`{' (dirty)' if git_info['dirty'] else ''}",
+            f"- result: **{n_pass} passed / {n_fail} failed / {n_error} errored** in {total_s:.1f}s",
+            "",
+            "| Mechanism | Check | Family | Status | Measured | Tolerance | ms |",
+            "|---|---|---|---|---:|---:|---:|",
+        ]
+        for c in checks:
+            cmp_sym = "<=" if c["comparator"] == "le" else ">="
+            lines.append(
+                f"| {c['mechanism']} | {c['check']} | {c['family']} | {c['status']} "
+                f"| {c['measured']:.3e} | {cmp_sym} {c['tolerance']:.3e} | {c['duration_ms']:.1f} |"
+            )
+        _write_artifacts(run_dir, summary=summary, report_md="\n".join(lines) + "\n")
+        console.print(f"[bold green]Wrote certificate artifacts[/bold green] → {run_dir}")
+
+    if n_fail + n_error > 0:
+        raise typer.Exit(code=1)
+
+
 if __name__ == "__main__":
     app()

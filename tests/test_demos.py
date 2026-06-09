@@ -666,6 +666,90 @@ def test_execution_sandbox_smoke():
     require("hello" in result.stdout, f"Expected stdout to contain 'hello', got: {result.stdout!r}")
 
 
+def test_certify_full_suite_passes():
+    """The complete certificate suite must be green on CPU fp32 (br-5ki.1 acceptance)."""
+    from cli import _CERTIFY_MECHANISMS, _run_certify_checks
+
+    checks = _run_certify_checks(list(_CERTIFY_MECHANISMS), device_str="cpu", dtype_str="fp32", seed=42)
+    require(len(checks) >= 30, f"Expected a comprehensive check suite, got only {len(checks)} checks")
+    mechanisms_covered = {c["mechanism"] for c in checks}
+    require(
+        mechanisms_covered == set(_CERTIFY_MECHANISMS),
+        f"Causality coverage gap: {set(_CERTIFY_MECHANISMS) - mechanisms_covered}",
+    )
+    failing = [c for c in checks if c["status"] != "pass"]
+    require(not failing, f"Certificate checks failed: {[(c['mechanism'], c['check'], c['detail']) for c in failing]}")
+    # Every check must carry measured value, tolerance, and timing (schema contract for B3/G2 consumers).
+    for c in checks:
+        require(isinstance(c["measured"], float), f"measured missing/wrong type in {c['check']}")
+        require(isinstance(c["duration_ms"], float), f"duration_ms missing in {c['check']}")
+        require(c["comparator"] in {"le", "ge"}, f"bad comparator in {c['check']}")
+
+
+def test_certify_detects_violation(monkeypatch):
+    """A deliberately broken invariant must produce a FAIL status (br-5ki.1 acceptance: failures fail)."""
+    import nanochat.quaternion_attention_torch as quat_mod
+    from cli import _run_certify_checks
+
+    real_qmul = quat_mod.qmul
+
+    def broken_qmul(a, b):
+        out = real_qmul(a, b)
+        return out * 1.01  # break norm multiplicativity (and associativity scaling)
+
+    monkeypatch.setattr(quat_mod, "qmul", broken_qmul)
+    checks = _run_certify_checks(["quaternion"], device_str="cpu", dtype_str="fp32", seed=42)
+    norm_check = next(c for c in checks if c["check"] == "qmul_norm_multiplicative")
+    require(
+        norm_check["status"] == "fail",
+        f"Broken qmul must fail the norm-multiplicativity certificate, got {norm_check['status']}",
+    )
+
+
+def test_certify_cli_exit_codes(tmp_path):
+    """CLI: exit 0 on green subset, nonzero on unknown mechanism; artifacts written when requested."""
+    import json as json_mod
+
+    from typer.testing import CliRunner
+
+    import cli as mgr_cli
+
+    runner = CliRunner()
+    result = runner.invoke(
+        mgr_cli.app,
+        ["certify", "-m", "braid", "-m", "surreal", "--artifacts-dir", str(tmp_path), "--run-id", "testrun"],
+    )
+    require(result.exit_code == 0, f"certify on green mechanisms must exit 0, got {result.exit_code}: {result.output}")
+    summary_path = tmp_path / "certs" / "nanochat" / "testrun" / "summary.json"
+    require(summary_path.exists(), f"Expected certificate summary at {summary_path}")
+    summary = json_mod.loads(summary_path.read_text())
+    require(summary["kind"] == "certify", "summary.json must identify itself as a certify artifact")
+    require(summary["counts"]["fail"] == 0 and summary["counts"]["error"] == 0, "green run must record zero failures")
+    require((tmp_path / "certs" / "nanochat" / "testrun" / "run.md").exists(), "run.md report must be written")
+
+    result_bad = runner.invoke(mgr_cli.app, ["certify", "-m", "nonexistent-mechanism"])
+    require(result_bad.exit_code != 0, "certify must exit nonzero for an unknown mechanism")
+
+
+def test_certify_gauge_forward_runs():
+    """Regression for br-hn5: gauge block forward must run (RoPE layout bug found by certify)."""
+    import torch
+
+    from cli import _certify_cos_sin, _certify_tiny_config
+    from nanochat.gpt import Block
+
+    torch.manual_seed(0)
+    cfg = _certify_tiny_config("gauge")
+    block = Block(cfg, 0)
+    T = 8  # deliberately != n_head: the broken layout only crashed when n_head != T
+    require(cfg.n_head != T, "test must use n_head != T to exercise the regression")
+    x = torch.randn(1, T, cfg.n_embd)
+    cos_sin = _certify_cos_sin(T, cfg.n_embd // cfg.n_head, torch.device("cpu"), torch.float32)
+    y = block(x, cos_sin, None)
+    require(y.shape == x.shape, f"gauge forward output shape mismatch: {y.shape} vs {x.shape}")
+    require(bool(torch.isfinite(y).all()), "gauge forward produced non-finite values")
+
+
 if __name__ == "__main__":
     import sys
 

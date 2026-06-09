@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nanochat.model_utils import apply_rotary_emb
+
 
 class GaugeBlock(nn.Module):
     def __init__(self, config, layer_idx):
@@ -114,16 +116,16 @@ class GaugeBlock(nn.Module):
 
         qkv = self.c_attn(x_global)
         q, k, v = torch.split(qkv, self.dim, dim=-1)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        q = q.view(B, T, self.n_head, self.head_dim)
+        k = k.view(B, T, self.n_head, self.head_dim)
+        v = v.view(B, T, self.n_head, self.head_dim)
 
-        # Apply RoPE (optional additional gauge field)
+        # Apply RoPE (optional additional gauge field) in the (B, T, H, D) layout
+        # expected by apply_rotary_emb (time at dim 1), BEFORE moving heads to the
+        # batch dim — matching the canonical order in gpt.CausalSelfAttention.
         cos, sin = cos_sin
-        # ... RoPE implementation usually provided in model_utils
-        from nanochat.model_utils import apply_rotary_emb
-
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
         # Attention
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
