@@ -36,3 +36,7 @@ beads.right.meta.json
 
 # bv (beads viewer) lock file
 .bv.lock
+
+# br runtime lock files (ephemeral, never commit)
+.sync.lock
+.write.lock
