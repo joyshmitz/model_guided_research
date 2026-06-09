@@ -750,6 +750,81 @@ def test_certify_gauge_forward_runs():
     require(bool(torch.isfinite(y).all()), "gauge forward produced non-finite values")
 
 
+def test_fuzz_runner_well_formed_and_green_on_benign_grid():
+    """Fuzz harness contract: well-formed records; benign reduced grid is all-pass (br-5ki.4)."""
+    from cli import _run_fuzz_cells
+
+    records = _run_fuzz_cells(
+        ["standard", "tropical"],
+        device_str="cpu",
+        dtypes=["fp32"],
+        scales=[1.0],
+        lengths=[1, 2],
+        patterns=["randn", "all_equal", "zeros"],
+        seed=42,
+    )
+    require(len(records) == 2 * 1 * 2 * 3, f"unexpected cell count: {len(records)}")
+    for r in records:
+        for key in ("mechanism", "dtype", "scale", "T", "pattern", "status", "recipe", "duration_ms"):
+            require(key in r, f"fuzz record missing key {key}: {r}")
+        require("seed=42" in r["recipe"], "recipe must carry the seed for reproduction")
+        require(r["status"] == "pass", f"benign grid must pass, got {r['status']} for {r['recipe']}")
+
+
+@pytest.mark.parametrize(
+    "pattern,length",
+    [
+        ("all_equal", 4),  # maximal score ties (argmax/softmax tie-handling)
+        ("zeros", 4),  # zero-norm inputs (rmsnorm/quaternion/octonion normalization paths)
+        ("randn", 1),  # T=1 boundary (single-token causal path)
+    ],
+)
+def test_fuzz_adversarial_regressions(pattern, length):
+    """Permanent regressions for the adversarial cases the bead names: ties, zero-norm, T=1 (br-5ki.4)."""
+    from cli import _CERTIFY_MECHANISMS, _run_fuzz_cells
+
+    records = _run_fuzz_cells(
+        list(_CERTIFY_MECHANISMS),
+        device_str="cpu",
+        dtypes=["fp32"],
+        scales=[1.0],
+        lengths=[length],
+        patterns=[pattern],
+        seed=42,
+    )
+    bad = [r for r in records if r["status"] in ("fail", "error")]
+    require(not bad, f"NaN/Inf or crash on {pattern}/T={length}: {[r['recipe'] for r in bad]}")
+
+
+def test_fuzz_detects_nan_injection(monkeypatch):
+    """A mechanism emitting NaN must be recorded as FAIL with a complete repro recipe (br-5ki.4)."""
+    import torch
+
+    import nanochat.gpt as gpt_mod
+    from cli import _run_fuzz_cells
+
+    real_block = gpt_mod.Block
+
+    class NaNBlock(torch.nn.Module):
+        def __init__(self, cfg, layer_idx):
+            super().__init__()
+            self.p = torch.nn.Parameter(torch.zeros(1))
+
+        def forward(self, x, cos_sin, kv_cache):
+            y = x + self.p
+            y = y.clone()
+            y[..., 0] = float("nan")
+            return y
+
+    monkeypatch.setattr(gpt_mod, "Block", NaNBlock)
+    records = _run_fuzz_cells(
+        ["standard"], device_str="cpu", dtypes=["fp32"], scales=[1.0], lengths=[2], patterns=["randn"], seed=42
+    )
+    require(len(records) == 1, f"expected one cell, got {len(records)}")
+    require(records[0]["status"] == "fail", f"NaN output must be a FAIL, got {records[0]['status']}")
+    require(records[0]["out_nan_inf"] > 0, "out_nan_inf must count the injected NaNs")
+
+
 if __name__ == "__main__":
     import sys
 

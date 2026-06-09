@@ -3495,5 +3495,300 @@ def certify(
         raise typer.Exit(code=1)
 
 
+# ---------------------------------------------------------------------------
+# mgr fuzz — numerical robustness sweep (br: model_guided_research-5ki.4)
+#
+# Stresses every mechanism across dtypes, input scales, sequence-length
+# boundaries, and adversarial input patterns, recording NaN/Inf in outputs AND
+# gradients. Complements `mgr certify` (invariants on benign inputs): fuzz asks
+# what happens on the inputs nobody writes unit tests for.
+# ---------------------------------------------------------------------------
+
+_FUZZ_PATTERNS: list[str] = ["randn", "all_equal", "alternating", "zeros"]
+
+
+def _fuzz_make_input(pattern: str, *, B: int, T: int, C: int, scale: float, device: Any, dtype: Any) -> Any:
+    import torch
+
+    if pattern == "randn":
+        x = torch.randn(B, T, C, device=device, dtype=torch.float32) * scale
+    elif pattern == "all_equal":
+        # Every token identical and every channel equal: maximal ties in every argmax/softmax.
+        x = torch.full((B, T, C), 1.0, device=device, dtype=torch.float32) * scale
+    elif pattern == "alternating":
+        # Extreme +/- cancellation pattern along both time and channels.
+        t_sign = (-1.0) ** torch.arange(T, device=device, dtype=torch.float32)
+        c_sign = (-1.0) ** torch.arange(C, device=device, dtype=torch.float32)
+        x = (t_sign.view(1, T, 1) * c_sign.view(1, 1, C)).expand(B, T, C).clone() * scale
+    elif pattern == "zeros":
+        # Zero-norm everything: rmsnorm of zeros, zero-norm quaternions/octonions, etc.
+        x = torch.zeros(B, T, C, device=device, dtype=torch.float32)
+    else:
+        raise ValueError(f"Unknown fuzz pattern: {pattern!r}")
+    return x.to(dtype=dtype)
+
+
+def _run_fuzz_cells(
+    mechanisms: list[str],
+    *,
+    device_str: str = "cpu",
+    dtypes: list[str] | None = None,
+    scales: list[float] | None = None,
+    lengths: list[int] | None = None,
+    patterns: list[str] | None = None,
+    seed: int = 42,
+    warn_out_abs: float = 1e4,
+    warn_grad_abs: float = 1e6,
+    progress: Any = None,
+) -> list[dict[str, Any]]:
+    """
+    Run the robustness sweep and return one record per cell:
+    {mechanism, dtype, scale, T, pattern, status, out_nan_inf, grad_nan_inf,
+     max_abs_out, max_abs_grad, duration_ms, recipe}.
+
+    status: "fail" if any NaN/Inf appears in the output or input-gradient;
+    "warn" if magnitudes exceed the warn thresholds; "error" on exception;
+    else "pass". The `recipe` string is a complete reproduction command.
+
+    Note: the `zeros` pattern is scale-invariant, so it runs once per
+    (mechanism, dtype, T) regardless of the scales list.
+    """
+    import torch
+
+    from nanochat.gpt import Block
+
+    device = torch.device(device_str)
+    dtypes = dtypes if dtypes is not None else ["fp32", "bf16"]
+    scales = scales if scales is not None else [1e-3, 1.0, 1e3]
+    # Boundary lengths around the tiny-config block size (1, 2, just-below, at).
+    lengths = lengths if lengths is not None else [1, 2, 63, 64]
+    patterns = patterns if patterns is not None else list(_FUZZ_PATTERNS)
+
+    records: list[dict[str, Any]] = []
+    for mech in mechanisms:
+        for dtype_str in dtypes:
+            dtype = torch.float32 if dtype_str == "fp32" else torch.bfloat16
+            for T in lengths:
+                for pattern in patterns:
+                    cell_scales = [1.0] if pattern == "zeros" else scales
+                    for scale in cell_scales:
+                        t0 = time.perf_counter()
+                        recipe = (
+                            f"mechanism={mech} dtype={dtype_str} scale={scale:g} T={T} pattern={pattern} seed={seed}"
+                        )
+                        rec: dict[str, Any] = {
+                            "mechanism": mech,
+                            "dtype": dtype_str,
+                            "scale": scale,
+                            "T": T,
+                            "pattern": pattern,
+                            "recipe": recipe,
+                        }
+                        try:
+                            torch.manual_seed(seed)
+                            cfg = _certify_tiny_config(mech)
+                            block = Block(cfg, 0).to(device=device, dtype=dtype)
+                            block.eval()
+                            head_dim = cfg.n_embd // cfg.n_head
+                            cos_sin = _certify_cos_sin(T, head_dim, device, dtype)
+                            x = _fuzz_make_input(
+                                pattern, B=2, T=T, C=cfg.n_embd, scale=scale, device=device, dtype=dtype
+                            )
+                            x.requires_grad_(True)
+                            y = block(x, cos_sin, None)
+                            (g,) = torch.autograd.grad(y.float().sum(), x, allow_unused=True)
+                            y_f = y.detach().float()
+                            out_bad = int((~torch.isfinite(y_f)).sum())
+                            if g is None:
+                                grad_bad = 0
+                                max_grad = 0.0
+                            else:
+                                g_f = g.detach().float()
+                                grad_bad = int((~torch.isfinite(g_f)).sum())
+                                max_grad = float(g_f.abs().max()) if g_f.numel() else 0.0
+                            max_out = float(y_f.abs().max()) if y_f.numel() else 0.0
+                            rec.update(
+                                out_nan_inf=out_bad,
+                                grad_nan_inf=grad_bad,
+                                max_abs_out=max_out,
+                                max_abs_grad=max_grad,
+                            )
+                            if out_bad or grad_bad:
+                                rec["status"] = "fail"
+                            elif max_out > warn_out_abs or max_grad > warn_grad_abs:
+                                rec["status"] = "warn"
+                            else:
+                                rec["status"] = "pass"
+                        except Exception as exc:  # noqa: BLE001 - a crash is a finding, not a harness bug
+                            rec.update(
+                                status="error",
+                                out_nan_inf=-1,
+                                grad_nan_inf=-1,
+                                max_abs_out=float("nan"),
+                                max_abs_grad=float("nan"),
+                                detail=f"{type(exc).__name__}: {exc}",
+                            )
+                        rec["duration_ms"] = round((time.perf_counter() - t0) * 1000.0, 3)
+                        records.append(rec)
+                        if progress is not None:
+                            progress()
+    return records
+
+
+@app.command()
+def fuzz(
+    mechanism: Annotated[
+        list[str] | None,
+        typer.Option("--mechanism", "-m", help="Mechanism(s) to fuzz (default: all)"),
+    ] = None,
+    device: Annotated[str, typer.Option(help="Device: cpu | cuda")] = "cpu",
+    seed: Annotated[int, typer.Option(help="Seed for randomized patterns")] = 42,
+    artifacts_dir: Annotated[Path | None, typer.Option(help="Write summary.json/run.md under this dir")] = None,
+    run_id: Annotated[str | None, typer.Option(help="Run id (default: timestamp)")] = None,
+    fail_on_warn: Annotated[bool, typer.Option(help="Treat warns as failures for the exit code")] = False,
+):
+    """
+    Numerical robustness fuzz: dtype x scale x boundary-length x adversarial-pattern
+    sweep over the attention mechanisms, recording NaN/Inf in outputs and gradients.
+
+    Every non-pass cell prints its full reproduction recipe. Exit code 1 if any
+    cell fails (or warns, with --fail-on-warn).
+    """
+    mechanisms = list(mechanism) if mechanism else list(_CERTIFY_MECHANISMS)
+    unknown = [m for m in mechanisms if m not in _CERTIFY_MECHANISMS]
+    if unknown:
+        console.print(f"[bold red]Unknown mechanism(s):[/bold red] {unknown}. Valid: {_CERTIFY_MECHANISMS}")
+        raise typer.Exit(code=2)
+
+    git_info = _get_git_info()
+    rid = run_id or _default_run_id()
+    n_cells_per_mech = 2 * len([1, 2, 63, 64]) * (3 * 3 + 1)  # dtypes * lengths * (3 patterns x 3 scales + zeros)
+    total_cells = n_cells_per_mech * len(mechanisms)
+    console.print(
+        Panel(
+            f"mechanisms: [cyan]{', '.join(mechanisms)}[/cyan]\n"
+            f"grid: dtype {{fp32, bf16}} x scale {{1e-3, 1, 1e3}} x T {{1, 2, 63, 64}} x "
+            f"pattern {{{', '.join(_FUZZ_PATTERNS)}}} = [cyan]{total_cells}[/cyan] cells\n"
+            f"device: [cyan]{device}[/cyan] · seed: [cyan]{seed}[/cyan] · git: [cyan]{git_info['commit']}[/cyan]",
+            title="[bold]mgr fuzz — numerical robustness sweep[/bold]",
+            border_style="blue",
+        )
+    )
+
+    t_start = time.perf_counter()
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as prog:
+        task = prog.add_task("fuzzing", total=total_cells)
+        records = _run_fuzz_cells(
+            mechanisms,
+            device_str=device,
+            seed=seed,
+            progress=lambda: prog.advance(task),
+        )
+    total_s = time.perf_counter() - t_start
+
+    by_mech: dict[str, dict[str, int]] = {}
+    for r in records:
+        agg = by_mech.setdefault(r["mechanism"], {"pass": 0, "warn": 0, "fail": 0, "error": 0, "cells": 0})
+        agg[r["status"]] += 1
+        agg["cells"] += 1
+
+    table = Table(box=box.SIMPLE_HEAVY)
+    table.add_column("Mechanism", style="cyan")
+    table.add_column("Cells", justify="right")
+    table.add_column("Pass", justify="right", style="green")
+    table.add_column("Warn", justify="right", style="yellow")
+    table.add_column("Fail", justify="right", style="red")
+    table.add_column("Error", justify="right", style="red")
+    table.add_column("Worst cell", style="dim", max_width=60)
+    for mech, agg in by_mech.items():
+        worst = ""
+        bad = [r for r in records if r["mechanism"] == mech and r["status"] in ("fail", "error")]
+        if not bad:
+            bad = [r for r in records if r["mechanism"] == mech and r["status"] == "warn"]
+        if bad:
+            worst = bad[0]["recipe"]
+        table.add_row(
+            mech,
+            str(agg["cells"]),
+            str(agg["pass"]),
+            str(agg["warn"]),
+            str(agg["fail"]),
+            str(agg["error"]),
+            worst,
+        )
+    console.print(table)
+
+    n_pass = sum(1 for r in records if r["status"] == "pass")
+    n_warn = sum(1 for r in records if r["status"] == "warn")
+    n_fail = sum(1 for r in records if r["status"] == "fail")
+    n_error = sum(1 for r in records if r["status"] == "error")
+    color = "green" if (n_fail + n_error) == 0 else "red"
+    console.print(
+        Panel(
+            f"[bold {color}]{n_pass} pass · {n_warn} warn · {n_fail} fail · {n_error} error[/bold {color}]"
+            f" · {len(records)} cells in {total_s:.1f}s",
+            border_style=color,
+        )
+    )
+    for r in records:
+        if r["status"] in ("fail", "error"):
+            console.print(
+                f"[red]✗[/red] {r['recipe']} — out_nan_inf={r['out_nan_inf']} grad_nan_inf={r['grad_nan_inf']}"
+                + (f" [{r.get('detail', '')}]" if r.get("detail") else "")
+            )
+        elif r["status"] == "warn":
+            console.print(
+                f"[yellow]△[/yellow] {r['recipe']} — max|out|={r['max_abs_out']:.3e} max|grad|={r['max_abs_grad']:.3e}"
+            )
+
+    if artifacts_dir is not None:
+        run_dir = artifacts_dir / "certs" / "fuzz" / rid
+        summary = {
+            "schema_version": 1,
+            "kind": "fuzz",
+            "run_id": rid,
+            "seed": seed,
+            "device": device,
+            "git": git_info,
+            "mechanisms": mechanisms,
+            "counts": {"pass": n_pass, "warn": n_warn, "fail": n_fail, "error": n_error},
+            "cells": records,
+            "duration_s": round(total_s, 3),
+        }
+        lines = [
+            "# mgr fuzz",
+            "",
+            f"- run_id: `{rid}` · seed: {seed} · device: {device} · git: `{git_info['commit']}`",
+            f"- result: **{n_pass} pass / {n_warn} warn / {n_fail} fail / {n_error} error** "
+            f"({len(records)} cells, {total_s:.1f}s)",
+            "",
+            "| Mechanism | Cells | Pass | Warn | Fail | Error |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+        for mech, agg in by_mech.items():
+            lines.append(
+                f"| {mech} | {agg['cells']} | {agg['pass']} | {agg['warn']} | {agg['fail']} | {agg['error']} |"
+            )
+        non_pass = [r for r in records if r["status"] != "pass"]
+        if non_pass:
+            lines += ["", "## Non-pass cells", ""]
+            for r in non_pass:
+                lines.append(
+                    f"- `{r['status']}` {r['recipe']} (out_nan_inf={r['out_nan_inf']}, "
+                    f"grad_nan_inf={r['grad_nan_inf']}, max|out|={r['max_abs_out']:.3e})"
+                )
+        _write_artifacts(run_dir, summary=summary, report_md="\n".join(lines) + "\n")
+        console.print(f"[bold green]Wrote fuzz artifacts[/bold green] → {run_dir}")
+
+    if n_fail + n_error > 0 or (fail_on_warn and n_warn > 0):
+        raise typer.Exit(code=1)
+
+
 if __name__ == "__main__":
     app()
