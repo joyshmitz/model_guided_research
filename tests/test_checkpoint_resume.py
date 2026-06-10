@@ -89,7 +89,9 @@ def _train_args(tmp_path: Path, run_id: str, **overrides):
 
 def _run_train(monkeypatch, tmp_path: Path, run_id: str, record: list[str] | None = None, **overrides) -> dict:
     monkeypatch.setattr(train_mod, "tokenizing_distributed_data_loader_with_state", _fake_loader_factory(record))
-    monkeypatch.setattr(train_mod, "list_parquet_files", lambda: ["fake_train.parquet", "fake_val.parquet"])
+    monkeypatch.setattr(
+        train_mod, "list_parquet_files", lambda data_dir=None: ["fake_train.parquet", "fake_val.parquet"]
+    )
     train_mod.train(_train_args(tmp_path, run_id, **overrides))
     summary_path = tmp_path / "artifacts" / "baseline" / "nanochat" / run_id / "summary.json"
     assert summary_path.exists(), f"missing summary at {summary_path}"
@@ -406,6 +408,46 @@ def test_provenance_taint_semantics(monkeypatch):
     assert report_mod.build_provenance({"a": 1, "b": 2})["config_hash"] == report_mod.build_provenance(
         {"b": 2, "a": 1}
     )["config_hash"]
+
+
+def test_data_dir_trains_on_generated_task_corpus(tmp_path):
+    """kbj2: --data-dir points training at an mgr gen-tasks corpus through the
+    REAL dataloader + tokenizer (no monkeypatching) - the campaign path."""
+    try:
+        from nanochat.tokenizer import get_tokenizer
+
+        get_tokenizer()
+    except Exception as exc:
+        pytest.skip(f"tokenizer unavailable: {exc}")
+
+    import nanochat.train as train_mod
+    from nanochat.diagnostics_data import generate_task
+
+    generate_task("arith", out_dir=tmp_path / "corpus", size=200, seed=7)
+    args = train_mod.build_parser().parse_args(
+        [
+            "--device", "cpu", "--max-steps", "3", "--batch-size", "2", "--sequence-len", "64",
+            "--n-layer", "1", "--n-head", "2", "--n-kv-head", "2", "--n-embd", "32", "--seed", "7",
+            "--warmup-steps", "0", "--artifacts-dir", str(tmp_path / "artifacts"), "--run-id", "datadir",
+            "--data-dir", str(tmp_path / "corpus" / "arith"), "--val-interval", "2", "--val-batches", "1",
+        ]
+    )
+    train_mod.train(args)
+    summary = json.loads(
+        (tmp_path / "artifacts" / "baseline" / "nanochat" / "datadir" / "summary.json").read_text()
+    )
+    ds = summary["dataset"]
+    assert ds["data_dir"] == str(tmp_path / "corpus" / "arith")
+    assert [Path(p).name for p in ds["parquet_files"]] == ["train_000.parquet", "val_000.parquet"]
+    assert len(summary["results"]["losses"]) == 3
+    assert summary["results"]["val_losses"], "val split (last parquet) must feed validation"
+
+    # nonexistent dir -> actionable validation error
+    bad = train_mod.build_parser().parse_args(
+        ["--device", "cpu", "--max-steps", "1", "--data-dir", str(tmp_path / "nope")]
+    )
+    with pytest.raises(ValueError, match="data-dir"):
+        train_mod.train(bad)
 
 
 def test_ordinal_scheduler_state_dict_round_trip():

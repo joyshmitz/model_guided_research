@@ -223,7 +223,7 @@ def _train_tiny_checkpoint(tmp_path: Path, attention_type: str, monkeypatch) -> 
             idx += 1
 
     monkeypatch.setattr(train_mod, "tokenizing_distributed_data_loader_with_state", fake_loader)
-    monkeypatch.setattr(train_mod, "list_parquet_files", lambda: ["a.parquet", "b.parquet"])
+    monkeypatch.setattr(train_mod, "list_parquet_files", lambda data_dir=None: ["a.parquet", "b.parquet"])
     run_id = f"e2e-{attention_type}"
     args = train_mod.build_parser().parse_args(
         [

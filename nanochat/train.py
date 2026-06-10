@@ -312,6 +312,10 @@ def _validate_train_args(args, *, ddp_rank: int, device: torch.device) -> None:
     if bool(getattr(args, "use_flex_attention", False)) and not hasattr(torch.nn.attention, "flex_attention"):
         errors.append("--use-flex-attention requires torch>=2.5 (missing torch.nn.attention.flex_attention).")
 
+    data_dir_arg = getattr(args, "data_dir", None)
+    if data_dir_arg is not None and not Path(str(data_dir_arg)).is_dir():
+        errors.append(f"--data-dir must be an existing directory, got {data_dir_arg!r}")
+
     # Checkpoint/resume flags (bead rz8.1).
     if int(getattr(args, "checkpoint_interval", 0)) < 0:
         errors.append("--checkpoint-interval must be >= 0 (0 disables checkpointing)")
@@ -557,9 +561,13 @@ def train(args) -> None:
         config.sequence_len = args.sequence_len
         config.syn_cfg = syn_cfg
 
-    # Dataset (optional auto-download)
+    # Dataset (optional auto-download). --data-dir points training at ANY
+    # parquet corpus following the FineWeb convention (sorted; last file is
+    # the val split) - e.g. an mgr gen-tasks output directory (bead kbj2).
+    data_dir = getattr(args, "data_dir", None)
+    data_dir = str(data_dir) if data_dir is not None else None
     required_parquet_files = max(2, int(args.min_parquet_files))
-    if args.auto_download_data:
+    if args.auto_download_data and data_dir is None:
         if ddp_rank == 0:
             info = ensure_min_parquet_files(min_count=required_parquet_files)
             present = len(info.get("paths", []))
@@ -572,12 +580,16 @@ def train(args) -> None:
                 console.print(f"[dim]Downloaded shards:[/dim] {', '.join(downloaded)}")
         if ddp:
             dist.barrier()
+    elif args.auto_download_data and data_dir is not None and ddp_rank == 0:
+        console.print("[yellow]--auto-download-data is ignored with --data-dir (custom corpus).[/yellow]")
 
-    parquet_files = list_parquet_files()
+    parquet_files = list_parquet_files(data_dir)
     if len(parquet_files) < required_parquet_files:
+        where = data_dir or "the nanochat cache directory"
         raise RuntimeError(
-            f"No usable dataset found (need >={required_parquet_files} parquet shards; 2 is the minimum: 1 train + 1 val). "
-            "Either download shards into the nanochat cache directory or run with --auto-download-data."
+            f"No usable dataset found in {where} (need >={required_parquet_files} parquet shards; "
+            "2 is the minimum: 1 train + 1 val). "
+            "Either provide shards there or run with --auto-download-data (FineWeb cache only)."
         )
 
     # Model
@@ -692,6 +704,7 @@ def train(args) -> None:
         split="train",
         device=device.type,
         resume_state_dict=loader_resume_state,
+        data_dir=data_dir,
     )
     if resume_meta is not None and resume_data_mode == "exact" and batches_consumed > 0:
         # Exact resume: replay the deterministic stream from the beginning and
@@ -940,6 +953,7 @@ def train(args) -> None:
             T=config.sequence_len,
             split="val",
             device=device.type,
+            data_dir=data_dir,
         )
         if ddp_rank == 0:
             console.print(f"[bold cyan]validation[/bold cyan] interval={val_interval} batches={val_batches}")
@@ -1339,6 +1353,7 @@ def train(args) -> None:
         },
         "config": asdict(config),
         "dataset": {
+            "data_dir": data_dir,  # null = the FineWeb cache
             "parquet_files_count": len(parquet_files),
             "parquet_files": parquet_files,
         },
@@ -1671,6 +1686,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--auto-download-data",
         action="store_true",
         help="If dataset shards are missing, download a minimal set (>=2 parquet shards).",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help=(
+            "Train on a custom parquet corpus directory (FineWeb convention: sorted, last file is val) - "
+            "e.g. an `mgr gen-tasks` output like artifacts/diagnostics/hier. Default: the nanochat cache."
+        ),
     )
     parser.add_argument(
         "--min-parquet-files",

@@ -368,7 +368,7 @@ def test_generated_parquet_loads_through_existing_dataloader(monkeypatch, tmp_pa
 
     import nanochat.dataloader as dl_mod
 
-    monkeypatch.setattr(dl_mod, "list_parquet_files", lambda: files)
+    monkeypatch.setattr(dl_mod, "list_parquet_files", lambda data_dir=None: files)
     loader = dl_mod.tokenizing_distributed_data_loader_with_state(B=2, T=64, split="train", device="cpu")
     for _ in range(2):
         inputs, targets, state = next(loader)

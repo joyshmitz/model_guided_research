@@ -9,7 +9,7 @@ from nanochat.torch_imports import torch
 
 
 def tokenizing_distributed_data_loader_with_state(
-    B, T, split, tokenizer_threads=4, tokenizer_batch_size=128, device="cuda", resume_state_dict=None
+    B, T, split, tokenizer_threads=4, tokenizer_batch_size=128, device="cuda", resume_state_dict=None, data_dir=None
 ):
     """
     Stream pretraining text from parquet files, tokenize, yield training batches.
@@ -30,7 +30,10 @@ def tokenizing_distributed_data_loader_with_state(
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
     def document_batches():
-        parquet_paths = list_parquet_files()
+        # data_dir=None -> the FineWeb cache; a path -> any parquet corpus
+        # following the same convention (sorted; LAST file is the val split),
+        # e.g. an mgr gen-tasks output directory (bead kbj2).
+        parquet_paths = list_parquet_files(data_dir)
         parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
         resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
         resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
