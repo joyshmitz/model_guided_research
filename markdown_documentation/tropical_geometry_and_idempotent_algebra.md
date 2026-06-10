@@ -602,3 +602,21 @@ A 99th‑percentile theory researcher is equipped for semiring algebra, convex P
 4. **Hardware sim**: cycle‑accurate model of the rebracketed pipeline vs. a densified attention kernel to quantify the memory/energy advantage.
 
 **Bottom line:** The construct is **coherent and clever**, with real advantages in **certifiability and hardware realizability**, but its broad impact hinges on demonstrating competitive accuracy in at least one valued domain and tightening the training‑monotonicity claims to the scope they truly cover.
+
+## 8) The tropical FFN
+
+*(Added by bead model_guided_research-8gk.8; production implementation in `nanochat/tropical_attention_torch.py` (`TropicalMLP`), wired via `GPTConfig.ffn_type`.)*
+
+The semiring design axis above stops at attention while the FFN — roughly two thirds of a transformer's parameters — remains `(+, ×)` with a smooth nonlinearity. Extending max-plus structure to the FFN closes that gap, and in particular closes the **one hole in the end-to-end Lipschitz certificate chain**: standard MLP blocks are not 1-Lipschitz, so certified-robustness compositions (bead 8gk.7) must otherwise constrain or bound them.
+
+**The layer.** A max-plus affine stage is $y_j = \max_d (W_{jd} + x_d) + b_j$. Each coordinate is a max of unit-slope affine functions of $x$, hence nonexpansive in the sup-norm; compositions stay nonexpansive. **The pure two-stage FFN is 1-Lipschitz by construction** (`thm-maxplus-ffn-lipschitz`).
+
+**Collapse and the rank budget.** Stacked max-plus stages compose by tropical matrix multiplication: the two-stage pure FFN equals the single stage with $M_{jd} = \max_h (W^{(2)}_{jh} + b^{(1)}_h + W^{(1)}_{hd})$ and bias $b^{(2)}$ (`thm-maxplus-ffn-collapse`; max is exact, floating-point regrouping costs ulps). Pure stacks therefore gain **no depth expressivity** — but the factored form is not pointless: $M$ has **Barvinok rank ≤ d_ff**. Hidden width is a *tropical rank budget* (the hidden units are the "route prototypes" of the Newton-polytope analysis in §2/bead 8gk.3), not a feature count.
+
+**Expressivity vs. certificate: the tropical-rational mode.** The difference of two pure stacks reaches all piecewise-linear maps (tropical rational functions) at a **declared constant of 2 per layer** (difference of two 1-Lipschitz maps); residual connections add 1; $L$ stacked rational layers compound to $2^L$. The certified configuration therefore wants pure stages or a single rational layer per block — the quality-vs-certificate trade-off is exactly what the (preregistration-gated) experiment campaign measures.
+
+**Maslov smoothing.** Replacing $\max$ with $\tfrac{1}{\beta}\log\sum e^{\beta(\cdot)}$ puts the FFN on the same $(+)_\beta$ semiring family as dequantization annealing (bead 8gk.1): the LSE–max sandwich bounds the smoothed stack within $(\log d + \log d_{ff})/\beta$ of the tropical endpoint elementwise (`thm-lse-max-sandwich`; verified as an exact-inequality test), enabling **network-wide annealing** of attention and FFN under one schedule.
+
+**EVT-aware initialization.** A max over $m$ unit-scale terms sits at the Gumbel location ($\approx \mathbb{E}[\max_m \mathcal{N}(0,1)]$, e.g. $\approx 1.77$ at $m{=}16$, *below* the asymptotic $\sqrt{2\ln m} \approx 2.35$), not at 0: an uncorrected max-plus stage drifts the residual stream upward at init. The correction is baked into the **stage-1 bias** ($-\sqrt{2\ln d}$; stage 1 sees the unit-RMS normed stream), while stage 2 — whose input is the *concentrated post-max distribution*, not unit-scale — initializes its bias at zero (applying the unit-scale correction there overshoots; this was caught empirically by the init-centering test). Exact finite-$n$ constants and learning-rate exponents belong to the width-scaling table of bead lab.1, whose EVT row covers the FFN with $d_{ff}$ as the width variable.
+
+**Certificates.** `mgr certify -m tropical` carries two FFN entries: `ffn_lipschitz_1_sup_norm` (fp64 perturbation sweep against the exact inequality) and `ffn_collapse_single_layer` (stack vs. collapsed map, fp64). Margins of the output-stage maxes (`ffn_gamma_*`) are recorded under the existing `tropical_record_margins` switch — the same runner-up-gap quantity that drives the route-stability certificate.

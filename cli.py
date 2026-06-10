@@ -2980,6 +2980,58 @@ def _run_certify_checks(
             detail="recorded gamma vs sort-based runner-up gap (+ count of inf mismatches)",
         )
 
+        # --- tropical FFN (bead 8gk.8): the certified chain's MLP piece ---
+        def _ffn_tiny(ffn_type: str, dtype_=None):
+            from nanochat.gpt import GPTConfig as _Cfg
+            from nanochat.tropical_attention_torch import TropicalMLP as _TMLP
+
+            torch.manual_seed(seed)
+            cfg_f = _Cfg(sequence_len=16, vocab_size=64, n_layer=1, n_head=2, n_kv_head=2, n_embd=16, ffn_type=ffn_type)
+            mlp = _TMLP(cfg_f)
+            return mlp.double() if dtype_ == torch.float64 else mlp
+
+        def ffn_lipschitz_measure() -> float:
+            # fp64: the inequality is EXACT in real arithmetic; fp32 rounding
+            # of (x + d) alone can push the ratio a few ulps above 1
+            mlp = _ffn_tiny("tropical", dtype_=torch.float64)
+            gen = torch.Generator().manual_seed(seed)
+            worst = 0.0
+            with torch.no_grad():
+                for scale in (1e-2, 1.0, 10.0):
+                    x = torch.randn(8, 16, generator=gen, dtype=torch.float64)
+                    d = torch.randn(8, 16, generator=gen, dtype=torch.float64) * scale
+                    num = (mlp(x + d) - mlp(x)).abs().amax(dim=-1)
+                    den = d.abs().amax(dim=-1).clamp_min(1e-15)
+                    worst = max(worst, float((num / den).max()))
+            return worst
+
+        def ffn_collapse_measure() -> float:
+            mlp = _ffn_tiny("tropical", dtype_=torch.float64)
+            from nanochat.tropical_attention_torch import tropical_maxplus_layer as _layer
+
+            with torch.no_grad():
+                m, b2 = mlp.collapsed_weight()
+                gen = torch.Generator().manual_seed(seed + 1)
+                x = torch.randn(32, 16, generator=gen, dtype=torch.float64)
+                return float((mlp(x) - _layer(x, m, b2)).abs().max())
+
+        add_check(
+            "tropical",
+            "ffn_lipschitz_1_sup_norm",
+            "classical",
+            ffn_lipschitz_measure,
+            tolerance=1.0 + 1e-9,
+            detail="pure max-plus FFN, fp64: sup-norm output change / input change (thm-maxplus-ffn-lipschitz)",
+        )
+        add_check(
+            "tropical",
+            "ffn_collapse_single_layer",
+            "classical",
+            ffn_collapse_measure,
+            tolerance=1e-9,
+            detail="two-stage pure stack equals its collapsed tropical-affine map, fp64 (thm-maxplus-ffn-collapse)",
+        )
+
     # ----- quaternion: algebra laws + rotor norm preservation (fp64) -----
     if "quaternion" in mechanisms:
         from nanochat.quaternion_attention_torch import qconj, qmul, qnormalize
@@ -4160,6 +4212,8 @@ _CERTIFY_NAMED_CHECKS: frozenset[str] = frozenset(
         "surreal.layer_linearity",
         "surreal.row_norm_equals_exp_scale",
         "surreal.scale_shift_equivariance",
+        "tropical.ffn_collapse_single_layer",
+        "tropical.ffn_lipschitz_1_sup_norm",
         "tropical.lipschitz_1_sup_norm_q",
         "tropical.lipschitz_1_sup_norm_v",
         "tropical.margin_matches_bruteforce",

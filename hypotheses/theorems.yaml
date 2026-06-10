@@ -82,7 +82,9 @@ theorems:
       path: pending
       anchor: null
     proof_location: "stated with proof sketch in bead 8gk.1; formalization target of vnl.2"
-    numerical_checks: []
+    numerical_checks:
+      - kind: pytest
+        ref: tests/test_mathematical_properties.py::TestTropicalFFN::test_beta_sandwich_bound_exact
     used_by: [model_guided_research-8gk.1, model_guided_research-vnl.2]
     depends_on: []
 
@@ -349,10 +351,14 @@ theorems:
     status: proved-on-paper
     mechanisms: [tropical]
     source_note:
-      path: pending
-      anchor: null
+      path: markdown_documentation/tropical_geometry_and_idempotent_algebra.md
+      anchor: "The tropical FFN"
     proof_location: "direct computation; stated in bead 8gk.8 (collapse + rank enrichment)"
-    numerical_checks: []
+    numerical_checks:
+      - kind: certify
+        ref: tropical.ffn_collapse_single_layer
+      - kind: pytest
+        ref: tests/test_mathematical_properties.py::TestTropicalFFN::test_pure_stack_collapses_to_single_tropical_affine_map
     used_by: [model_guided_research-8gk.8, model_guided_research-8gk.3]
     depends_on: []
 
@@ -365,10 +371,16 @@ theorems:
     status: proved-on-paper
     mechanisms: [tropical]
     source_note:
-      path: pending
-      anchor: null
+      path: markdown_documentation/tropical_geometry_and_idempotent_algebra.md
+      anchor: "The tropical FFN"
     proof_location: "elementary; stated with constants in bead 8gk.8"
-    numerical_checks: []
+    numerical_checks:
+      - kind: certify
+        ref: tropical.ffn_lipschitz_1_sup_norm
+      - kind: pytest
+        ref: tests/test_mathematical_properties.py::TestTropicalFFN::test_pure_mode_is_1_lipschitz_sup_norm
+      - kind: pytest
+        ref: tests/test_mathematical_properties.py::TestTropicalFFN::test_rational_mode_is_2_lipschitz_sup_norm
     used_by: [model_guided_research-8gk.8, model_guided_research-8gk.7]
     depends_on: [thm-tropical-1-lipschitz]
 
@@ -545,7 +557,9 @@ theorems:
       path: pending
       anchor: null
     proof_location: "classical EVT (Fisher-Tippett-Gnedenko); parameterization program in bead lab.1"
-    numerical_checks: []
+    numerical_checks:
+      - kind: pytest
+        ref: tests/test_mathematical_properties.py::TestTropicalFFN::test_evt_bias_centers_init_outputs
     used_by:
       [model_guided_research-lab.1, model_guided_research-8gk.8]
     depends_on: []

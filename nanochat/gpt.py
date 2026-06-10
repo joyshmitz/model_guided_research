@@ -34,7 +34,7 @@ from nanochat.quaternion_attention_torch import QuaternionCausalSelfAttention
 from nanochat.reversible_block_torch import ReversibleBlock
 from nanochat.simplicial_attention_torch import SimplicialCausalSelfAttention
 from nanochat.surreal_torch import SurrealCausalSelfAttention
-from nanochat.tropical_attention_torch import TropicalCausalSelfAttention
+from nanochat.tropical_attention_torch import TropicalCausalSelfAttention, TropicalMLP
 from nanochat.ultrametric_attention_torch import UltrametricCausalSelfAttention
 
 try:
@@ -167,6 +167,15 @@ class GPTConfig:
     tropical_gauge_fix: bool = True
     tropical_score_center: bool = True
     tropical_record_margins: bool = False
+    # FFN structure (bead 8gk.8): the semiring design axis extended past attention.
+    # "standard" = ReLU^2 MLP; "tropical" = pure max-plus stack (1-Lipschitz,
+    # closes the certified chain's MLP hole); "tropical-rational" = difference
+    # of two pure stacks (all piecewise-linear maps, 2-Lipschitz declared).
+    ffn_type: str = "standard"
+    # Maslov smoothing for the tropical FFN: None = exact max (tropical
+    # endpoint); finite beta>0 = (+)_beta semiring (network-wide annealing
+    # alongside 8gk.1's attention schedule when that lands).
+    ffn_beta: float | None = None
     # Ultrametric-specific options (see nanochat.ultrametric_attention_torch).
     ultrametric_mode: str = "kernel"  # "kernel" | "trie"
     ultrametric_hard_digits: bool = False
@@ -318,6 +327,15 @@ class MLP(nn.Module):
         return x
 
 
+def _build_ffn(config) -> nn.Module:
+    """FFN dispatch (bead 8gk.8): standard ReLU^2 MLP, or the max-plus
+    TropicalMLP (pure 1-Lipschitz / rational 2-Lipschitz, optional Maslov
+    beta-smoothing). Validation of ffn_type happens in GPT._validate_config."""
+    if getattr(config, "ffn_type", "standard") in ("tropical", "tropical-rational"):
+        return TropicalMLP(config)
+    return MLP(config)
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -339,7 +357,9 @@ class Block(nn.Module):
                 config,
                 layer_idx,
                 CausalSelfAttention(sub_config, layer_idx),
-                MLP(sub_config),
+                # tropical FFN inside additive coupling is allowed: ANY G
+                # preserves invertibility (bead 8gk.8 interaction rule b)
+                _build_ffn(sub_config),
             )
             return
 
@@ -361,7 +381,7 @@ class Block(nn.Module):
             self.attn = SurrealCausalSelfAttention(config, layer_idx)
         else:
             self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = _build_ffn(config)
 
     def forward(self, x, cos_sin, kv_cache):
         if self.config.attention_type == "gauge":
@@ -430,6 +450,20 @@ class GPT(nn.Module):
         if self.config.attention_type == "gauge":
             if self.config.n_kv_head != self.config.n_head:
                 raise ValueError("gauge attention requires n_kv_head == n_head (GQA not supported)")
+
+        ffn_type = getattr(self.config, "ffn_type", "standard")
+        if ffn_type not in ("standard", "tropical", "tropical-rational"):
+            raise ValueError(f"ffn_type must be standard | tropical | tropical-rational, got {ffn_type!r}")
+        if ffn_type != "standard" and self.config.attention_type == "gauge":
+            # Gauge replaces the WHOLE block including the MLP (A1 boundary
+            # decision) - there is no standard MLP slot for the flag to act on.
+            raise ValueError(
+                "ffn_type is incompatible with attention_type='gauge' (the gauge block replaces the whole "
+                "block including the MLP; see beads 8gk.8 / 7b0.1)"
+            )
+        ffn_beta = getattr(self.config, "ffn_beta", None)
+        if ffn_beta is not None and not (float(ffn_beta) > 0):
+            raise ValueError(f"ffn_beta must be None or > 0, got {ffn_beta!r}")
 
         ca_rule = getattr(self.config, "ca_init_rule", None)
         if isinstance(ca_rule, str):

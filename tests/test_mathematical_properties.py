@@ -1083,6 +1083,196 @@ def run_all_tests():
     return len(failed_tests) == 0
 
 
+class TestTropicalFFN:
+    """Tropical max-plus FFN (bead 8gk.8) - the constants are theorems:
+    pure mode 1-Lipschitz, rational mode 2-Lipschitz, exact collapse of pure
+    stacks, the LSE-max sandwich at finite beta, EVT-bias centering at init,
+    and trainability of the whole GPT with the tropical FFN swapped in."""
+
+    @staticmethod
+    def _cfg(ffn_type: str = "tropical", **kw):
+        from nanochat.gpt import GPTConfig
+
+        base = dict(sequence_len=32, vocab_size=128, n_layer=1, n_head=2, n_kv_head=2, n_embd=16, ffn_type=ffn_type)
+        base.update(kw)
+        return GPTConfig(**base)
+
+    def _mlp(self, ffn_type: str = "tropical", seed: int = 0, double: bool = True, **kw):
+        import torch
+
+        from nanochat.tropical_attention_torch import TropicalMLP
+
+        torch.manual_seed(seed)
+        mlp = TropicalMLP(self._cfg(ffn_type, **kw))
+        return mlp.double() if double else mlp
+
+    def test_pure_mode_is_1_lipschitz_sup_norm(self):
+        import torch
+
+        mlp = self._mlp("tropical")
+        gen = torch.Generator().manual_seed(1)
+        with torch.no_grad():
+            for scale in (1e-3, 1e-1, 1.0, 100.0):
+                x = torch.randn(16, 16, generator=gen, dtype=torch.float64)
+                d = torch.randn(16, 16, generator=gen, dtype=torch.float64) * scale
+                num = (mlp(x + d) - mlp(x)).abs().amax(dim=-1)
+                den = d.abs().amax(dim=-1)
+                ratio = float((num / den).max())
+                require(ratio <= 1.0 + 1e-12, f"pure max-plus FFN must be 1-Lipschitz; ratio {ratio} at scale {scale}")
+
+    def test_rational_mode_is_2_lipschitz_sup_norm(self):
+        import torch
+
+        mlp = self._mlp("tropical-rational")
+        gen = torch.Generator().manual_seed(2)
+        for scale in (1e-2, 1.0, 10.0):
+            x = torch.randn(16, 16, generator=gen, dtype=torch.float64)
+            d = torch.randn(16, 16, generator=gen, dtype=torch.float64) * scale
+            ratio = float(((mlp(x + d) - mlp(x)).abs().amax(-1) / d.abs().amax(-1)).max())
+            require(ratio <= 2.0 + 1e-12, f"rational FFN must be 2-Lipschitz; ratio {ratio} at scale {scale}")
+
+    def test_pure_stack_collapses_to_single_tropical_affine_map(self):
+        import torch
+
+        from nanochat.tropical_attention_torch import tropical_maxplus_layer
+
+        mlp = self._mlp("tropical", seed=3)
+        m, b2 = mlp.collapsed_weight()
+        x = torch.randn(64, 16, dtype=torch.float64)
+        diff = float((mlp(x) - tropical_maxplus_layer(x, m, b2)).abs().max())
+        require(diff < 1e-12, f"collapse theorem violated: max|stack - collapsed| = {diff:.3e} (fp64)")
+
+    def test_rational_mode_refuses_collapse(self):
+        mlp = self._mlp("tropical-rational")
+        try:
+            mlp.collapsed_weight()
+            raise AssertionError("collapsed_weight() must raise for the rational mode")
+        except ValueError:
+            pass
+
+    def test_beta_sandwich_bound_exact(self):
+        """hard <= smooth <= hard + (log d + log d_ff)/beta, elementwise -
+        the LSE-max sandwich through both stages (thm-lse-max-sandwich)."""
+        import math as _math
+
+        import torch
+
+        beta = 7.0
+        hard = self._mlp("tropical", seed=4)
+        smooth = self._mlp("tropical", seed=999, ffn_beta=beta)
+        smooth.load_state_dict(hard.state_dict())  # identical weights
+        x = torch.randn(32, 16, dtype=torch.float64)
+        h, s = hard(x), smooth(x)
+        d_in, d_ff = 16, 64
+        bound = (_math.log(d_in) + _math.log(d_ff)) / beta
+        low_ok = float((s - h).min())
+        high_ok = float((s - h).max())
+        require(low_ok >= -1e-9, f"smoothed FFN fell below the hard max: min(s-h) = {low_ok:.3e}")
+        require(high_ok <= bound + 1e-9, f"sandwich violated: max(s-h) = {high_ok:.4f} > {bound:.4f}")
+
+    def test_evt_bias_centers_init_outputs(self):
+        import torch
+
+        mlp = self._mlp("tropical", seed=5)
+        x = torch.randn(256, 16, dtype=torch.float64)
+        with torch.no_grad():
+            out_mean = float(mlp(x).mean())
+        require(abs(out_mean) < 1.5, f"EVT bias should keep init outputs near-centered, got mean {out_mean:.3f}")
+        # control: without the correction the stack drifts up by ~E[max of 16
+        # N(0,1)] ~ 1.77 (the finite-n Gumbel location - BELOW the asymptotic
+        # sqrt(2 ln 16) = 2.35; lab.1's table owns the exact constants)
+        with torch.no_grad():
+            mlp.b1.zero_()
+            mlp.b2.zero_()
+            drift = float(mlp(x).mean())
+        require(drift > 1.5, f"zeroed-bias control should drift upward by ~1.77; got {drift:.3f}")
+        require(drift - out_mean > 1.5, f"correction effect too small: centered {out_mean:.2f} vs control {drift:.2f}")
+
+    def test_margin_buffers_record_when_enabled(self):
+        import torch
+
+        mlp = self._mlp("tropical", seed=6, double=False, tropical_record_margins=True)
+        x = torch.randn(8, 16)
+        mlp(x)
+        require(hasattr(mlp, "ffn_gamma_min") and hasattr(mlp, "ffn_gamma_mean"), "margin buffers missing")
+        require(float(mlp.ffn_gamma_min) >= 0.0, "gamma_min must be nonnegative (top1 - top2)")
+        require(float(mlp.ffn_gamma_mean) >= float(mlp.ffn_gamma_min), "gamma_mean must dominate gamma_min")
+
+    def test_margins_path_matches_plain_path(self):
+        import torch
+
+        recording = self._mlp("tropical", seed=7, double=False, tropical_record_margins=True)
+        plain = self._mlp("tropical", seed=999, double=False)
+        plain.load_state_dict(dict(recording.state_dict().items()), strict=False)
+        x = torch.randn(8, 16)
+        require(
+            bool(torch.equal(recording(x), plain(x))),
+            "margin recording must not change the forward output (same max, bitwise)",
+        )
+
+    def test_pointwise_decode_parity(self):
+        import torch
+
+        mlp = self._mlp("tropical", seed=8, double=False)
+        x = torch.randn(1, 12, 16)
+        full = mlp(x)
+        stepped = torch.cat([mlp(x[:, t : t + 1]) for t in range(12)], dim=1)
+        require(bool(torch.equal(full, stepped)), "FFN is pointwise: full vs per-token forward must be bitwise equal")
+
+    def test_gradcheck_pure_mode(self):
+        import torch
+
+        mlp = self._mlp("tropical", seed=9)
+        x = torch.randn(3, 16, dtype=torch.float64, requires_grad=True)
+        require(
+            torch.autograd.gradcheck(lambda inp: mlp(inp).sum(), (x,), eps=1e-6, atol=1e-4),
+            "gradcheck failed for pure max-plus FFN",
+        )
+
+    def test_training_smoke_loss_decreases(self):
+        import torch
+
+        from nanochat.gpt import GPT
+
+        for ffn_type, steps in (("tropical", 30), ("tropical-rational", 20)):
+            torch.manual_seed(11)
+            model = GPT(self._cfg(ffn_type, n_layer=2, n_embd=32))
+            ids = torch.randint(0, 128, (4, 24))
+            targets = torch.randint(0, 128, (4, 24))
+            opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+            first = last = None
+            for _ in range(steps):
+                loss = model(ids, targets=targets)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                first = float(loss) if first is None else first
+                last = float(loss)
+            require(
+                last < first * 0.9,
+                f"{ffn_type} GPT failed to train on the memorization smoke: first={first:.3f} last={last:.3f}",
+            )
+
+    def test_invalid_configs_rejected(self):
+        from nanochat.gpt import GPT
+
+        try:
+            GPT(self._cfg("tropical", attention_type="gauge", n_kv_head=2))
+            raise AssertionError("gauge + tropical FFN must be rejected")
+        except ValueError as exc:
+            require("gauge" in str(exc), f"unhelpful gauge-combo error: {exc}")
+        try:
+            GPT(self._cfg("tropical", ffn_beta=-1.0))
+            raise AssertionError("ffn_beta <= 0 must be rejected")
+        except ValueError:
+            pass
+        try:
+            GPT(self._cfg("maxplus"))
+            raise AssertionError("unknown ffn_type must be rejected")
+        except ValueError:
+            pass
+
+
 if __name__ == "__main__":
     success = run_all_tests()
     sys.exit(0 if success else 1)

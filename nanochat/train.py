@@ -51,6 +51,9 @@ _SUPPORTED_ATTENTION_TYPES = (
     "gauge",
 )
 
+# FFN structure variants (bead 8gk.8): the semiring axis extended to the MLP.
+_SUPPORTED_FFN_TYPES = ("standard", "tropical", "tropical-rational")
+
 
 def _select_env_vars() -> dict[str, str]:
     prefixes = ("CUDA", "NCCL", "TORCH", "PYTORCH", "NANOCHAT")
@@ -287,6 +290,20 @@ def _validate_train_args(args, *, ddp_rank: int, device: torch.device) -> None:
     if attention_type not in _SUPPORTED_ATTENTION_TYPES:
         errors.append(f"--attention-type must be one of: {', '.join(_SUPPORTED_ATTENTION_TYPES)}")
 
+    ffn_type = str(getattr(args, "ffn_type", "standard"))
+    if ffn_type not in _SUPPORTED_FFN_TYPES:
+        errors.append(f"--ffn-type must be one of: {', '.join(_SUPPORTED_FFN_TYPES)}")
+    if ffn_type != "standard" and attention_type == "gauge":
+        errors.append(
+            "--ffn-type is incompatible with --attention-type gauge: the gauge block replaces the whole "
+            "block including the MLP (beads 8gk.8 / 7b0.1)."
+        )
+    ffn_beta = getattr(args, "ffn_beta", None)
+    if ffn_beta is not None and not (float(ffn_beta) > 0):
+        errors.append(f"--ffn-beta must be > 0 when set (got {ffn_beta}); omit it for the exact tropical endpoint.")
+    if ffn_beta is not None and ffn_type == "standard":
+        warnings.append("--ffn-beta has no effect with --ffn-type standard.")
+
     if bool(getattr(args, "use_flex_attention", False)) and not hasattr(torch.nn.attention, "flex_attention"):
         errors.append("--use-flex-attention requires torch>=2.5 (missing torch.nn.attention.flex_attention).")
 
@@ -361,6 +378,9 @@ def train(args) -> None:
         config.sequence_len = args.sequence_len
         config.optimizer_type = args.optimizer_type
         config.attention_type = args.attention_type
+        config.ffn_type = str(getattr(args, "ffn_type", "standard"))
+        ffn_beta_arg = getattr(args, "ffn_beta", None)
+        config.ffn_beta = float(ffn_beta_arg) if ffn_beta_arg is not None else None
         config.use_flex_attention = bool(getattr(args, "use_flex_attention", False))
         std_entropy = getattr(args, "standard_record_attn_entropy", None)
         if std_entropy is not None:
@@ -1100,6 +1120,19 @@ if __name__ == "__main__":
     )
     parser.add_argument("--optimizer-type", type=str, default="adamw", choices=_SUPPORTED_OPTIMIZER_TYPES)
     parser.add_argument("--attention-type", type=str, default="standard", choices=_SUPPORTED_ATTENTION_TYPES)
+    parser.add_argument(
+        "--ffn-type",
+        type=str,
+        default="standard",
+        choices=_SUPPORTED_FFN_TYPES,
+        help="FFN structure: standard ReLU^2 MLP, pure max-plus (1-Lipschitz), or tropical-rational (8gk.8)",
+    )
+    parser.add_argument(
+        "--ffn-beta",
+        type=float,
+        default=None,
+        help="Maslov smoothing for tropical FFN modes: omit for the exact max endpoint, >0 for (+)_beta",
+    )
     parser.add_argument(
         "--standard-record-attn-entropy",
         action=argparse.BooleanOptionalAction,
