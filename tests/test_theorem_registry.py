@@ -129,6 +129,19 @@ def test_dangling_depends_on_rejected() -> None:
     assert any("unknown theorem id 'thm-does-not-exist'" in e for e in errors), f"got: {errors}"
 
 
+def test_string_depends_on_rejected_with_single_error() -> None:
+    """A malformed string depends_on must produce ONE clear type error, not
+    one confusing unknown-id error per character."""
+    errors, _, _ = validate(registry(entry(depends_on="thm-other")))
+    assert any("depends_on must be a list" in e for e in errors), f"got: {errors}"
+    assert not any("unknown theorem id" in e for e in errors), f"char-iteration leak: {errors}"
+
+
+def test_nonstring_mechanism_rejected() -> None:
+    errors, _, _ = validate(registry(entry(mechanisms=["tropical", None])))
+    assert any("mechanisms must be a list of strings" in e for e in errors), f"got: {errors}"
+
+
 def test_unknown_certify_ref_rejected() -> None:
     errors, _, _ = validate(
         registry(entry(numerical_checks=[{"kind": "certify", "ref": "tropical.not_a_real_check"}]))

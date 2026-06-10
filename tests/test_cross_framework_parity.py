@@ -41,9 +41,10 @@ TOLERANCE TABLE
   atol 1e-5 (fp32)  : trie alpha-weighted reads vs oracle (fp32 sum order)
 
 MUTATION CHECK (performed during development of this suite, then reverted):
-  flipping the sign of the ay*bz term in torch qmul made
-  test_qmul_parity fail with max|diff| ~ O(1); flipping the d_conj*b sign in
-  torch omul made test_omul_parity fail. The suite has teeth.
+  flipping the sign of the az*bx term in torch qmul's oy component made
+  test_qmul_parity fail with max|diff| ~ O(1); flipping the Cayley-Dickson
+  'ac - d_conj*b' sign in torch omul made test_omul_parity fail (both dtypes).
+  The suite has teeth. (Seed 20260610; recorded in the bead close notes.)
 """
 
 from __future__ import annotations

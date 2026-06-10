@@ -4174,8 +4174,9 @@ def _validate_theorem_registry(
 
         if not isinstance(t.get("statement"), str) or not t["statement"].strip():
             errors.append(f"{where}: statement must be a non-empty string")
-        if not isinstance(t.get("mechanisms"), list):
-            errors.append(f"{where}: mechanisms must be a list")
+        mechanisms = t.get("mechanisms")
+        if not isinstance(mechanisms, list) or not all(isinstance(m, str) for m in mechanisms):
+            errors.append(f"{where}: mechanisms must be a list of strings")
         if not isinstance(t.get("proof_location"), str) or not t["proof_location"].strip():
             errors.append(f"{where}: proof_location must be a non-empty string")
 
@@ -4230,9 +4231,15 @@ def _validate_theorem_registry(
                 elif collected_pytest_ids is not None and not _pytest_ref_resolves(ref, collected_pytest_ids):
                     errors.append(f"{where}: pytest ref does not resolve against live collection: {ref}")
 
-        for dep in t.get("depends_on", []) or []:
-            if dep not in all_ids:
-                errors.append(f"{where}: depends_on references unknown theorem id {dep!r}")
+        depends_on = t.get("depends_on")
+        if not isinstance(depends_on, list):
+            # without this check a malformed string value would iterate per
+            # character and emit one confusing error per letter
+            errors.append(f"{where}: depends_on must be a list (may be empty)")
+        else:
+            for dep in depends_on:
+                if dep not in all_ids:
+                    errors.append(f"{where}: depends_on references unknown theorem id {dep!r}")
         used_by = t.get("used_by")
         if not isinstance(used_by, list):
             errors.append(f"{where}: used_by must be a list (may be empty)")
@@ -4379,7 +4386,14 @@ def theorems_validate(
                 wtable.add_row(w)
             console.print(wtable)
         color = "red" if errors else ("yellow" if warnings else "green")
-        tier = "deep (pytest collection resolved)" if deep and collected is not None else "static"
+        if not deep:
+            tier = "static"
+        elif collected is not None:
+            tier = "deep (pytest collection resolved)"
+        elif collect_problem:
+            tier = "deep (pytest collection FAILED)"
+        else:
+            tier = "deep (no pytest refs to resolve)"
         console.print(
             Panel(
                 f"[bold {color}]{summary['entries']} entries · "
