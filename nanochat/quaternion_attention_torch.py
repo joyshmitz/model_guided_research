@@ -4,10 +4,9 @@ Implements "Rotor-Gate" style attention where features are treated as quaternion
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-from nanochat.model_utils import apply_rotary_emb, causal_attn_mask, norm, repeat_kv_heads
+from nanochat.model_utils import AttentionCore
 
 
 def qmul(a, b):
@@ -46,140 +45,51 @@ def qnormalize(q):
     return F.normalize(q, p=2, dim=-1)
 
 
-class QuaternionCausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
+class QuaternionCausalSelfAttention(AttentionCore):
+    """Rotor-gate attention: standard scalar scores, quaternion value mixing.
 
+    Scores stay the real dot product (the R^4 dot product IS the scalar part
+    of q1 * conj(q2), so flat vectors give the same scalar affinity without
+    materializing the (Tq, Tk, N, 4) rotor tensor). The value update uses the
+    FULL quaternion product via relative rotors R_ij = Q_i * conj(K_j):
+
+        y_i = sum_j probs_ij * (Q_i * conj(K_j) * V_j)
+
+    which quaternion associativity factors into three cheap steps (see
+    aggregate()). Q/K are per-channel normalized before any quaternion
+    product so the rotor multiplications are norm-preserving.
+    """
+
+    def __init__(self, config, layer_idx):
+        # Standard linear projections; the output is interpreted as
+        # head_dim/4 quaternions per head.
+        super().__init__(config, layer_idx)
         if self.n_embd % 4 != 0:
             raise ValueError("n_embd must be divisible by 4 for Quaternion attention")
-
-        self.head_dim = self.n_embd // self.n_head
-
         if self.head_dim % 4 != 0:
             raise ValueError("head_dim must be divisible by 4 for Quaternion attention")
 
-        # We use standard linear layers for projection, but interpret output as quaternions
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+    def score(self, q, k):
+        return (q @ k.transpose(-2, -1)) * (1.0 / (self.head_dim**0.5))
 
-    def forward(self, x, cos_sin, kv_cache):
-        B, T, C = x.size()
+    def aggregate(self, weights, v, *, q, k, kv_cache, pos0):
+        B = q.size(0)
+        Tk = v.size(2)
 
-        # Project
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        # Rotary Embeddings (Standard)
-        # Note: Rotary embeddings are complex rotations. Quaternions are 4D.
-        # We can apply rotary embeddings to the pairs inside the quaternion or just apply it before quaternion interpretation.
-        # Let's apply standard RoPE for now as position encoding.
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
-
-        # Transpose to (B, H, T, D)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-
-        if kv_cache is not None:
-            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-
-        if self.n_kv_head != self.n_head:
-            k, v = repeat_kv_heads(k, v, n_head=self.n_head)
-
-        # Interpret as Quaternions
-        # Reshape (..., D) -> (..., D/4, 4)
-        q_q = q.view(B, self.n_head, -1, self.head_dim // 4, 4)
-        k_q = k.view(B, self.n_head, -1, self.head_dim // 4, 4)
+        # Interpret as quaternions: (..., D) -> (..., D/4, 4), and normalize
+        # per-channel so rotor multiplications are norm-preserving.
+        q_q = qnormalize(q.view(B, self.n_head, -1, self.head_dim // 4, 4))
+        k_q = qnormalize(k.view(B, self.n_head, -1, self.head_dim // 4, 4))
         v_q = v.view(B, self.n_head, -1, self.head_dim // 4, 4)
 
-        # Normalize per-channel quaternions so rotor multiplications are norm-preserving.
-        q_q = qnormalize(q_q)
-        k_q = qnormalize(k_q)
-
-        # Attention Score = ScalarPart(Q * K_conj)
-        # Q: (B, H, Tq, N, 4)
-        # K: (B, H, Tk, N, 4)
-        # We need to sum over N (the quaternion vector dimension) to get a single score per token pair?
-        # Standard attention: dot product.
-        # Dot product of two quaternions q1, q2 is ScalarPart(q1 * q2_conj).
-        # So we can just compute Q * K_conj and sum the scalar parts over the N dimension?
-        # Or do we want vector-valued attention weights?
-        # Standard Transformer reduces to scalar attention weights.
-
-        # Compute Q * K_conj
-        # We need broadcasting for Tq and Tk.
-        # q_q: (B, H, Tq, 1, N, 4)
-        # k_q: (B, H, 1, Tk, N, 4)
-
-        # Memory optimization: This 5D/6D tensor might be huge.
-        # Let's compute the dot product directly.
-        # Dot product in R^4 is same as ScalarPart(q1 * q2_conj).
-        # So we can just treat them as real vectors for the score calculation!
-        # (B, H, Tq, D) @ (B, H, Tk, D)^T -> (B, H, Tq, Tk)
-
-        # Wait, the "Rotor-Gate" idea is that we use the FULL quaternion product for the value update.
-        # But for the *score*, we usually need a scalar.
-        # Let's stick to: Score = Real Dot Product (standard).
-        # BUT, the value aggregation is: Y = sum(Attn * (Q * K_conj * V)).
-        # "Attention via relative rotors: Query-key relations use q * conj(k) both to generate scalar scores and to rotate values"
-
-        # 1. Compute Relative Rotors R_ij = Q_i * K_j_conj
-        # This is (Tq, Tk, N, 4). Heavy!
-        # If we simply compute standard attention scores:
-        scores = (q @ k.transpose(-2, -1)) * (1.0 / (self.head_dim**0.5))
-
-        # Masking
-        Tq = q.size(2)
-        Tk = k.size(2)
-        if kv_cache is None or Tq > 1:
-            mask = causal_attn_mask(Tq, Tk, device=q.device)
-            scores.masked_fill_(~mask, float("-inf"))
-
-        probs = F.softmax(scores, dim=-1)  # (B, H, Tq, Tk)
-
-        # Value mixing
-        # Standard: y = probs @ v
-        # Rotor: y_i = sum_j probs_ij * (R_ij * v_j)
-        # R_ij = q_i * k_j_conj
-        # y_i = sum_j probs_ij * (q_i * k_j_conj * v_j)
-        # This is associative: q_i * sum_j (probs_ij * k_j_conj * v_j)
-        # So we can:
-        # 1. Compute T_j = k_j_conj * v_j  (Elementwise quaternion mul)
-        # 2. Aggregate: A_i = sum_j probs_ij * T_j (Standard attention aggregation)
-        # 3. Rotate: y_i = q_i * A_i
-
-        # Step 1: T = K_conj * V
-        # k_q: (B, H, Tk, N, 4)
-        # v_q: (B, H, Tk, N, 4)
+        # y_i = sum_j probs_ij * (q_i * k_j_conj * v_j) is associative, so:
+        # 1. T_j = k_j_conj * v_j      (elementwise quaternion mul)
         t_q = qmul(qconj(k_q), v_q)  # (B, H, Tk, N, 4)
-
-        # Flatten T back to (B, H, Tk, D) for aggregation
         t_flat = t_q.view(B, self.n_head, Tk, self.head_dim)
-
-        # Step 2: Aggregate
-        # probs: (B, H, Tq, Tk)
-        # t_flat: (B, H, Tk, D)
-        # agg = probs @ t_flat -> (B, H, Tq, D)
-        agg = probs @ t_flat
-
-        # Step 3: Rotate
-        # agg reshaped to quaternion
+        # 2. A_i = sum_j probs_ij T_j  (standard attention aggregation)
+        agg = weights @ t_flat  # (B, H, Tq, D)
+        # 3. y_i = q_i * A_i           (rotate by the query rotor)
         agg_q = agg.view(B, self.n_head, -1, self.head_dim // 4, 4)
-
-        # y = q * agg
         y_q = qmul(q_q, agg_q)
 
-        # Flatten
-        y = y_q.view(B, self.n_head, -1, self.head_dim)
-
-        # Output projection
-        y = y.transpose(1, 2).contiguous().view(B, Tq, -1)
-        y = self.c_proj(y)
-        return y
+        return y_q.view(B, self.n_head, -1, self.head_dim)
