@@ -1,0 +1,351 @@
+{
+  "date": "2026-06-10",
+  "policy_version": "ci-v1",
+  "verdicts": [
+    {
+      "arms": {
+        "ultrametric": {
+          "ci95": [
+            -0.014436763449225344,
+            0.014436763449225344
+          ],
+          "effect": 0.0,
+          "n_baseline": 9,
+          "n_candidate": 9,
+          "verdict": "refuted"
+        }
+      },
+      "artifacts": [
+        "artifacts/evals/tasks/pilot1-arith-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-ultrametric-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-ultrametric-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-ultrametric-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s2/summary.json"
+      ],
+      "id": "hyp-ultrametric-hier-heldout-depth",
+      "policy_version": "ci-v1",
+      "tainted_artifacts_seen": false,
+      "verdict": "refuted"
+    },
+    {
+      "arms": {
+        "fractal": {
+          "ci95": [
+            -0.014436763449225344,
+            0.014436763449225344
+          ],
+          "effect": 0.0,
+          "n_baseline": 9,
+          "n_candidate": 9,
+          "verdict": "refuted"
+        }
+      },
+      "artifacts": [
+        "artifacts/evals/tasks/pilot1-arith-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-fractal-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-fractal-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-fractal-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s2/summary.json"
+      ],
+      "id": "hyp-fractal-hier-heldout-depth",
+      "policy_version": "ci-v1",
+      "tainted_artifacts_seen": false,
+      "verdict": "refuted"
+    },
+    {
+      "id": "hyp-ultrametric-needle-long-context",
+      "mechanism": "ultrametric",
+      "reason": "qualifying artifact lacks the metric at the registered path",
+      "reason_code": "metric_missing",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-ultrametric-trie-decode-speedup",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "arms": {
+        "braid": {
+          "ci95": [
+            -0.07501562337273482,
+            0.07501562337273482
+          ],
+          "effect": 0.0,
+          "n_baseline": 9,
+          "n_candidate": 9,
+          "verdict": "inconclusive"
+        }
+      },
+      "artifacts": [
+        "artifacts/evals/tasks/pilot1-arith-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-braid-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-braid-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-braid-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s2/summary.json"
+      ],
+      "id": "hyp-braid-dyck-depth-extrapolation",
+      "policy_version": "ci-v1",
+      "tainted_artifacts_seen": false,
+      "verdict": "inconclusive"
+    },
+    {
+      "id": "hyp-braid-length-generalization",
+      "mechanism": "braid",
+      "reason": "qualifying artifact lacks the metric at the registered path",
+      "reason_code": "metric_missing",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-reversible-activation-memory",
+      "mechanism": "reversible",
+      "reason": "only tainted artifacts available (dirty tree / missing provenance) - evidence not attributable to a committed code state",
+      "reason_code": "tainted_evidence",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-reversible-gradient-stability",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-tropical-needle-no-dilution",
+      "mechanism": "tropical",
+      "reason": "no qualifying artifact for the candidate arm",
+      "reason_code": "no_candidate_artifacts",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-tropical-certified-robustness",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "arms": {
+        "quaternion": {
+          "ci95": [
+            -0.02500520779091161,
+            0.02500520779091161
+          ],
+          "effect": 0.0,
+          "n_baseline": 9,
+          "n_candidate": 9,
+          "verdict": "refuted"
+        }
+      },
+      "artifacts": [
+        "artifacts/evals/tasks/pilot1-arith-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-quaternion-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-quaternion-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-quaternion-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s2/summary.json"
+      ],
+      "id": "hyp-quaternion-rotation-composition",
+      "policy_version": "ci-v1",
+      "tainted_artifacts_seen": false,
+      "verdict": "refuted"
+    },
+    {
+      "id": "hyp-octonion-rotation-composition",
+      "mechanism": "octonion",
+      "reason": "no qualifying artifact for the candidate arm",
+      "reason_code": "no_candidate_artifacts",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-octonion-norm-stability",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "arms": {
+        "simplicial": {
+          "ci95": [
+            -0.02887352689845069,
+            0.02887352689845069
+          ],
+          "effect": 0.0,
+          "n_baseline": 9,
+          "n_candidate": 9,
+          "verdict": "refuted"
+        }
+      },
+      "artifacts": [
+        "artifacts/evals/tasks/pilot1-arith-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-simplicial-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-simplicial-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-simplicial-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s2/summary.json"
+      ],
+      "id": "hyp-simplicial-two-hop-composition",
+      "policy_version": "ci-v1",
+      "tainted_artifacts_seen": false,
+      "verdict": "refuted"
+    },
+    {
+      "arms": {
+        "surreal": {
+          "ci95": [
+            -0.02500520779091161,
+            0.02500520779091161
+          ],
+          "effect": 0.0,
+          "n_baseline": 9,
+          "n_candidate": 9,
+          "verdict": "refuted"
+        }
+      },
+      "artifacts": [
+        "artifacts/evals/tasks/pilot1-arith-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-surreal-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-surreal-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-arith-surreal-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-dyck-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-hier-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-rel-standard-s2/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s0/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s1/summary.json",
+        "artifacts/evals/tasks/pilot1-rot-standard-s2/summary.json"
+      ],
+      "id": "hyp-surreal-wide-dynamic-range",
+      "policy_version": "ci-v1",
+      "tainted_artifacts_seen": false,
+      "verdict": "refuted"
+    },
+    {
+      "id": "hyp-surreal-scaling-axis-prediction",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-ordinal-regime-shift-recovery",
+      "mechanism": "ordinal",
+      "reason": "no qualifying artifact for the candidate arm",
+      "reason_code": "no_candidate_artifacts",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-hoss-stiff-lr-robustness",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-gauge-gradient-stability",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-gauge-bag-conservation",
+      "mechanism": "gauge",
+      "reason": "no qualifying artifact for the candidate arm",
+      "reason_code": "no_candidate_artifacts",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-group-nonsolvable-barrier",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-placebo-no-winner",
+      "mechanism": "tropical",
+      "reason": "no qualifying artifact for the candidate arm",
+      "reason_code": "no_candidate_artifacts",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-ordinal-cosine-parity-simple",
+      "mechanism": "ordinal",
+      "reason": "no qualifying artifact for the candidate arm",
+      "reason_code": "no_candidate_artifacts",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-gauge-grad-stability-demo",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    }
+  ]
+}

@@ -73,9 +73,10 @@ hypotheses:
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
       scale_caveats: "registered at nanochat research scale; E1 rungs decide persistence"
-    status: open
+    status: refuted
     evidence: []
-    verdict_history: []
+    verdict_history:
+      - {date: "2026-06-10", verdict: refuted, artifacts: ["artifacts/evals/tasks/pilot1-arith-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-arith-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-arith-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-hier-ultrametric-s0/summary.json", "artifacts/evals/tasks/pilot1-hier-ultrametric-s1/summary.json", "artifacts/evals/tasks/pilot1-hier-ultrametric-s2/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s2/summary.json"], adjudicator: "engine:ci-v1", policy_version: "ci-v1", arms: {"ultrametric": {"ci95": [-0.014436763449225344, 0.014436763449225344], "effect": 0.0, "n_baseline": 9, "n_candidate": 9, "verdict": "refuted"}}}
 
   - id: hyp-fractal-hier-heldout-depth
     statement: >-
@@ -96,9 +97,10 @@ hypotheses:
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
       scale_caveats: "registered at nanochat research scale"
-    status: open
+    status: refuted
     evidence: []
-    verdict_history: []
+    verdict_history:
+      - {date: "2026-06-10", verdict: refuted, artifacts: ["artifacts/evals/tasks/pilot1-arith-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-arith-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-arith-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-hier-fractal-s0/summary.json", "artifacts/evals/tasks/pilot1-hier-fractal-s1/summary.json", "artifacts/evals/tasks/pilot1-hier-fractal-s2/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s2/summary.json"], adjudicator: "engine:ci-v1", policy_version: "ci-v1", arms: {"fractal": {"ci95": [-0.014436763449225344, 0.014436763449225344], "effect": 0.0, "n_baseline": 9, "n_candidate": 9, "verdict": "refuted"}}}
 
   - id: hyp-ultrametric-needle-long-context
     statement: >-
@@ -164,9 +166,10 @@ hypotheses:
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
       scale_caveats: "registered at nanochat research scale"
-    status: open
+    status: inconclusive
     evidence: []
-    verdict_history: []
+    verdict_history:
+      - {date: "2026-06-10", verdict: inconclusive, artifacts: ["artifacts/evals/tasks/pilot1-arith-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-arith-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-arith-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-dyck-braid-s0/summary.json", "artifacts/evals/tasks/pilot1-dyck-braid-s1/summary.json", "artifacts/evals/tasks/pilot1-dyck-braid-s2/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s2/summary.json"], adjudicator: "engine:ci-v1", policy_version: "ci-v1", arms: {"braid": {"ci95": [-0.07501562337273482, 0.07501562337273482], "effect": 0.0, "n_baseline": 9, "n_candidate": 9, "verdict": "inconclusive"}}}
 
   - id: hyp-braid-length-generalization
     statement: >-
@@ -299,9 +302,10 @@ hypotheses:
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
       scale_caveats: "registered at nanochat research scale"
-    status: open
+    status: refuted
     evidence: []
-    verdict_history: []
+    verdict_history:
+      - {date: "2026-06-10", verdict: refuted, artifacts: ["artifacts/evals/tasks/pilot1-arith-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-arith-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-arith-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-rot-quaternion-s0/summary.json", "artifacts/evals/tasks/pilot1-rot-quaternion-s1/summary.json", "artifacts/evals/tasks/pilot1-rot-quaternion-s2/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s2/summary.json"], adjudicator: "engine:ci-v1", policy_version: "ci-v1", arms: {"quaternion": {"ci95": [-0.02500520779091161, 0.02500520779091161], "effect": 0.0, "n_baseline": 9, "n_candidate": 9, "verdict": "refuted"}}}
 
   - id: hyp-octonion-rotation-composition
     statement: >-
@@ -366,9 +370,10 @@ hypotheses:
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
       scale_caveats: "the doc's provably-impossible construction is stronger than this LM proxy; a dedicated task may sharpen the threshold later"
-    status: open
+    status: refuted
     evidence: []
-    verdict_history: []
+    verdict_history:
+      - {date: "2026-06-10", verdict: refuted, artifacts: ["artifacts/evals/tasks/pilot1-arith-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-arith-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-arith-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-rel-simplicial-s0/summary.json", "artifacts/evals/tasks/pilot1-rel-simplicial-s1/summary.json", "artifacts/evals/tasks/pilot1-rel-simplicial-s2/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s2/summary.json"], adjudicator: "engine:ci-v1", policy_version: "ci-v1", arms: {"simplicial": {"ci95": [-0.02887352689845069, 0.02887352689845069], "effect": 0.0, "n_baseline": 9, "n_candidate": 9, "verdict": "refuted"}}}
 
   # ---------------------------------------------------------------------------
   # Scale & dynamics (surreal / ordinal / hoss / gauge)
@@ -392,9 +397,10 @@ hypotheses:
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
       scale_caveats: "registered at nanochat research scale"
-    status: open
+    status: refuted
     evidence: []
-    verdict_history: []
+    verdict_history:
+      - {date: "2026-06-10", verdict: refuted, artifacts: ["artifacts/evals/tasks/pilot1-arith-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-arith-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-arith-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-arith-surreal-s0/summary.json", "artifacts/evals/tasks/pilot1-arith-surreal-s1/summary.json", "artifacts/evals/tasks/pilot1-arith-surreal-s2/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-dyck-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-hier-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-rel-standard-s2/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s0/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s1/summary.json", "artifacts/evals/tasks/pilot1-rot-standard-s2/summary.json"], adjudicator: "engine:ci-v1", policy_version: "ci-v1", arms: {"surreal": {"ci95": [-0.02500520779091161, 0.02500520779091161], "effect": 0.0, "n_baseline": 9, "n_candidate": 9, "verdict": "refuted"}}}
 
   - id: hyp-surreal-scaling-axis-prediction
     statement: >-
