@@ -16,6 +16,20 @@ def _tropical_center(x: torch.Tensor, *, dim: int = -1) -> torch.Tensor:
     return x - x.amax(dim=dim, keepdim=True)
 
 
+def tropical_inner(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """Max-plus inner product: out[..., i, j] = max_d (q[..., i, d] + k[..., j, d]).
+
+    This is the score stage of tropical attention, exposed as a pure function.
+    It is the torch twin of the JAX demo's tropical matrix product
+    (tropical_geometry_and_idempotent_algebra.tmm): tropical_inner(Q, K)
+    equals tmm(Q, K^T) entrywise, exactly (max and + are exact float ops).
+    Kept separable so the cross-framework parity suite
+    (tests/test_cross_framework_parity.py, bead model_guided_research-5ki.6)
+    can compare the two implementations directly.
+    """
+    return torch.max(q.unsqueeze(-2) + k.unsqueeze(-3), dim=-1).values
+
+
 def tropical_max_plus_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -55,7 +69,7 @@ def tropical_max_plus_attention(
         v = _tropical_center(v, dim=-1)
 
     # Similarity/logits: score(q,k) = max_d (q_d + k_d)  (max-plus dot product)
-    attn_scores = torch.max(q.unsqueeze(3) + k.unsqueeze(2), dim=-1).values  # (B, H, Tq, Tk)
+    attn_scores = tropical_inner(q, k)  # (B, H, Tq, Tk)
 
     mask = causal_attn_mask(Tq, Tk, device=q.device)
     attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
