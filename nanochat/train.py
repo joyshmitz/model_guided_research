@@ -827,7 +827,8 @@ def train(args) -> None:
                 "has_gauss": int(np_has_gauss),
                 "cached_gaussian": float(np_cached),
             },
-            "python": [int(py_version), [int(v) for v in py_internal], py_gauss],
+            # gauss slot is None or the cached Box-Muller float - normalize explicitly
+            "python": [int(py_version), [int(v) for v in py_internal], None if py_gauss is None else float(py_gauss)],
         }
         train_state: dict[str, Any] = {
             "optimizers": [opt.state_dict() for opt in optimizers],
@@ -1124,8 +1125,15 @@ def train(args) -> None:
 
     # Final checkpoint so downstream consumers (eval C2, teachers C6) always
     # have the end-of-run state, even when max_steps is not a multiple of the
-    # interval. Skipped if the interval already saved this exact step.
-    if checkpoint_interval > 0 and last_completed_step >= 0 and last_completed_step not in checkpoint_saved_steps:
+    # interval. Skipped if the interval already saved this exact step, and
+    # skipped when THIS run trained no steps (a resume of an already-complete
+    # run has an empty last_loader_state - saving would record a bogus
+    # data position; the parent's checkpoint already covers that step).
+    if (
+        checkpoint_interval > 0
+        and last_completed_step >= start_step
+        and last_completed_step not in checkpoint_saved_steps
+    ):
         save_training_checkpoint(last_completed_step)
 
     if device.type == "cuda":

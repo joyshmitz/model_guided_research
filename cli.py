@@ -4132,7 +4132,11 @@ def gen_tasks(
         if not sep:
             console.print(f"[bold red]--dial expects name=value, got {pair!r}[/bold red]")
             raise typer.Exit(code=2)
-        dial_overrides[key.strip()] = float(value)
+        try:
+            dial_overrides[key.strip()] = float(value)
+        except ValueError:
+            console.print(f"[bold red]--dial value must be numeric, got {pair!r}[/bold red]")
+            raise typer.Exit(code=2) from None
 
     if task == "all":
         names = list(DEFAULT_TASKS) + (["realhier"] if include_real else [])
@@ -4309,7 +4313,7 @@ def eval_tasks(
         console.print("[bold red]Provide --task or --all-tasks, not both.[/bold red]")
         raise typer.Exit(code=2)
     if all_tasks:
-        names = [t for t in DEFAULT_TASKS if TASKS[t].answer_marker is not None or t in ("regime", "placebo")]
+        names = list(DEFAULT_TASKS)  # realhier stays opt-in via explicit --task realhier
     elif task:
         unknown = [t for t in task if t not in TASKS]
         if unknown:
@@ -4347,7 +4351,10 @@ def eval_tasks(
 
     for name in names:
         spec = TASKS[name]
-        per_seed_em: dict[str, dict[str, list[float]]] = {
+        # per_seed lists stay ALIGNED with seed_list: a seed whose docs were
+        # all skipped (too long for the rotary cache) records None, never a
+        # silent gap - downstream consumers can pair per_seed[i] with seeds[i].
+        per_seed_em: dict[str, dict[str, list[float | None]]] = {
             mode: {"in_range": [], "held_out": []} for mode, _ in decode_modes
         }
         ppl_in: list[float] = []
@@ -4359,7 +4366,10 @@ def eval_tasks(
 
         with console.status(f"[bold cyan]evaluating {name}…[/bold cyan]"):
             for eval_seed in seed_list:
-                in_docs, out_docs, in_range_max = _eval_split_examples(spec, n=examples, seed=eval_seed)
+                in_docs, out_docs, seed_in_range_max = _eval_split_examples(spec, n=examples, seed=eval_seed)
+                # the train-regime boundary is the max over EVERY seed's train split
+                if seed_in_range_max is not None:
+                    in_range_max = seed_in_range_max if in_range_max is None else max(in_range_max, seed_in_range_max)
                 ppl_in.append(
                     stats_mod.mean(_eval_doc_perplexity(model, tok, d, device) for d in in_docs)
                 )
@@ -4377,7 +4387,10 @@ def eval_tasks(
                                 model, tok, spec, doc, device=device, temperature=temp, seed=eval_seed
                             )
                             if scored is None:
-                                skipped += 1
+                                # each doc is scored once per mode; count its
+                                # skip once (greedy always runs)
+                                if mode == "greedy":
+                                    skipped += 1
                                 continue
                             correct, expected, got = scored
                             if correct is None:
@@ -4394,15 +4407,15 @@ def eval_tasks(
                                     f"[yellow]{name} fail[/yellow] [{mode}/{region}] "
                                     f"expected={expected!r} got={got!r}"
                                 )
-                        if scored_n:
-                            per_seed_em[mode][region].append(correct_n / scored_n)
+                        per_seed_em[mode][region].append(correct_n / scored_n if scored_n else None)
 
-        def agg(values: list[float]) -> dict[str, Any] | None:
-            if not values:
+        def agg(values: list[float | None]) -> dict[str, Any] | None:
+            valid = [v for v in values if v is not None]
+            if not valid:
                 return None
-            mean = stats_mod.mean(values)
-            if len(values) > 1:
-                half = 1.96 * stats_mod.stdev(values) / (len(values) ** 0.5)
+            mean = stats_mod.mean(valid)
+            if len(valid) > 1:
+                half = 1.96 * stats_mod.stdev(valid) / (len(valid) ** 0.5)
             else:
                 half = 0.0
             return {"mean": mean, "ci95": [mean - half, mean + half], "per_seed": values}
@@ -4507,8 +4520,8 @@ def eval_tasks(
             em_out = f"{g_out['mean']:.3f}" if g_out else "-"
         ppl = f"{rec['perplexity']['in_range']:.1f}/{rec['perplexity']['held_out']:.1f}"
         table.add_row(name, em_in, em_out, ppl, rec["difficulty_axis"] or "(lm-only)")
-        curve_link = f" ([curve]({curve_files[name]}))" if name in curve_files else ""
-        md_rows.append(f"| {name} | {em_in} | {em_out} | {ppl} |{curve_link}")
+        curve_cell = f"[curve]({curve_files[name]})" if name in curve_files else "-"
+        md_rows.append(f"| {name} | {em_in} | {em_out} | {ppl} | {curve_cell} |")
     console.print(table)
 
     report_md = (
@@ -4517,7 +4530,7 @@ def eval_tasks(
         f"- attention_type: {summary['meta']['checkpoint']['attention_type']}\n"
         f"- n_params: {n_params:,}\n"
         f"- seeds: {seed_list} · examples/seed: {examples} · decode: {[m for m, _ in decode_modes]}\n\n"
-        "| task | EM in-range | EM held-out | ppl in/held |\n|---|---|---|---|\n"
+        "| task | EM in-range | EM held-out | ppl in/held | curve |\n|---|---|---|---|---|\n"
         + "\n".join(md_rows)
         + "\n\nSee `summary.json` (schema mgr.evaltasks.v1) for the full contract output.\n"
     )
@@ -4561,7 +4574,11 @@ def profile_data(
         if dial_str:
             for pair in dial_str.split(","):
                 key, _, value = pair.partition("=")
-                dial_overrides[key.strip()] = float(value)
+                try:
+                    dial_overrides[key.strip()] = float(value)
+                except ValueError:
+                    console.print(f"[bold red]--task dial must be name=number, got {pair!r}[/bold red]")
+                    raise typer.Exit(code=2) from None
         try:
             texts = generate_texts(task_name, size=sample, seed=seed, dial_overrides=dial_overrides)
         except ValueError as exc:

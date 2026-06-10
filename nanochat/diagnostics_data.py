@@ -288,8 +288,13 @@ def _hier_tree(rng: random.Random, depth: int, branching: int, zipf_alpha: float
         total = sum(weights)
         children = {}
         for i in range(branching):
-            # Zipf imbalance: low-rank branches get subtrees, high-rank may flatten to leaves
-            go_deep = rng.random() < (weights[i] / total) * branching * 0.8
+            # Zipf imbalance: low-rank branches get subtrees, high-rank may
+            # flatten to leaves. The probability saturates at 1 for low-rank
+            # branches at high alpha - that saturation IS the imbalance
+            # mechanism (rank 0 always deep, the rest rarely). min() makes the
+            # cap explicit; it does not change behavior (random() < p for
+            # p >= 1 is always true), so generator hashes are unchanged.
+            go_deep = rng.random() < min(1.0, (weights[i] / total) * branching * 0.8)
             children[f"k{level}x{i}"] = build(level + 1) if go_deep else f"v{rng.randrange(100)}"
         return children
 

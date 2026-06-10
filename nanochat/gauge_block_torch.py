@@ -71,6 +71,10 @@ class GaugeBlock(nn.Module):
         # the standard path, with SDPA's enable_gqa broadcasting KV heads.
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
+        if not (self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0):
+            # GPT._validate_config checks this too, but GaugeBlock is also
+            # constructed standalone (certify's make_block builds Block directly).
+            raise ValueError("n_kv_head must divide n_head and be <= n_head")
         self.head_dim = self.dim // self.n_head
         self.c_q = nn.Linear(self.dim, self.n_head * self.head_dim, bias=False)
         self.c_k = nn.Linear(self.dim, self.n_kv_head * self.head_dim, bias=False)
@@ -130,9 +134,26 @@ class GaugeBlock(nn.Module):
         # steps; the fp32 lane keeps the cached and full-forward frames aligned.
         if kv_cache is not None:
             kv_cache.ensure_gauge_angle_cache(n_pairs=self.n_pairs, device=x.device)
+            # Desync guard: the lane ACCUMULATES, so a re-run of the same
+            # forward (or a cache rewound without reset()) would silently
+            # double-count angles - and the per-token history needed to
+            # rebuild the lane is not stored. Fail loudly instead. The lane's
+            # token count must equal the cache write position, which is the
+            # same for every layer within one forward (pos advances only
+            # after the last layer inserts).
+            seen = kv_cache.gauge_angle_pos[self.layer_idx]
+            pos0 = kv_cache.get_pos()
+            if seen != pos0:
+                raise RuntimeError(
+                    f"gauge angle lane desync at layer {self.layer_idx}: lane has accumulated {seen} "
+                    f"tokens but the cache position is {pos0}. A forward was re-run against the same "
+                    "cache, or the cache was rewound without reset(); the cumulative gauge field "
+                    "cannot be reconstructed - call kv_cache.reset() and re-prefill."
+                )
             prev = kv_cache.gauge_cum_angles[self.layer_idx]  # (B, n_pairs) fp32
             angles_global = prev.unsqueeze(1) + torch.cumsum(angles_local.float(), dim=1)
             kv_cache.gauge_cum_angles[self.layer_idx] = angles_global[:, -1].detach()
+            kv_cache.gauge_angle_pos[self.layer_idx] = pos0 + T
         else:
             angles_global = torch.cumsum(angles_local.float(), dim=1)
 

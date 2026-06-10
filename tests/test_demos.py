@@ -568,6 +568,22 @@ def test_nanochat_gauge_long_decode_drift_is_bounded():
     assert drift < 1e-2, f"gauge long-decode drift {drift:.3e} exceeds bound 1e-2 after {total} positions"
 
 
+def test_nanochat_gauge_cache_desync_fails_loudly():
+    """The gauge angle lane ACCUMULATES, so re-running a forward against the
+    same cache (or rewinding pos without reset()) would silently double-count
+    angles. The lane tracks its token count and must raise instead."""
+    import torch
+
+    model, config, make_cache = _tiny_gauge_model_and_cache()
+    ids = torch.randint(0, config.vocab_size, (1, 4), dtype=torch.long)
+    with torch.inference_mode():
+        kv_cache = make_cache(8)
+        _ = model(ids, kv_cache=kv_cache)
+        kv_cache.pos = 0  # rewind WITHOUT reset(): the lane still holds 4 tokens
+        with pytest.raises(RuntimeError, match="gauge angle lane desync"):
+            _ = model(ids, kv_cache=kv_cache)
+
+
 def test_nanochat_gauge_cache_reset_clears_angle_lane():
     """KVCache.reset() must zero the gauge cumsum lane: it ACCUMULATES (unlike
     the positionally-overwritten kv/simplicial lanes), so a reused cache would

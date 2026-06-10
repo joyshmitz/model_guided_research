@@ -122,8 +122,11 @@ class KVCache:
         self.simplicial_y1_cache = None
         # - Gauge blocks cache the running cumulative transport angles per layer
         #   (B, n_pairs), kept fp32 regardless of model dtype so angle drift cannot
-        #   accumulate over long decodes (bead 7b0.5).
+        #   accumulate over long decodes (bead 7b0.5). gauge_angle_pos tracks how
+        #   many tokens each layer's lane has accumulated, so a re-run/rewound
+        #   forward fails loudly instead of silently double-accumulating.
         self.gauge_cum_angles: torch.Tensor | None = None
+        self.gauge_angle_pos: list[int] | None = None
 
     def reset(self):
         self.pos = 0
@@ -131,6 +134,8 @@ class KVCache:
         # overwritten by position), so stale angles would corrupt a reused cache.
         if self.gauge_cum_angles is not None:
             self.gauge_cum_angles.zero_()
+        if self.gauge_angle_pos is not None:
+            self.gauge_angle_pos = [0] * len(self.gauge_angle_pos)
 
     def get_pos(self):
         return self.pos
@@ -274,9 +279,13 @@ class KVCache:
             other_angles = other.gauge_cum_angles
             if other_angles is None:
                 self.gauge_cum_angles = None
+                self.gauge_angle_pos = None
             elif not isinstance(other_angles, torch.Tensor):
                 raise TypeError("KVCache.prefill expected other.gauge_cum_angles to be a torch.Tensor | None")
             else:
+                # token counts are batch-independent; copy alongside the angles
+                other_pos = getattr(other, "gauge_angle_pos", None)
+                self.gauge_angle_pos = list(other_pos) if other_pos is not None else [0] * int(self.kv_shape[0])
                 if other_angles.ndim != 3 or other_angles.size(0) != self.kv_shape[0]:
                     raise ValueError(
                         "KVCache.prefill expected gauge_cum_angles of shape (num_layers, B, n_pairs) with "
@@ -298,6 +307,8 @@ class KVCache:
 
     def ensure_gauge_angle_cache(self, *, n_pairs: int, device: torch.device) -> None:
         if self.gauge_cum_angles is not None:
+            if self.gauge_angle_pos is None:  # lane copied without its counter
+                self.gauge_angle_pos = [0] * int(self.kv_shape[0])
             return
         # (num_layers, B, n_pairs) fp32; no seq dim - this is a running sum,
         # so it needs no lazy kv_cache tensor and never grows.
@@ -306,6 +317,7 @@ class KVCache:
             dtype=torch.float32,
             device=device,
         )
+        self.gauge_angle_pos = [0] * int(self.kv_shape[0])
 
     def ensure_simplicial_y1_cache(
         self,

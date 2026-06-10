@@ -163,7 +163,9 @@ def test_heldout_difficulty_actually_held_out():
     splits = TASKS["group"].generate(120, 9, {"length": 4})
     train_max = max(_seq_len(d, "SEQ", "OUT") for d in splits["train"])
     test_min = min(_seq_len(d, "SEQ", "OUT") for d in splits["test"])
-    assert test_min >= 2 * train_max // 2 and test_min > train_max, "group: held-out lengths must start at 2x"
+    # generator contract: train words in [2, 4]; held-out words in [2*4, 8*4]
+    assert train_max <= 4, f"group: train word length {train_max} exceeds the dial"
+    assert test_min >= 8, f"group: held-out lengths must start at 2x the dial (got {test_min})"
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +429,12 @@ def test_cli_gen_tasks_and_profile_task(tmp_path):
 
     result = runner.invoke(mgr_cli.app, ["gen-tasks", "--task", "all", "--dial", "max_depth=6"])
     assert result.exit_code == 2, "--dial with --task all must be rejected"
+
+    result = runner.invoke(mgr_cli.app, ["gen-tasks", "--task", "dyck", "--dial", "max_depth=abc"])
+    assert result.exit_code == 2, "non-numeric dial value must exit 2, not traceback"
+
+    result = runner.invoke(mgr_cli.app, ["profile-data", "--task", "hier:depth=abc"])
+    assert result.exit_code == 2, "non-numeric profile-data dial must exit 2, not traceback"
 
     result = runner.invoke(
         mgr_cli.app,
