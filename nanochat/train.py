@@ -8,6 +8,7 @@ import argparse
 import json
 import math
 import os
+import random
 import shlex
 import sys
 import time
@@ -16,6 +17,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from rich import box
@@ -23,8 +25,16 @@ from rich.console import Console
 from rich.table import Table
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from nanochat.checkpoint_manager import (
+    checkpoint_file_paths,
+    find_last_step,
+    load_checkpoint,
+    prune_checkpoints,
+    save_checkpoint,
+    verify_checkpoint_roundtrip,
+)
 from nanochat.common import autodetect_device_type, compute_cleanup, compute_init, print0
-from nanochat.dataloader import tokenizing_distributed_data_loader
+from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
 from nanochat.dataset import ensure_min_parquet_files, list_parquet_files
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.gpt_synaptic import GPTSynaptic, GPTSynapticConfig
@@ -302,6 +312,23 @@ def _validate_train_args(args, *, ddp_rank: int, device: torch.device) -> None:
     if bool(getattr(args, "use_flex_attention", False)) and not hasattr(torch.nn.attention, "flex_attention"):
         errors.append("--use-flex-attention requires torch>=2.5 (missing torch.nn.attention.flex_attention).")
 
+    # Checkpoint/resume flags (bead rz8.1).
+    if int(getattr(args, "checkpoint_interval", 0)) < 0:
+        errors.append("--checkpoint-interval must be >= 0 (0 disables checkpointing)")
+    if int(getattr(args, "checkpoint_keep", 0)) < 0:
+        errors.append("--checkpoint-keep must be >= 0 (0 keeps all checkpoints)")
+    resume_from = getattr(args, "resume_from", None)
+    if resume_from is not None:
+        if str(resume_from) == "latest":
+            if getattr(args, "checkpoint_dir", None) is None:
+                errors.append("--resume-from latest requires --checkpoint-dir (the directory to scan)")
+        elif not Path(str(resume_from)).is_dir():
+            errors.append(f"--resume-from must be 'latest' or an existing checkpoint directory, got {resume_from!r}")
+    if getattr(args, "resume_step", None) is not None and resume_from is None:
+        warnings.append("--resume-step has no effect without --resume-from.")
+    if model_type == "synaptic" and resume_from is not None:
+        errors.append("--resume-from is currently only supported for --model-type gpt.")
+
     syn_cfg_path = getattr(args, "synaptic_config", None)
     if model_type == "synaptic" and syn_cfg_path is not None:
         path = Path(str(syn_cfg_path))
@@ -363,6 +390,42 @@ def train(args) -> None:
     compile_dynamic = _parse_optional_bool(getattr(args, "compile_dynamic", "auto"))
 
     _validate_train_args(args, ddp_rank=ddp_rank, device=device)
+
+    # ----- checkpoint/resume setup (bead rz8.1) -----
+    checkpoint_interval = int(getattr(args, "checkpoint_interval", 0))
+    checkpoint_keep = int(getattr(args, "checkpoint_keep", 0))
+    checkpoint_verify = bool(getattr(args, "checkpoint_verify", False))
+    resume_data_mode = str(getattr(args, "resume_data_mode", "exact"))
+
+    resume_from = getattr(args, "resume_from", None)
+    resume_meta: dict[str, Any] | None = None
+    resume_train_state: dict[str, Any] | None = None
+    resume_model_data: dict[str, Any] | None = None
+    if resume_from is not None:
+        resume_dir = str(getattr(args, "checkpoint_dir", None)) if str(resume_from) == "latest" else str(resume_from)
+        resume_step_arg = getattr(args, "resume_step", None)
+        resume_step = int(resume_step_arg) if resume_step_arg is not None else find_last_step(resume_dir)
+        if ddp_rank == 0:
+            console.print(f"[bold cyan]resume[/bold cyan] loading checkpoint step {resume_step} from {resume_dir}")
+        t_load0 = time.perf_counter()
+        resume_model_data, resume_train_state, resume_meta = load_checkpoint(
+            resume_dir, resume_step, device, load_optimizer=True, rank=ddp_rank
+        )
+        if resume_train_state is None:
+            raise RuntimeError(f"Checkpoint at {resume_dir} step {resume_step} has no rank-{ddp_rank} training state")
+        # Defensive both-directions torch.compile key normalization: saves come
+        # from the raw module (clean keys), but tolerate older artifacts.
+        resume_model_data = {k.removeprefix("_orig_mod."): v for k, v in resume_model_data.items()}
+        if ddp_rank == 0:
+            load_bytes = sum(
+                os.path.getsize(p) for p in checkpoint_file_paths(resume_dir, resume_step, rank=ddp_rank)
+                if os.path.exists(p)
+            )
+            console.print(
+                f"[bold cyan]resume[/bold cyan] read step={resume_step} "
+                f"bytes={load_bytes:,} duration={time.perf_counter() - t_load0:.2f}s "
+                f"components=model/optim/sched/dataloader/rng"
+            )
 
     if model_type == "gpt":
         config = GPTConfig()
@@ -521,6 +584,23 @@ def train(args) -> None:
     raw_model = GPT(config) if model_type == "gpt" else GPTSynaptic(config)
     raw_model.to(device)
     raw_model.init_weights()
+    if resume_meta is not None:
+        # The resumed run must be the SAME model: config drift between the
+        # checkpoint and the resume command line is an error, not a warning.
+        saved_config = resume_meta.get("model_config") or {}
+        current_config = asdict(config)
+        diffs = {
+            k: (saved_config.get(k), current_config.get(k))
+            for k in sorted(set(saved_config) | set(current_config))
+            if saved_config.get(k) != current_config.get(k)
+        }
+        if diffs:
+            raise ValueError(
+                "Resume config mismatch (checkpoint vs current args): "
+                + ", ".join(f"{k}: {a!r} -> {b!r}" for k, (a, b) in diffs.items())
+            )
+        assert resume_model_data is not None
+        raw_model.load_state_dict(resume_model_data, strict=True)
     model: torch.nn.Module = raw_model
     compiled_model = False
     if compile_requested:
@@ -574,13 +654,60 @@ def train(args) -> None:
         for opt in optimizers:
             schedulers.append(OrdinalLRScheduler(opt, eta_init=args.learning_rate))
 
-    # Dataloader
-    loader = tokenizing_distributed_data_loader(
+    # Restore optimizer/scheduler state AFTER scheduler construction: the
+    # OrdinalLRScheduler __init__ writes eta_init into the param groups, and
+    # optimizer.load_state_dict then restores the checkpointed LRs over it.
+    if resume_train_state is not None:
+        saved_opt_states = resume_train_state.get("optimizers") or []
+        if len(saved_opt_states) != len(optimizers):
+            raise RuntimeError(
+                f"Resume optimizer count mismatch: checkpoint has {len(saved_opt_states)}, "
+                f"current setup built {len(optimizers)} (optimizer_type changed?)"
+            )
+        for opt, opt_state in zip(optimizers, saved_opt_states):
+            opt.load_state_dict(opt_state)
+        saved_sched_states = resume_train_state.get("schedulers") or []
+        if len(saved_sched_states) != len(schedulers):
+            raise RuntimeError(
+                f"Resume scheduler count mismatch: checkpoint has {len(saved_sched_states)}, "
+                f"current setup built {len(schedulers)} (scheduler_type changed?)"
+            )
+        for sched, sched_state in zip(schedulers, saved_sched_states):
+            sched.load_state_dict(sched_state)
+
+    # Dataloader (with-state variant so checkpoints can capture the data position).
+    batches_consumed = 0
+    loader_resume_state: dict[str, int] | None = None
+    if resume_meta is not None:
+        batches_consumed = int(resume_meta.get("batches_consumed", 0))
+        if resume_data_mode == "approximate":
+            # The loader's native resume: skips to the next row group after the
+            # recorded position. Cheap for huge runs; may skip a few documents
+            # (never repeats), so trajectories are NOT bitwise-comparable.
+            saved_loader = (resume_train_state or {}).get("dataloader") or {}
+            loader_resume_state = {"pq_idx": int(saved_loader["pq_idx"]), "rg_idx": int(saved_loader["rg_idx"])}
+    loader = tokenizing_distributed_data_loader_with_state(
         B=args.batch_size,
         T=config.sequence_len,
         split="train",
         device=device.type,
+        resume_state_dict=loader_resume_state,
     )
+    if resume_meta is not None and resume_data_mode == "exact" and batches_consumed > 0:
+        # Exact resume: replay the deterministic stream from the beginning and
+        # discard the batches the parent run already consumed. The token stream
+        # (and the internal token_buffer remainder) is reconstructed exactly, so
+        # the resumed trajectory can be bitwise-identical. Cost is one pass of
+        # tokenization over the consumed prefix - linear in the parent run
+        # length; use --resume-data-mode approximate for very long runs.
+        t_ff0 = time.perf_counter()
+        for _ in range(batches_consumed):
+            next(loader)
+        if ddp_rank == 0:
+            console.print(
+                f"[bold cyan]resume[/bold cyan] fast-forwarded {batches_consumed} batches "
+                f"in {time.perf_counter() - t_ff0:.2f}s (exact data replay)"
+            )
 
     def autocast_ctx():
         if device.type == "cuda":
@@ -639,12 +766,144 @@ def train(args) -> None:
         if max_steps < 1:
             raise ValueError("--max-steps must be >= 1")
 
+    start_step = 0
+    parent_run_ids: list[str] = []
+    if resume_meta is not None:
+        # A resumed run honors the ORIGINAL budget: max_steps comes from the
+        # checkpoint meta, so interrupt+resume consumes exactly the FLOPs the
+        # first command line planned - regardless of the resume command line.
+        saved_budget = resume_meta.get("budget") or {}
+        saved_max_steps = int(saved_budget.get("max_steps", max_steps))
+        if saved_max_steps != max_steps and ddp_rank == 0:
+            console.print(
+                f"[bold cyan]resume[/bold cyan] restoring original budget: max_steps {max_steps} -> "
+                f"{saved_max_steps} (from checkpoint meta; the original --target-flops/--max-steps governs)"
+            )
+        max_steps = saved_max_steps
+        start_step = int(resume_meta["step"]) + 1
+        lineage = resume_meta.get("lineage") or {}
+        parent_run_ids = list(lineage.get("parent_run_ids") or [])
+        parent_id = lineage.get("run_id")
+        if parent_id:
+            parent_run_ids.append(str(parent_id))
+        if start_step >= max_steps and ddp_rank == 0:
+            console.print(
+                f"[bold yellow]resume[/bold yellow] checkpoint step {start_step - 1} already reaches the "
+                f"budget ({max_steps} steps); nothing to train."
+            )
+
     if ddp_rank == 0:
         console.print(
-            f"[bold cyan]budget[/bold cyan] steps={max_steps} warmup={args.warmup_steps} "
+            f"[bold cyan]budget[/bold cyan] steps={max_steps} start_step={start_step} warmup={args.warmup_steps} "
             f"tokens/step={tokens_per_step:,} flops/token={flops_per_token:,} "
             f"flops/step={flops_per_step:,}"
         )
+
+    # Run identity is needed BEFORE the loop now: the default checkpoint dir
+    # lives under the run's artifact directory.
+    resolved_run_id = args.run_id or time.strftime("%Y%m%d_%H%M%S")
+    artifacts_kind = str(getattr(args, "artifacts_kind", "baseline"))
+    artifacts_topic = str(getattr(args, "artifacts_topic", "nanochat"))
+    run_dir = Path(args.artifacts_dir) / artifacts_kind / artifacts_topic / resolved_run_id
+
+    checkpoint_dir = str(getattr(args, "checkpoint_dir", None) or (run_dir / "checkpoints"))
+    checkpoint_saved_steps: list[int] = []
+
+    def save_training_checkpoint(step: int) -> None:
+        """Capture FULL training state at a completed step (bead rz8.1)."""
+        t_save0 = time.perf_counter()
+        model_data = raw_model.state_dict()  # raw module: clean keys under torch.compile/DDP
+        # RNG lanes serialized into weights-only-safe types (tensors/ints/lists)
+        # so load_checkpoint can keep torch.load(weights_only=True).
+        np_bit_gen, np_keys, np_pos, np_has_gauss, np_cached = np.random.get_state()
+        py_version, py_internal, py_gauss = random.getstate()
+        rng_state: dict[str, Any] = {
+            "torch_cpu": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
+            "numpy": {
+                "bit_generator": str(np_bit_gen),
+                "keys": torch.from_numpy(np.asarray(np_keys, dtype=np.int64)),
+                "pos": int(np_pos),
+                "has_gauss": int(np_has_gauss),
+                "cached_gaussian": float(np_cached),
+            },
+            "python": [int(py_version), [int(v) for v in py_internal], py_gauss],
+        }
+        train_state: dict[str, Any] = {
+            "optimizers": [opt.state_dict() for opt in optimizers],
+            "schedulers": [sched.state_dict() for sched in schedulers],
+            "dataloader": {
+                "batches_consumed": step + 1,
+                "pq_idx": int(last_loader_state.get("pq_idx", 0)),
+                "rg_idx": int(last_loader_state.get("rg_idx", 0)),
+            },
+            "rng": rng_state,
+        }
+        meta_data: dict[str, Any] = {
+            "step": step,
+            "model_config": asdict(config),
+            "model_type": model_type,
+            "optimizer_type": str(args.optimizer_type),
+            "scheduler_type": str(args.scheduler_type),
+            "seed": int(args.seed),
+            "world_size": int(ddp_world_size),
+            "batches_consumed": step + 1,
+            "budget": {
+                "max_steps": max_steps,
+                "target_flops": args.target_flops,
+                "flops_per_step_est": flops_per_step,
+                "flops_consumed_est": (step + 1) * flops_per_step,
+            },
+            "lineage": {"run_id": resolved_run_id, "parent_run_ids": parent_run_ids},
+        }
+        save_checkpoint(checkpoint_dir, step, model_data, train_state, meta_data, rank=ddp_rank)
+        checkpoint_saved_steps.append(step)
+        if checkpoint_verify:
+            mismatches = verify_checkpoint_roundtrip(
+                checkpoint_dir, step, device, model_data=model_data, optimizer_data=train_state, rank=ddp_rank
+            )
+            if mismatches:
+                raise RuntimeError(
+                    f"--checkpoint-verify failed at step {step}: {len(mismatches)} tensor mismatches "
+                    f"(first: {mismatches[:5]})"
+                )
+        pruned = prune_checkpoints(checkpoint_dir, checkpoint_saved_steps, keep=checkpoint_keep, rank=ddp_rank)
+        if ddp_rank == 0:
+            saved_bytes = sum(
+                os.path.getsize(p) for p in checkpoint_file_paths(checkpoint_dir, step, rank=ddp_rank)
+                if os.path.exists(p)
+            )
+            verify_note = " verify=ok" if checkpoint_verify else ""
+            prune_note = f" pruned={pruned}" if pruned else ""
+            console.print(
+                f"[bold cyan]checkpoint[/bold cyan] step={step} dir={checkpoint_dir} "
+                f"bytes={saved_bytes:,} duration={time.perf_counter() - t_save0:.2f}s "
+                f"components=model/optim/sched/dataloader/rng{verify_note}{prune_note}"
+            )
+
+    # Restore RNG streams LAST, after every setup consumer of randomness
+    # (model init, optimizer construction) has run - so the first resumed
+    # step draws exactly what the uninterrupted run would have drawn.
+    if resume_train_state is not None:
+        saved_rng = resume_train_state.get("rng") or {}
+        if "torch_cpu" in saved_rng:
+            torch.set_rng_state(saved_rng["torch_cpu"].cpu().to(torch.uint8))
+        if device.type == "cuda" and saved_rng.get("cuda") is not None:
+            torch.cuda.set_rng_state_all([s.cpu().to(torch.uint8) for s in saved_rng["cuda"]])
+        if saved_rng.get("numpy") is not None:
+            np_state = saved_rng["numpy"]
+            np.random.set_state(
+                (
+                    np_state["bit_generator"],
+                    np_state["keys"].cpu().numpy().astype(np.uint32),
+                    int(np_state["pos"]),
+                    int(np_state["has_gauss"]),
+                    float(np_state["cached_gaussian"]),
+                )
+            )
+        if saved_rng.get("python") is not None:
+            py_version, py_internal, py_gauss = saved_rng["python"]
+            random.setstate((int(py_version), tuple(int(v) for v in py_internal), py_gauss))
 
     is_hoss = args.optimizer_type == "hoss"
 
@@ -672,10 +931,13 @@ def train(args) -> None:
     last_log_time = time.perf_counter()
     meas_start_time: float | None = None
 
+    last_loader_state: dict[str, int] = {}
+    last_completed_step = start_step - 1
     try:
-        for step, (inputs, targets) in enumerate(loader):
+        for step, (inputs, targets, loader_state) in enumerate(loader, start=start_step):
             if step >= max_steps:
                 break
+            last_loader_state = loader_state
 
             if step == args.warmup_steps:
                 if device.type == "cuda":
@@ -787,6 +1049,17 @@ def train(args) -> None:
 
             loss_item = float(loss_for_log.item())
             losses.append(loss_item)
+            last_completed_step = step
+
+            # Ordinal scheduler transitions (loss-driven). Orphaned until rz8.1:
+            # the schedulers were constructed but never stepped, so
+            # --scheduler-type ordinal silently did nothing past the initial LR.
+            for sched in schedulers:
+                sched.step(loss_item)
+
+            # Periodic full-state checkpoint (bead rz8.1).
+            if checkpoint_interval > 0 and (step + 1) % checkpoint_interval == 0:
+                save_training_checkpoint(step)
 
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -849,6 +1122,12 @@ def train(args) -> None:
     finally:
         compute_cleanup()
 
+    # Final checkpoint so downstream consumers (eval C2, teachers C6) always
+    # have the end-of-run state, even when max_steps is not a multiple of the
+    # interval. Skipped if the interval already saved this exact step.
+    if checkpoint_interval > 0 and last_completed_step >= 0 and last_completed_step not in checkpoint_saved_steps:
+        save_training_checkpoint(last_completed_step)
+
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     end_time = time.perf_counter()
@@ -876,11 +1155,8 @@ def train(args) -> None:
     module_command = "python -m nanochat.train" + (f" {arg_str}" if arg_str else "")
     uv_command = "uv run " + module_command
 
-    resolved_run_id = args.run_id or time.strftime("%Y%m%d_%H%M%S")
-    artifacts_kind = str(getattr(args, "artifacts_kind", "baseline"))
-    artifacts_topic = str(getattr(args, "artifacts_topic", "nanochat"))
-    run_dir = Path(args.artifacts_dir) / artifacts_kind / artifacts_topic / resolved_run_id
-
+    # resolved_run_id / run_dir were computed before the training loop (the
+    # default checkpoint dir lives under the run dir).
     generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     meta: dict[str, Any] = {
         "run_id": resolved_run_id,
@@ -916,12 +1192,28 @@ def train(args) -> None:
         "flops_per_step_est": flops_per_step,
         "planned_total_flops_est": max_steps * flops_per_step,
     }
+    checkpointing: dict[str, Any] = {
+        "interval": checkpoint_interval,
+        "dir": checkpoint_dir if checkpoint_interval > 0 else None,
+        "keep": checkpoint_keep,
+        "verify": checkpoint_verify,
+        "saved_steps": checkpoint_saved_steps,
+    }
+    resume_record: dict[str, Any] | None = None
+    if resume_meta is not None:
+        resume_record = {
+            "from": str(resume_from),
+            "resume_step": start_step,
+            "data_mode": resume_data_mode,
+            "parent_run_ids": parent_run_ids,
+        }
     # Compute final train/val CE statistics
     final_train_ce = losses[-1] if losses else float("nan")
     final_val_ce = val_losses[-1][1] if val_losses else None
 
     results: dict[str, Any] = {
         "losses": losses,
+        "start_step": start_step,
         "train_ce_final": final_train_ce,
         "val_losses": val_losses,
         "val_ce_final": final_val_ce,
@@ -969,6 +1261,8 @@ def train(args) -> None:
             "parquet_files": parquet_files,
         },
         "budget": budget,
+        "checkpointing": checkpointing,
+        "resume": resume_record,
         "results": results,
         "numerics": {
             "check_numerics": check_numerics,
@@ -1072,7 +1366,7 @@ See `summary.json` for full details.
     console.print(f"[bold green]Wrote artifacts[/bold green] → {run_dir}")
 
 
-if __name__ == "__main__":
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model-type",
@@ -1352,6 +1646,54 @@ if __name__ == "__main__":
     )
     parser.add_argument("--scheduler-type", type=str, default="none", choices=_SUPPORTED_SCHEDULER_TYPES)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu", "mps"])
-    args = parser.parse_args()
+    # Checkpoint/resume (bead rz8.1).
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=0,
+        help="Save a full training-state checkpoint every N steps (0 disables checkpointing).",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help="Checkpoint directory (default: <artifacts>/<kind>/<topic>/<run-id>/checkpoints).",
+    )
+    parser.add_argument(
+        "--checkpoint-keep",
+        type=int,
+        default=0,
+        help="Retain only the newest K checkpoints saved by THIS run (0 keeps all).",
+    )
+    parser.add_argument(
+        "--checkpoint-verify",
+        action="store_true",
+        help="After each save, reload and compare every tensor bitwise (corruption tripwire).",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Resume training from a checkpoint directory, or 'latest' to scan --checkpoint-dir.",
+    )
+    parser.add_argument(
+        "--resume-step",
+        type=int,
+        default=None,
+        help="Checkpoint step to resume from (default: the last step found in the directory).",
+    )
+    parser.add_argument(
+        "--resume-data-mode",
+        type=str,
+        default="exact",
+        choices=["exact", "approximate"],
+        help=(
+            "exact: replay+discard the consumed data prefix (bitwise-resumable; cost linear in the prefix). "
+            "approximate: the loader's native row-group skip (cheap; may skip a few documents)."
+        ),
+    )
+    return parser
 
-    train(args)
+
+if __name__ == "__main__":
+    train(build_parser().parse_args())

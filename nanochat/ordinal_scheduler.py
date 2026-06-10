@@ -95,3 +95,31 @@ class OrdinalLRScheduler:
 
     def get_last_lr(self):
         return [group["lr"] for group in self.optimizer.param_groups]
+
+    def state_dict(self) -> dict:
+        """Mutable scheduler state for checkpoint/resume (bead rz8.1).
+
+        Constructor hyperparameters (B_init/P_init/eta_init/gamma/min_lr/alpha)
+        are intentionally included too: a resumed run must reproduce the limit
+        transitions of the original run even if the resume command line drifts.
+        Per-param-group LRs live in the OPTIMIZER state_dict, not here.
+        """
+        return {
+            "A": self.A,
+            "B": self.B,
+            "C": self.C,
+            "B_init": self.B_init,
+            "P_init": self.P_init,
+            "eta_init": self.eta_init,
+            "gamma": self.gamma,
+            "min_lr": self.min_lr,
+            "best_loss": self.best_loss,
+            "ema_loss": self.ema_loss,
+            "alpha": self.alpha,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        for key in ("A", "B", "C", "B_init", "P_init", "eta_init", "gamma", "min_lr", "best_loss", "ema_loss", "alpha"):
+            if key not in state:
+                raise KeyError(f"OrdinalLRScheduler.load_state_dict missing key {key!r}")
+            setattr(self, key, state[key])

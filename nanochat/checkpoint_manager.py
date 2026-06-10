@@ -1,5 +1,32 @@
 """
 Utilities for saving and loading model/optim/state checkpoints.
+
+Checkpoint directory contract (bead rz8.1) — consumers (eval harness C2,
+distillation teachers C6, scaling rungs E1, sampling D5) depend on this layout:
+
+    <checkpoint_dir>/
+        model_<step:06d>.pt           # raw (uncompiled) model state_dict, clean keys
+        optim_<step:06d>_rank<r>.pt   # per-rank training state:
+                                      #   {"optimizers": [state_dict, ...],   # in setup_optimizers order
+                                      #    "schedulers": [state_dict, ...],   # OrdinalLRScheduler counters
+                                      #    "dataloader": {"batches_consumed": int,
+                                      #                    "pq_idx": int, "rg_idx": int},
+                                      #    "rng": {"torch_cpu": Tensor,
+                                      #             "cuda": list[Tensor] | None,
+                                      #             "numpy": tuple, "python": tuple}}
+        meta_<step:06d>.json          # {"step": last completed step (0-based),
+                                      #  "model_config": asdict(GPTConfig), "model_type": str,
+                                      #  "optimizer_type": str, "scheduler_type": str,
+                                      #  "seed": int, "world_size": int,
+                                      #  "batches_consumed": int,
+                                      #  "budget": {"max_steps", "target_flops", "flops_per_step_est",
+                                      #              "flops_consumed_est"},
+                                      #  "lineage": {"run_id": str, "parent_run_ids": [str, ...]}}
+
+`step` is the 0-based index of the last COMPLETED optimizer step; a resumed
+run continues at step+1. The optimizer list layout deliberately accommodates
+future optimizers with exotic state (e.g. HOSS when D3 lands): anything that
+implements torch's Optimizer state_dict protocol slots in unchanged.
 """
 
 import glob
@@ -70,12 +97,81 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     optimizer_data = None
     if load_optimizer:
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
+        # weights_only loading works because train.py serializes the RNG lanes
+        # into weights-only-safe types (tensors/ints/lists) before saving.
         optimizer_data = torch.load(optimizer_path, map_location=device, weights_only=True)
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
     with open(meta_path, encoding="utf-8") as f:
         meta_data = json.load(f)
     return model_data, optimizer_data, meta_data
+
+
+def checkpoint_file_paths(checkpoint_dir, step, rank=0):
+    """The (model, optim, meta) file triple for a step — single source of naming truth."""
+    return (
+        os.path.join(checkpoint_dir, f"model_{step:06d}.pt"),
+        os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt"),
+        os.path.join(checkpoint_dir, f"meta_{step:06d}.json"),
+    )
+
+
+def prune_checkpoints(checkpoint_dir, steps_saved_this_run, *, keep, rank=0):
+    """Retention: keep the newest `keep` checkpoints among `steps_saved_this_run`.
+
+    Deletes ONLY files this run itself created (the caller passes the list of
+    steps it saved) — never user files or checkpoints from other runs sharing
+    the directory. Returns the list of pruned steps; mutates steps_saved_this_run.
+    """
+    if keep <= 0:
+        return []
+    pruned: list[int] = []
+    while len(steps_saved_this_run) > keep:
+        oldest = steps_saved_this_run.pop(0)
+        for path in checkpoint_file_paths(checkpoint_dir, oldest, rank=rank):
+            # Model/meta exist only on rank 0; optim shards on every rank.
+            if os.path.exists(path):
+                os.remove(path)
+        pruned.append(oldest)
+        logger.info(f"Pruned checkpoint step {oldest} from {checkpoint_dir} (keep={keep})")
+    return pruned
+
+
+def verify_checkpoint_roundtrip(checkpoint_dir, step, device, *, model_data, optimizer_data, rank=0):
+    """Integrity tripwire (--checkpoint-verify): reload what was just saved and
+    compare every tensor bitwise. Returns a list of mismatch descriptions
+    (empty = verified). Cheap insurance against flaky storage on long runs."""
+
+    def tensors_equal(a, b) -> bool:
+        return a.shape == b.shape and a.dtype == b.dtype and bool(torch.equal(a.cpu(), b.cpu()))
+
+    mismatches: list[str] = []
+    reloaded_model, reloaded_optim, _meta = load_checkpoint(
+        checkpoint_dir, step, device, load_optimizer=optimizer_data is not None, rank=rank
+    )
+    if rank == 0:
+        for key, tensor in model_data.items():
+            other = reloaded_model.get(key)
+            if other is None or not tensors_equal(tensor, other):
+                mismatches.append(f"model[{key}]")
+    if optimizer_data is not None and reloaded_optim is not None:
+
+        def walk(a, b, path):
+            if isinstance(a, torch.Tensor):
+                if not (isinstance(b, torch.Tensor) and tensors_equal(a, b)):
+                    mismatches.append(path)
+            elif isinstance(a, dict):
+                for k in a:
+                    walk(a[k], b.get(k) if isinstance(b, dict) else None, f"{path}[{k!r}]")
+            elif isinstance(a, (list, tuple)):
+                if not isinstance(b, (list, tuple)) or len(a) != len(b):
+                    mismatches.append(path)
+                else:
+                    for i, (x, y) in enumerate(zip(a, b)):
+                        walk(x, y, f"{path}[{i}]")
+
+        walk(optimizer_data, reloaded_optim, "optim")
+    return mismatches
 
 
 def build_model(checkpoint_dir, step, device, phase):
