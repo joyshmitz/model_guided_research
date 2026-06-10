@@ -4211,6 +4211,19 @@ def _load_eval_checkpoint(checkpoint_dir: Path, step: int | None, device: Any) -
     return model, meta, resolved_step
 
 
+def _eval_tasks_provenance(
+    ckpt_meta: dict[str, Any], *, seeds: list[int], examples: int, decode_modes: list[str]
+) -> dict[str, Any]:
+    from nanochat.report import build_provenance
+
+    return build_provenance(
+        {
+            "model_config": ckpt_meta.get("model_config"),
+            "eval": {"seeds": seeds, "examples": examples, "decode_modes": decode_modes},
+        }
+    )
+
+
 _EVAL_TASKS_SCHEMA_VERSION = "mgr.evaltasks.v1"
 # SCHEMA CONTRACT (consumed by C4 scorecards and the G2 verdict engine):
 # {"schema_version", "kind": "eval-tasks",
@@ -4500,6 +4513,12 @@ def eval_tasks(
             "decode_modes": [m for m, _ in decode_modes],
             "git": _get_git_info(),
         },
+        # Tamper-evidence (rz8.2 contract): the G2 verdict engine refuses
+        # tainted artifacts. config_hash here covers the EVAL parameters plus
+        # the checkpoint's model config (the full evidence-producing recipe).
+        "provenance": _eval_tasks_provenance(
+            ckpt_meta, seeds=seed_list, examples=examples, decode_modes=[m for m, _ in decode_modes]
+        ),
         "tasks": results,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
@@ -5623,6 +5642,393 @@ def hypotheses_add(
         console.print("[bold red]add rolled back: the new entry failed validation.[/bold red]")
         raise typer.Exit(code=1)
     console.print(f"[bold green]Registered {hypothesis_id}[/bold green] → {path}")
+
+
+# =============================================================================
+# Verdict engine (bead hij.2) — mgr adjudicate. Artifacts in, verdicts out,
+# deterministically. The integrity core is REFUSAL: missing/weak/tainted
+# evidence yields BLOCKED with a machine-readable reason, never a soft verdict.
+# =============================================================================
+
+_ADJ_POLICY_VERSION = "ci-v1"
+# ci-v1 statistical policy (recorded in every verdict so a future policy
+# change cannot silently reinterpret history):
+#   - observations per arm: per_seed values when the metric_path ends in
+#     ".mean" and a sibling per_seed list exists; otherwise one observation
+#     per qualifying artifact. CIs need >= 2 observations per arm.
+#   - absolute_delta: effect = mean(C) - mean(B); Welch-normal CI95
+#     (d +/- 1.96 * sqrt(sC^2/nC + sB^2/nB)).
+#   - ratio: effect = mean(C) / mean(B); percentile bootstrap CI95
+#     (10_000 resamples, numpy default_rng(1234) - deterministic).
+#   - SUPPORTED: the CI95 lies entirely on the predicted side of the
+#     threshold. REFUTED: entirely on the failing side (the registered
+#     effect size is part of the claim). INCONCLUSIVE: the CI straddles.
+#   - budgets: all qualifying artifacts' planned total FLOPs must agree
+#     within 5% of the maximum, else BLOCKED budget_mismatch.
+_ADJ_BUDGET_RTOL = 0.05
+_ADJ_BOOTSTRAP_SEED = 1234
+_ADJ_BOOTSTRAP_N = 10_000
+_ADJ_ATTENTION_MECHS = frozenset(
+    {"standard", "tropical", "ultrametric", "simplicial", "quaternion", "braid", "fractal", "octonion", "surreal", "reversible", "gauge"}
+)
+
+_ADJ_BLOCK_REASONS = {
+    "prediction_not_operationalized": "prediction is null; operationalization_note names the blocker",
+    "no_candidate_artifacts": "no qualifying artifact for the candidate arm",
+    "no_baseline_artifacts": "no qualifying artifact for the baseline arm",
+    "tainted_evidence": "only tainted artifacts available (dirty tree / missing provenance) - evidence not attributable to a committed code state",
+    "insufficient_seeds": "fewer observations than the prediction's min_seeds (or < 2, the CI floor)",
+    "budget_mismatch": "candidate and baseline budgets differ beyond the 5% equal-FLOPs tolerance",
+    "metric_missing": "qualifying artifact lacks the metric at the registered path",
+}
+
+
+def _adj_walk_path(data: Any, dotted: str) -> Any:
+    cur = data
+    for seg in dotted.split("."):
+        if isinstance(cur, dict) and seg in cur:
+            cur = cur[seg]
+        elif isinstance(cur, list) and seg.isdigit() and int(seg) < len(cur):
+            cur = cur[int(seg)]
+        else:
+            return None
+    return cur
+
+
+def _adj_collect_artifacts(roots: list[Path]) -> list[dict[str, Any]]:
+    """Index every summary.json under the roots by schema kind."""
+    index: list[dict[str, Any]] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("summary.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            sv = data.get("schema_version")
+            if sv == "mgr.evaltasks.v1":
+                schema = "evaltasks"
+            elif sv == "mgr.telemetry.v1":
+                schema = "train"
+            else:
+                continue
+            prov = data.get("provenance")
+            tainted = (not isinstance(prov, dict)) or bool(prov.get("tainted", True))
+            index.append({"path": str(path), "schema": schema, "data": data, "tainted": tainted})
+    return index
+
+
+def _adj_artifact_matches_arm(art: dict[str, Any], mechanism: str) -> bool:
+    """Arm membership: an arm changes exactly ITS axis from the all-defaults
+    baseline (attention standard, scheduler none, optimizer non-hoss)."""
+    data = art["data"]
+    if art["schema"] == "evaltasks":
+        attn = ((data.get("meta") or {}).get("checkpoint") or {}).get("attention_type")
+        return attn == (mechanism if mechanism in _ADJ_ATTENTION_MECHS else "standard")
+    config = data.get("config") or {}
+    hparams = data.get("hparams") or {}
+    attn = config.get("attention_type")
+    sched = hparams.get("scheduler_type", "none")
+    opt = config.get("optimizer_type", "adamw")
+    if mechanism == "ordinal":
+        return attn == "standard" and sched == "ordinal"
+    if mechanism == "hoss":
+        return attn == "standard" and opt == "hoss"
+    return attn == mechanism and sched != "ordinal" and opt != "hoss"
+
+
+def _adj_planned_flops(art: dict[str, Any]) -> float | None:
+    data = art["data"]
+    if art["schema"] == "evaltasks":
+        budget = ((data.get("meta") or {}).get("checkpoint") or {}).get("budget") or {}
+    else:
+        budget = data.get("budget") or {}
+    target = budget.get("target_flops")
+    if isinstance(target, (int, float)) and target:
+        return float(target)
+    planned = budget.get("planned_total_flops_est")
+    if isinstance(planned, (int, float)) and planned:
+        return float(planned)
+    max_steps = budget.get("max_steps")
+    per_step = budget.get("flops_per_step_est")
+    if isinstance(max_steps, int) and isinstance(per_step, (int, float)):
+        return float(max_steps * per_step)
+    return None
+
+
+def _adj_observations(art: dict[str, Any], dotted: str) -> list[float] | None:
+    """Extract per-seed observations when available, else the single value."""
+    value = _adj_walk_path(art["data"], dotted)
+    if dotted.endswith(".mean"):
+        parent = _adj_walk_path(art["data"], dotted.rsplit(".", 1)[0])
+        if isinstance(parent, dict) and isinstance(parent.get("per_seed"), list):
+            obs = [float(v) for v in parent["per_seed"] if isinstance(v, (int, float))]
+            return obs or None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return [float(value)]
+    return None
+
+
+def _adj_ci(cand: list[float], base: list[float], threshold_kind: str) -> tuple[float, float, float]:
+    """(effect, ci_low, ci_high) under the ci-v1 policy."""
+    import statistics as stats_mod
+
+    import numpy as _np
+
+    if threshold_kind == "absolute_delta":
+        effect = stats_mod.mean(cand) - stats_mod.mean(base)
+        se = (
+            (stats_mod.variance(cand) / len(cand)) + (stats_mod.variance(base) / len(base))
+        ) ** 0.5
+        return effect, effect - 1.96 * se, effect + 1.96 * se
+    rng = _np.random.default_rng(_ADJ_BOOTSTRAP_SEED)
+    c = _np.asarray(cand, dtype=float)
+    b = _np.asarray(base, dtype=float)
+    effect = float(c.mean() / b.mean())
+    ratios = []
+    for _ in range(_ADJ_BOOTSTRAP_N):
+        cs = c[rng.integers(0, len(c), len(c))]
+        bs = b[rng.integers(0, len(b), len(b))]
+        if bs.mean() != 0:
+            ratios.append(cs.mean() / bs.mean())
+    lo, hi = _np.percentile(ratios, [2.5, 97.5])
+    return effect, float(lo), float(hi)
+
+
+def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    """One hypothesis -> a verdict record (verdict in supported/refuted/
+    inconclusive) or a refusal (verdict 'blocked' + reason_code)."""
+    hid = hyp.get("id")
+    pred = hyp.get("prediction")
+    if not isinstance(pred, dict):
+        return {"id": hid, "verdict": "blocked", "reason_code": "prediction_not_operationalized",
+                "reason": _ADJ_BLOCK_REASONS["prediction_not_operationalized"]}
+    schema, _, dotted = str(pred.get("metric_path", "")).partition(":")
+    baseline_mech = (pred.get("baseline") or {}).get("mechanism", "standard")
+    min_seeds = int(pred.get("min_seeds", 3))
+    comparator = pred.get("comparator")
+    threshold = float(pred.get("threshold", 0.0))
+    threshold_kind = str(pred.get("threshold_kind", "absolute_delta"))
+
+    pool = [a for a in artifacts if a["schema"] == schema]
+    arms: dict[str, dict[str, Any]] = {}
+    used_paths: list[str] = []
+    saw_tainted = False
+    # A multi-mechanism entry is a FOR-ALL claim: every listed mechanism must
+    # adjudicate; the overall verdict is the worst case across arms.
+    for mech in hyp.get("mechanisms") or []:
+        cand_all = [a for a in pool if _adj_artifact_matches_arm(a, mech)]
+        base_all = [a for a in pool if _adj_artifact_matches_arm(a, baseline_mech)]
+        saw_tainted = saw_tainted or any(a["tainted"] for a in cand_all + base_all)
+        cand = [a for a in cand_all if not a["tainted"]]
+        base = [a for a in base_all if not a["tainted"]]
+        if not cand:
+            code = "tainted_evidence" if cand_all else "no_candidate_artifacts"
+            return {"id": hid, "verdict": "blocked", "reason_code": code, "mechanism": mech,
+                    "reason": _ADJ_BLOCK_REASONS[code]}
+        if not base:
+            code = "tainted_evidence" if base_all else "no_baseline_artifacts"
+            return {"id": hid, "verdict": "blocked", "reason_code": code, "mechanism": mech,
+                    "reason": _ADJ_BLOCK_REASONS[code]}
+        flops = [f for a in cand + base if (f := _adj_planned_flops(a)) is not None]
+        if len(flops) != len(cand) + len(base) or (max(flops) - min(flops)) > _ADJ_BUDGET_RTOL * max(flops):
+            return {"id": hid, "verdict": "blocked", "reason_code": "budget_mismatch", "mechanism": mech,
+                    "reason": _ADJ_BLOCK_REASONS["budget_mismatch"]}
+        cand_obs = [v for a in cand for v in (_adj_observations(a, dotted) or [])]
+        base_obs = [v for a in base for v in (_adj_observations(a, dotted) or [])]
+        if not cand_obs or not base_obs:
+            return {"id": hid, "verdict": "blocked", "reason_code": "metric_missing", "mechanism": mech,
+                    "reason": _ADJ_BLOCK_REASONS["metric_missing"]}
+        if min(len(cand_obs), len(base_obs)) < max(2, min_seeds):
+            return {"id": hid, "verdict": "blocked", "reason_code": "insufficient_seeds", "mechanism": mech,
+                    "reason": _ADJ_BLOCK_REASONS["insufficient_seeds"]}
+        effect, lo, hi = _adj_ci(cand_obs, base_obs, threshold_kind)
+        if comparator == ">=":
+            arm_verdict = "supported" if lo >= threshold else ("refuted" if hi < threshold else "inconclusive")
+        else:  # "<="
+            arm_verdict = "supported" if hi <= threshold else ("refuted" if lo > threshold else "inconclusive")
+        arms[mech] = {
+            "verdict": arm_verdict,
+            "effect": effect,
+            "ci95": [lo, hi],
+            "n_candidate": len(cand_obs),
+            "n_baseline": len(base_obs),
+        }
+        used_paths.extend(sorted({a["path"] for a in cand + base}))
+
+    order = {"refuted": 0, "inconclusive": 1, "supported": 2}
+    verdict = min((a["verdict"] for a in arms.values()), key=lambda v: order[v])
+    return {
+        "id": hid,
+        "verdict": verdict,
+        "arms": arms,
+        "artifacts": sorted(set(used_paths)),
+        "policy_version": _ADJ_POLICY_VERSION,
+        "tainted_artifacts_seen": saw_tainted,
+    }
+
+
+def _registry_append_verdict(path: Path, hyp_id: str, entry_line: str, new_status: str) -> None:
+    """Textual ledger surgery: append a single-line flow-mapping history item
+    and update the status line, preserving every hand-written comment. The
+    caller validates the result and rolls back on any error."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    # locate the entry block
+    start = next(i for i, ln in enumerate(lines) if ln.strip() == f"- id: {hyp_id}")
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("- id: ")), len(lines))
+    block = list(range(start, end))
+    status_idx = next(i for i in block if lines[i].startswith("    status:"))
+    lines[status_idx] = f"    status: {new_status}"
+    vh_idx = next(i for i in block if lines[i].startswith("    verdict_history:"))
+    if lines[vh_idx].strip() == "verdict_history: []":
+        lines[vh_idx] = "    verdict_history:"
+        lines.insert(vh_idx + 1, entry_line)
+    else:
+        # append AFTER the last existing item (history is chronological)
+        insert_at = vh_idx + 1
+        while insert_at < end and (
+            lines[insert_at].startswith("      - ") or lines[insert_at].startswith("        ")
+        ):
+            insert_at += 1
+        lines.insert(insert_at, entry_line)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+@app.command("adjudicate")
+def adjudicate(
+    hypothesis: Annotated[list[str] | None, typer.Option("--hypothesis", "-H", help="Hypothesis id (repeatable)")] = None,
+    adjudicate_all: Annotated[bool, typer.Option("--all", help="Adjudicate every operationalized hypothesis")] = False,
+    artifacts: Annotated[list[Path] | None, typer.Option(help="Artifact root(s) to scan (repeatable)")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Report verdicts without touching the registry")] = False,
+    artifacts_dir: Annotated[Path, typer.Option(help="Output root for the adjudication report")] = Path("artifacts"),
+    run_id: Annotated[str | None, typer.Option(help="Report run id (default: date)")] = None,
+) -> None:
+    """Adjudicate registry hypotheses against artifact evidence (bead hij.2).
+
+    Verdicts are deterministic (fixed bootstrap seed) and stamped with the
+    statistical policy version. The engine REFUSES weak evidence: missing
+    artifacts, low seed counts, mismatched budgets, or tainted provenance
+    yield BLOCKED with a machine-readable reason - never a soft verdict.
+    Refusals are report-only; only supported/refuted/inconclusive verdicts
+    append to the registry ledger (append-only, validated, rolled back on
+    any validation failure).
+    """
+    repo_root = Path(__file__).resolve().parent
+    data = _hypotheses_load_or_exit()
+    entries = [h for h in data.get("hypotheses", []) if isinstance(h, dict)]
+    if hypothesis:
+        wanted = set(hypothesis)
+        unknown = wanted - {h.get("id") for h in entries}
+        if unknown:
+            console.print(f"[bold red]Unknown hypothesis id(s): {sorted(unknown)}[/bold red]")
+            raise typer.Exit(code=2)
+        entries = [h for h in entries if h.get("id") in wanted]
+    elif not adjudicate_all:
+        console.print("[bold red]Provide --hypothesis ID (repeatable) or --all.[/bold red]")
+        raise typer.Exit(code=2)
+
+    roots = [Path(p) for p in (artifacts or [Path("artifacts")])]
+    index = _adj_collect_artifacts(roots)
+    console.print(
+        f"[bold cyan]adjudicate[/bold cyan] {len(entries)} hypothesis(es) · "
+        f"{len(index)} artifact(s) indexed from {[str(r) for r in roots]} · policy {_ADJ_POLICY_VERSION}"
+    )
+
+    today = time.strftime("%Y-%m-%d")
+    verdicts = [_adjudicate_hypothesis(h, index) for h in entries]
+
+    # ---- ledger append (real verdicts only; refusals are report-only) ----
+    registry_path = _hypotheses_registry_path()
+    applied = 0
+    if not dry_run:
+        original = registry_path.read_text(encoding="utf-8")
+        try:
+            for v in verdicts:
+                if v["verdict"] == "blocked":
+                    continue
+                arms_txt = json.dumps(v["arms"], sort_keys=True)
+                entry_line = (
+                    "      - {date: "
+                    + json.dumps(today)
+                    + ", verdict: "
+                    + v["verdict"]
+                    + ", artifacts: "
+                    + json.dumps(v["artifacts"])
+                    + ", adjudicator: "
+                    + json.dumps(f"engine:{_ADJ_POLICY_VERSION}")
+                    + ", policy_version: "
+                    + json.dumps(_ADJ_POLICY_VERSION)
+                    + ", arms: "
+                    + arms_txt
+                    + "}"
+                )
+                _registry_append_verdict(registry_path, str(v["id"]), entry_line, v["verdict"])
+                applied += 1
+            if applied:
+                new_data, load_errors = _load_hypothesis_registry(registry_path)
+                parent = _load_parent_hypothesis_registry(repo_root)
+                errors, _w, _s = _validate_hypothesis_registry(new_data, load_errors, repo_root, parent=parent)
+                if errors:
+                    raise RuntimeError("post-adjudication registry validation failed: " + "; ".join(errors[:5]))
+        except Exception as exc:  # roll back: never leave the ledger invalid
+            registry_path.write_text(original, encoding="utf-8")
+            console.print(f"[bold red]ledger update rolled back: {exc}[/bold red]")
+            raise typer.Exit(code=1) from exc
+
+    # ---- report ----
+    resolved_run_id = run_id or today
+    run_dir = artifacts_dir / "adjudications" / resolved_run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"policy_version": _ADJ_POLICY_VERSION, "date": today, "verdicts": verdicts}
+    (run_dir / "verdicts.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+    style = {"supported": "green", "refuted": "red", "inconclusive": "magenta", "blocked": "dim"}
+    order = {"refuted": 0, "supported": 1, "inconclusive": 2, "blocked": 3}
+    by_id = {h.get("id"): h for h in entries}
+    rows = sorted(
+        verdicts, key=lambda v: (order[v["verdict"]], ",".join(by_id[v["id"]].get("mechanisms") or []), str(v["id"]))
+    )
+    table = Table(title=f"adjudication — {today} (policy {_ADJ_POLICY_VERSION})", box=box.SIMPLE_HEAVY)
+    table.add_column("hypothesis", style="bold")
+    table.add_column("verdict")
+    table.add_column("detail")
+    md_rows = []
+    for v in rows:
+        st = v["verdict"]
+        if st == "blocked":
+            detail = f"{v['reason_code']}" + (f" [{v.get('mechanism')}]" if v.get("mechanism") else "")
+        else:
+            detail = "; ".join(
+                f"{m}: effect={a['effect']:.4g} ci95=[{a['ci95'][0]:.4g},{a['ci95'][1]:.4g}] (n={a['n_candidate']}/{a['n_baseline']})"
+                for m, a in v["arms"].items()
+            )
+        table.add_row(str(v["id"]), f"[{style[st]}]{st}[/{style[st]}]", detail)
+        md_rows.append(f"| {v['id']} | {st} | {detail} |")
+    console.print(table)
+    counts: dict[str, int] = {}
+    for v in verdicts:
+        counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
+    summary_line = " · ".join(f"{k}: {n}" for k, n in sorted(counts.items()))
+    report_md = (
+        f"# Adjudication — {today}\n\n"
+        f"- policy: `{_ADJ_POLICY_VERSION}`\n"
+        f"- artifacts indexed: {len(index)} from {[str(r) for r in roots]}\n"
+        f"- ledger entries appended: {applied}{' (dry run)' if dry_run else ''}\n"
+        f"- verdicts: {summary_line}\n\n"
+        "| hypothesis | verdict | detail |\n|---|---|---|\n" + "\n".join(md_rows) + "\n\n"
+        "BLOCKED rows are refusals, not adjudications: the engine declines to rule on weak, "
+        "mismatched, or tainted evidence. See `verdicts.json` for machine-readable reasons.\n"
+    )
+    (run_dir / "report.md").write_text(report_md)
+    console.print(
+        Panel(
+            f"[bold]{summary_line}[/bold] · ledger appends: {applied}{' (dry run)' if dry_run else ''} · → {run_dir}",
+            border_style="blue",
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,383 @@
+"""Tests for the verdict engine, mgr adjudicate (bead hij.2).
+
+The acceptance matrix: fixture artifacts drive one hypothesis to EACH verdict
+state (supported / refuted / inconclusive / blocked-for-every-reason);
+verdicts are deterministic (fixed bootstrap seed -> byte-identical
+verdicts.json); the ledger append survives validation, preserves hand-written
+registry comments, never rewrites prior history, and rolls back atomically
+when validation fails. The integrity core - REFUSING weak or tainted
+evidence - is tested explicitly per the bead.
+"""
+
+import json
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+import cli
+
+runner = CliRunner()
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+CLEAN_PROV = {"schema_version": "mgr.metrics.v1", "git_sha": "deadbeef", "git_dirty": False,
+              "config_hash": "abc", "data_snapshot_hash": None, "tainted": False}
+TAINTED_PROV = {**CLEAN_PROV, "git_dirty": True, "tainted": True}
+
+
+def _evaltasks_artifact(
+    root: Path,
+    name: str,
+    *,
+    mechanism: str,
+    per_seed: list[float],
+    task: str = "hier",
+    target_flops: float = 2e9,
+    tainted: bool = False,
+) -> Path:
+    run_dir = root / name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    mean = sum(per_seed) / len(per_seed)
+    summary = {
+        "schema_version": "mgr.evaltasks.v1",
+        "kind": "eval-tasks",
+        "meta": {
+            "checkpoint": {
+                "attention_type": mechanism,
+                "budget": {"max_steps": 100, "target_flops": target_flops, "flops_per_step_est": 1e7},
+            },
+            "seeds": list(range(len(per_seed))),
+        },
+        "provenance": TAINTED_PROV if tainted else CLEAN_PROV,
+        "tasks": {
+            task: {
+                "exact_match": {"greedy": {"held_out": {"mean": mean, "per_seed": per_seed},
+                                            "in_range": {"mean": mean, "per_seed": per_seed}}},
+                "perplexity": {"in_range": mean, "held_out": mean},
+            }
+        },
+    }
+    (run_dir / "summary.json").write_text(json.dumps(summary))
+    return run_dir / "summary.json"
+
+
+def _hyp(per_pred_overrides=None, **overrides):
+    pred = {
+        "metric_path": "evaltasks:tasks.hier.exact_match.greedy.held_out.mean",
+        "comparator": ">=",
+        "threshold_kind": "absolute_delta",
+        "threshold": 0.05,
+        "baseline": {"mechanism": "standard", "equal_flops": True},
+        "min_seeds": 3,
+    }
+    pred.update(per_pred_overrides or {})
+    base = {
+        "id": "hyp-engine-test",
+        "statement": "engine test claim",
+        "mechanisms": ["ultrametric"],
+        "source": {"kind": "human", "provenance": "test"},
+        "date_registered": "2026-06-10",
+        "prediction": pred,
+        "status": "open",
+        "evidence": [],
+        "verdict_history": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def _index(root: Path):
+    return cli._adj_collect_artifacts([root])
+
+
+# ---------------------------------------------------------------------------
+# verdict states
+
+
+def test_supported_when_ci_clears_threshold(tmp_path):
+    _evaltasks_artifact(tmp_path, "cand", mechanism="ultrametric", per_seed=[0.80, 0.82, 0.81])
+    _evaltasks_artifact(tmp_path, "base", mechanism="standard", per_seed=[0.50, 0.51, 0.52])
+    v = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path))
+    assert v["verdict"] == "supported", v
+    arm = v["arms"]["ultrametric"]
+    assert arm["ci95"][0] >= 0.05 and abs(arm["effect"] - 0.30) < 0.02
+    assert v["policy_version"] == "ci-v1"
+
+
+def test_refuted_when_ci_clears_opposite_side(tmp_path):
+    _evaltasks_artifact(tmp_path, "cand", mechanism="ultrametric", per_seed=[0.50, 0.51, 0.50])
+    _evaltasks_artifact(tmp_path, "base", mechanism="standard", per_seed=[0.50, 0.50, 0.51])
+    v = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path))
+    assert v["verdict"] == "refuted", v  # effect ~0, CI well below the +0.05 claim
+
+
+def test_inconclusive_when_ci_straddles(tmp_path):
+    # high variance: CI spans the 0.05 threshold
+    _evaltasks_artifact(tmp_path, "cand", mechanism="ultrametric", per_seed=[0.40, 0.75, 0.55])
+    _evaltasks_artifact(tmp_path, "base", mechanism="standard", per_seed=[0.45, 0.55, 0.50])
+    v = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path))
+    assert v["verdict"] == "inconclusive", v
+
+
+def test_ratio_threshold_kind_supported(tmp_path):
+    _evaltasks_artifact(tmp_path, "cand", mechanism="ultrametric", per_seed=[0.30, 0.31, 0.29])
+    _evaltasks_artifact(tmp_path, "base", mechanism="standard", per_seed=[0.60, 0.61, 0.59])
+    hyp = _hyp({"comparator": "<=", "threshold_kind": "ratio", "threshold": 0.7,
+                "metric_path": "evaltasks:tasks.hier.perplexity.held_out"})
+    # perplexity path has no per_seed -> one observation per artifact; add more artifacts
+    _evaltasks_artifact(tmp_path, "cand2", mechanism="ultrametric", per_seed=[0.30, 0.32, 0.31])
+    _evaltasks_artifact(tmp_path, "cand3", mechanism="ultrametric", per_seed=[0.29, 0.30, 0.31])
+    _evaltasks_artifact(tmp_path, "base2", mechanism="standard", per_seed=[0.58, 0.62, 0.60])
+    _evaltasks_artifact(tmp_path, "base3", mechanism="standard", per_seed=[0.61, 0.60, 0.59])
+    v = cli._adjudicate_hypothesis(hyp, _index(tmp_path))
+    assert v["verdict"] == "supported", v
+    assert abs(v["arms"]["ultrametric"]["effect"] - 0.5) < 0.05
+
+
+# ---------------------------------------------------------------------------
+# blocked reasons (the integrity core)
+
+
+def test_blocked_reasons(tmp_path):
+    # no artifacts at all
+    v = cli._adjudicate_hypothesis(_hyp(), [])
+    assert v["verdict"] == "blocked" and v["reason_code"] == "no_candidate_artifacts"
+
+    # candidate present, baseline missing
+    _evaltasks_artifact(tmp_path, "cand", mechanism="ultrametric", per_seed=[0.8, 0.8, 0.8])
+    v = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path))
+    assert v["verdict"] == "blocked" and v["reason_code"] == "no_baseline_artifacts"
+
+    # insufficient seeds
+    root2 = tmp_path / "few"
+    _evaltasks_artifact(root2, "cand", mechanism="ultrametric", per_seed=[0.8, 0.8])
+    _evaltasks_artifact(root2, "base", mechanism="standard", per_seed=[0.5, 0.5])
+    v = cli._adjudicate_hypothesis(_hyp(), _index(root2))
+    assert v["verdict"] == "blocked" and v["reason_code"] == "insufficient_seeds"
+
+    # budget mismatch beyond 5%
+    root3 = tmp_path / "budget"
+    _evaltasks_artifact(root3, "cand", mechanism="ultrametric", per_seed=[0.8, 0.8, 0.8], target_flops=2e9)
+    _evaltasks_artifact(root3, "base", mechanism="standard", per_seed=[0.5, 0.5, 0.5], target_flops=4e9)
+    v = cli._adjudicate_hypothesis(_hyp(), _index(root3))
+    assert v["verdict"] == "blocked" and v["reason_code"] == "budget_mismatch"
+
+    # metric missing at the registered path
+    root4 = tmp_path / "metric"
+    _evaltasks_artifact(root4, "cand", mechanism="ultrametric", per_seed=[0.8, 0.8, 0.8], task="dyck")
+    _evaltasks_artifact(root4, "base", mechanism="standard", per_seed=[0.5, 0.5, 0.5], task="dyck")
+    v = cli._adjudicate_hypothesis(_hyp(), _index(root4))  # hyp points at tasks.hier
+    assert v["verdict"] == "blocked" and v["reason_code"] == "metric_missing"
+
+    # not operationalized
+    v = cli._adjudicate_hypothesis(_hyp() | {"prediction": None}, [])
+    assert v["verdict"] == "blocked" and v["reason_code"] == "prediction_not_operationalized"
+
+
+def test_tainted_evidence_refused_and_clean_twin_adjudicates(tmp_path):
+    """The bead's explicit pair: tainted fixture -> BLOCKED with the correct
+    reason; a clean twin of the same numbers adjudicates normally."""
+    dirty = tmp_path / "dirty"
+    _evaltasks_artifact(dirty, "cand", mechanism="ultrametric", per_seed=[0.8, 0.82, 0.81], tainted=True)
+    _evaltasks_artifact(dirty, "base", mechanism="standard", per_seed=[0.5, 0.51, 0.52])
+    v = cli._adjudicate_hypothesis(_hyp(), _index(dirty))
+    assert v["verdict"] == "blocked" and v["reason_code"] == "tainted_evidence", v
+
+    clean = tmp_path / "clean"
+    _evaltasks_artifact(clean, "cand", mechanism="ultrametric", per_seed=[0.8, 0.82, 0.81])
+    _evaltasks_artifact(clean, "base", mechanism="standard", per_seed=[0.5, 0.51, 0.52])
+    v = cli._adjudicate_hypothesis(_hyp(), _index(clean))
+    assert v["verdict"] == "supported"
+
+    # missing provenance entirely == tainted (pre-rz8.2 artifacts)
+    noprov = tmp_path / "noprov"
+    path = _evaltasks_artifact(noprov, "cand", mechanism="ultrametric", per_seed=[0.8, 0.82, 0.81])
+    data = json.loads(path.read_text())
+    del data["provenance"]
+    path.write_text(json.dumps(data))
+    _evaltasks_artifact(noprov, "base", mechanism="standard", per_seed=[0.5, 0.51, 0.52])
+    v = cli._adjudicate_hypothesis(_hyp(), _index(noprov))
+    assert v["verdict"] == "blocked" and v["reason_code"] == "tainted_evidence"
+
+
+def test_forall_multi_mechanism_worst_case(tmp_path):
+    """A multi-mechanism entry is a FOR-ALL claim: worst arm decides."""
+    _evaltasks_artifact(tmp_path, "c1", mechanism="ultrametric", per_seed=[0.80, 0.81, 0.82])
+    _evaltasks_artifact(tmp_path, "c2", mechanism="fractal", per_seed=[0.50, 0.51, 0.50])
+    _evaltasks_artifact(tmp_path, "base", mechanism="standard", per_seed=[0.50, 0.51, 0.52])
+    hyp = _hyp(mechanisms=["ultrametric", "fractal"])
+    v = cli._adjudicate_hypothesis(hyp, _index(tmp_path))
+    assert v["verdict"] == "refuted"  # fractal arm fails the +0.05 claim decisively
+    assert v["arms"]["ultrametric"]["verdict"] == "supported"
+    assert v["arms"]["fractal"]["verdict"] == "refuted"
+
+    # any arm without evidence blocks the whole FOR-ALL claim
+    hyp = _hyp(mechanisms=["ultrametric", "braid"])
+    v = cli._adjudicate_hypothesis(hyp, _index(tmp_path))
+    assert v["verdict"] == "blocked" and v["mechanism"] == "braid"
+
+
+def test_train_schema_arm_detection(tmp_path):
+    """ordinal/hoss arms resolve via hparams/config, not attention_type."""
+
+    def train_artifact(name, *, scheduler="none", optimizer="adamw", val_ce=2.0):
+        run = tmp_path / name
+        run.mkdir(parents=True)
+        (run / "summary.json").write_text(json.dumps({
+            "schema_version": "mgr.telemetry.v1",
+            "config": {"attention_type": "standard", "optimizer_type": optimizer},
+            "hparams": {"scheduler_type": scheduler},
+            "budget": {"max_steps": 100, "target_flops": 1e9, "flops_per_step_est": 1e7},
+            "provenance": CLEAN_PROV,
+            "results": {"val_ce_final": val_ce},
+        }))
+
+    for i, ce in enumerate([1.90, 1.92, 1.91]):
+        train_artifact(f"ord{i}", scheduler="ordinal", val_ce=ce)
+    for i, ce in enumerate([2.00, 2.02, 2.01]):
+        train_artifact(f"std{i}", val_ce=ce)
+    hyp = _hyp(
+        {"metric_path": "train:results.val_ce_final", "comparator": "<=",
+         "threshold_kind": "ratio", "threshold": 0.98},
+        mechanisms=["ordinal"],
+    )
+    v = cli._adjudicate_hypothesis(hyp, _index(tmp_path))
+    assert v["verdict"] == "supported", v
+    assert v["arms"]["ordinal"]["n_candidate"] == 3
+
+
+# ---------------------------------------------------------------------------
+# determinism + CLI + ledger
+
+
+def test_determinism_byte_identical_verdicts(tmp_path, monkeypatch):
+    _evaltasks_artifact(tmp_path / "a", "cand", mechanism="ultrametric", per_seed=[0.6, 0.7, 0.65])
+    _evaltasks_artifact(tmp_path / "a", "base", mechanism="standard", per_seed=[0.5, 0.55, 0.52])
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        "schema_version: 1\nhypotheses:\n"
+        + _yaml_entry(_hyp({"threshold_kind": "ratio", "threshold": 1.05}))
+    )
+    monkeypatch.setattr(cli, "_hypotheses_registry_path", lambda: registry)
+    monkeypatch.setattr(cli, "_load_parent_hypothesis_registry", lambda repo_root: None)
+
+    outs = []
+    for run in ("r1", "r2"):
+        result = runner.invoke(cli.app, [
+            "adjudicate", "--all", "--dry-run", "--artifacts", str(tmp_path / "a"),
+            "--artifacts-dir", str(tmp_path / run), "--run-id", "x",
+        ])
+        assert result.exit_code == 0, result.output
+        outs.append((tmp_path / run / "adjudications" / "x" / "verdicts.json").read_bytes())
+    assert outs[0] == outs[1], "same artifacts must produce byte-identical verdicts (fixed bootstrap seed)"
+
+
+def _yaml_entry(h):
+    pred = h["prediction"]
+    lines = [
+        f"  - id: {h['id']}",
+        f"    statement: {json.dumps(h['statement'])}",
+        f"    mechanisms: [{', '.join(h['mechanisms'])}]",
+        "    source: {kind: human, provenance: test}",
+        f"    date_registered: \"{h['date_registered']}\"",
+    ]
+    if pred is None:
+        lines += ["    prediction: null", "    operationalization_note: test", "    status: blocked"]
+    else:
+        lines += [
+            "    prediction:",
+            f"      metric_path: {json.dumps(pred['metric_path'])}",
+            f"      comparator: \"{pred['comparator']}\"",
+            f"      threshold_kind: {pred['threshold_kind']}",
+            f"      threshold: {pred['threshold']}",
+            f"      baseline: {{mechanism: {pred['baseline']['mechanism']}, equal_flops: true}}",
+            f"      min_seeds: {pred['min_seeds']}",
+            "    status: open",
+        ]
+    lines += ["    evidence: []", "    verdict_history: []", ""]
+    return "\n".join(lines)
+
+
+def test_ledger_append_preserves_comments_and_is_append_only(tmp_path, monkeypatch):
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        "# HAND-WRITTEN HEADER COMMENT - must survive ledger surgery\n"
+        "schema_version: 1\nhypotheses:\n" + _yaml_entry(_hyp())
+    )
+    monkeypatch.setattr(cli, "_hypotheses_registry_path", lambda: registry)
+    monkeypatch.setattr(cli, "_load_parent_hypothesis_registry", lambda repo_root: None)
+    _evaltasks_artifact(tmp_path / "a", "cand", mechanism="ultrametric", per_seed=[0.8, 0.82, 0.81])
+    _evaltasks_artifact(tmp_path / "a", "base", mechanism="standard", per_seed=[0.5, 0.51, 0.52])
+
+    result = runner.invoke(cli.app, [
+        "adjudicate", "--all", "--artifacts", str(tmp_path / "a"),
+        "--artifacts-dir", str(tmp_path / "out"), "--run-id", "x",
+    ])
+    assert result.exit_code == 0, result.output
+    text = registry.read_text()
+    assert "HAND-WRITTEN HEADER COMMENT" in text, "ledger surgery must preserve comments"
+    data, _ = cli._load_hypothesis_registry(registry)
+    entry = data["hypotheses"][0]
+    assert entry["status"] == "supported"
+    assert len(entry["verdict_history"]) == 1
+    first = entry["verdict_history"][0]
+    assert first["verdict"] == "supported" and first["adjudicator"] == "engine:ci-v1"
+    assert first["policy_version"] == "ci-v1" and first["artifacts"]
+
+    # second adjudication APPENDS; the first entry is untouched
+    result = runner.invoke(cli.app, [
+        "adjudicate", "--all", "--artifacts", str(tmp_path / "a"),
+        "--artifacts-dir", str(tmp_path / "out2"), "--run-id", "x",
+    ])
+    assert result.exit_code == 0, result.output
+    data, _ = cli._load_hypothesis_registry(registry)
+    history = data["hypotheses"][0]["verdict_history"]
+    assert len(history) == 2 and history[0] == first, "prior entries must never mutate"
+
+    errors, _, _ = cli._validate_hypothesis_registry(data, [], REPO_ROOT, parent=None)
+    assert errors == [], f"ledgered registry must stay valid: {errors}"
+
+
+def test_dry_run_leaves_registry_untouched(tmp_path, monkeypatch):
+    registry = tmp_path / "registry.yaml"
+    registry.write_text("schema_version: 1\nhypotheses:\n" + _yaml_entry(_hyp()))
+    before = registry.read_text()
+    monkeypatch.setattr(cli, "_hypotheses_registry_path", lambda: registry)
+    monkeypatch.setattr(cli, "_load_parent_hypothesis_registry", lambda repo_root: None)
+    _evaltasks_artifact(tmp_path / "a", "cand", mechanism="ultrametric", per_seed=[0.8, 0.82, 0.81])
+    _evaltasks_artifact(tmp_path / "a", "base", mechanism="standard", per_seed=[0.5, 0.51, 0.52])
+    result = runner.invoke(cli.app, [
+        "adjudicate", "--all", "--dry-run", "--artifacts", str(tmp_path / "a"),
+        "--artifacts-dir", str(tmp_path / "out"), "--run-id", "x",
+    ])
+    assert result.exit_code == 0, result.output
+    assert registry.read_text() == before
+
+
+def test_blocked_refusals_do_not_touch_the_ledger(tmp_path, monkeypatch):
+    registry = tmp_path / "registry.yaml"
+    registry.write_text("schema_version: 1\nhypotheses:\n" + _yaml_entry(_hyp()))
+    before = registry.read_text()
+    monkeypatch.setattr(cli, "_hypotheses_registry_path", lambda: registry)
+    monkeypatch.setattr(cli, "_load_parent_hypothesis_registry", lambda repo_root: None)
+    result = runner.invoke(cli.app, [
+        "adjudicate", "--all", "--artifacts", str(tmp_path / "empty"),
+        "--artifacts-dir", str(tmp_path / "out"), "--run-id", "x",
+    ])
+    assert result.exit_code == 0, result.output
+    assert registry.read_text() == before, "refusals are report-only"
+    verdicts = json.loads((tmp_path / "out" / "adjudications" / "x" / "verdicts.json").read_text())
+    assert verdicts["verdicts"][0]["verdict"] == "blocked"
+
+
+def test_cli_argument_errors(tmp_path):
+    result = runner.invoke(cli.app, ["adjudicate"])
+    assert result.exit_code == 2
+    result = runner.invoke(cli.app, ["adjudicate", "--hypothesis", "hyp-does-not-exist", "--dry-run"])
+    assert result.exit_code == 2
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

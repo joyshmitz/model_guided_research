@@ -1324,6 +1324,7 @@ def train(args) -> None:
             "weight_decay": float(weight_decay),
             "grad_clip_norm": (float(grad_clip_norm) if grad_clip_norm is not None else None),
             "model_type": model_type,
+            "scheduler_type": str(args.scheduler_type),  # arm detection for the G2 verdict engine
             "synaptic_config": (asdict(config.syn_cfg) if model_type == "synaptic" else None),
             "val_interval": val_interval,
             "val_batches": val_batches if val_interval > 0 else None,
