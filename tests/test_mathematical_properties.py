@@ -1254,13 +1254,16 @@ class TestTropicalFFN:
             )
 
     def test_invalid_configs_rejected(self):
+        import torch
+
         from nanochat.gpt import GPT
 
-        try:
-            GPT(self._cfg("tropical", attention_type="gauge", n_kv_head=2))
-            raise AssertionError("gauge + tropical FFN must be rejected")
-        except ValueError as exc:
-            require("gauge" in str(exc), f"unhelpful gauge-combo error: {exc}")
+        # gauge + tropical FFN: REJECTED until 1fr6 gave the gauge block a
+        # standard MLP slot; now the combination must construct and forward.
+        model = GPT(self._cfg("tropical", attention_type="gauge", n_kv_head=2))
+        ids = torch.randint(0, 128, (1, 8))
+        out = model(ids)
+        require(bool(torch.isfinite(out).all()), "gauge + tropical FFN forward produced non-finite values")
         try:
             GPT(self._cfg("tropical", ffn_beta=-1.0))
             raise AssertionError("ffn_beta <= 0 must be rejected")

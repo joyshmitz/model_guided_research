@@ -293,11 +293,6 @@ def _validate_train_args(args, *, ddp_rank: int, device: torch.device) -> None:
     ffn_type = str(getattr(args, "ffn_type", "standard"))
     if ffn_type not in _SUPPORTED_FFN_TYPES:
         errors.append(f"--ffn-type must be one of: {', '.join(_SUPPORTED_FFN_TYPES)}")
-    if ffn_type != "standard" and attention_type == "gauge":
-        errors.append(
-            "--ffn-type is incompatible with --attention-type gauge: the gauge block replaces the whole "
-            "block including the MLP (beads 8gk.8 / 7b0.1)."
-        )
     ffn_beta = getattr(args, "ffn_beta", None)
     if ffn_beta is not None and not (float(ffn_beta) > 0):
         errors.append(f"--ffn-beta must be > 0 when set (got {ffn_beta}); omit it for the exact tropical endpoint.")

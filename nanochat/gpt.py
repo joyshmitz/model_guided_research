@@ -288,7 +288,9 @@ class Block(nn.Module):
         self.config = config
         # Special Block Types that replace the standard Attention+MLP structure
         if config.attention_type == "gauge":
-            self.special_block = GaugeBlock(config, layer_idx)
+            # The gauge block owns its residual skeleton and MLP slot (1fr6);
+            # the MLP is built here so ffn_type dispatch applies to gauge too.
+            self.special_block = GaugeBlock(config, layer_idx, _build_ffn(config))
             return
         if config.attention_type == "reversible":
             # Reversible blocks split channels in half: x = [x1, x2].
@@ -393,20 +395,9 @@ class GPT(nn.Module):
                 raise ValueError(
                     "reversible attention requires n_kv_head to divide (n_head // 2) and be <= (n_head // 2)"
                 )
-        if self.config.attention_type == "gauge":
-            if self.config.n_kv_head != self.config.n_head:
-                raise ValueError("gauge attention requires n_kv_head == n_head (GQA not supported)")
-
         ffn_type = getattr(self.config, "ffn_type", "standard")
         if ffn_type not in ("standard", "tropical", "tropical-rational"):
             raise ValueError(f"ffn_type must be standard | tropical | tropical-rational, got {ffn_type!r}")
-        if ffn_type != "standard" and self.config.attention_type == "gauge":
-            # Gauge replaces the WHOLE block including the MLP (A1 boundary
-            # decision) - there is no standard MLP slot for the flag to act on.
-            raise ValueError(
-                "ffn_type is incompatible with attention_type='gauge' (the gauge block replaces the whole "
-                "block including the MLP; see beads 8gk.8 / 7b0.1)"
-            )
         ffn_beta = getattr(self.config, "ffn_beta", None)
         if ffn_beta is not None and not (float(ffn_beta) > 0):
             raise ValueError(f"ffn_beta must be None or > 0, got {ffn_beta!r}")
@@ -469,6 +460,8 @@ class GPT(nn.Module):
                 sb = block.special_block
                 if hasattr(sb, "c_proj"):
                     _zero_proj_weight(sb.c_proj)
+                if hasattr(sb, "mlp") and hasattr(sb.mlp, "c_proj"):
+                    _zero_proj_weight(sb.mlp.c_proj)
                 if hasattr(sb, "f_block") and hasattr(sb.f_block, "c_proj"):
                     _zero_proj_weight(sb.f_block.c_proj)
                 if hasattr(sb, "g_block") and hasattr(sb.g_block, "c_proj"):

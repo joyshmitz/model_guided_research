@@ -120,9 +120,17 @@ class KVCache:
         # Optional per-layer cached state for attention variants that need more than K/V.
         # - Simplicial attention caches the 1-hop outputs so 2-hop diffusion stays KV-cache consistent.
         self.simplicial_y1_cache = None
+        # - Gauge blocks cache the running cumulative transport angles per layer
+        #   (B, n_pairs), kept fp32 regardless of model dtype so angle drift cannot
+        #   accumulate over long decodes (bead 7b0.5).
+        self.gauge_cum_angles: torch.Tensor | None = None
 
     def reset(self):
         self.pos = 0
+        # The gauge lane ACCUMULATES (unlike kv/simplicial lanes, which are
+        # overwritten by position), so stale angles would corrupt a reused cache.
+        if self.gauge_cum_angles is not None:
+            self.gauge_cum_angles.zero_()
 
     def get_pos(self):
         return self.pos
@@ -261,6 +269,43 @@ class KVCache:
                     device=device,
                 )
                 self.simplicial_y1_cache[:, :, :, : other.pos, :] = expanded[:, :, :, : other.pos, :].to(device=device)
+
+        if hasattr(other, "gauge_cum_angles"):
+            other_angles = other.gauge_cum_angles
+            if other_angles is None:
+                self.gauge_cum_angles = None
+            elif not isinstance(other_angles, torch.Tensor):
+                raise TypeError("KVCache.prefill expected other.gauge_cum_angles to be a torch.Tensor | None")
+            else:
+                if other_angles.ndim != 3 or other_angles.size(0) != self.kv_shape[0]:
+                    raise ValueError(
+                        "KVCache.prefill expected gauge_cum_angles of shape (num_layers, B, n_pairs) with "
+                        f"num_layers={self.kv_shape[0]}, got {tuple(other_angles.shape)}"
+                    )
+                target_B = self.kv_shape[2]
+                if other_angles.size(1) == target_B:
+                    self.gauge_cum_angles = other_angles.clone().to(device=device)
+                elif other_angles.size(1) == 1:
+                    self.gauge_cum_angles = (
+                        other_angles.expand(other_angles.size(0), target_B, other_angles.size(2))
+                        .clone()
+                        .to(device=device)
+                    )
+                else:
+                    raise ValueError(
+                        f"Cannot expand gauge_cum_angles batch dim {other_angles.size(1)} -> {target_B}"
+                    )
+
+    def ensure_gauge_angle_cache(self, *, n_pairs: int, device: torch.device) -> None:
+        if self.gauge_cum_angles is not None:
+            return
+        # (num_layers, B, n_pairs) fp32; no seq dim - this is a running sum,
+        # so it needs no lazy kv_cache tensor and never grows.
+        self.gauge_cum_angles = torch.zeros(
+            (self.kv_shape[0], self.kv_shape[2], n_pairs),
+            dtype=torch.float32,
+            device=device,
+        )
 
     def ensure_simplicial_y1_cache(
         self,

@@ -8,25 +8,51 @@ Mathematical core (from JAX reference):
   - Implemented as cumulative product of rotations (or sum of angles for U(1)).
   - Gauge invariance: compare q_i with k_j transported by R_{i<-j} = T_i T_j^{-1}.
   - R_{i<-j} acts on features to align frames.
+
+Block structure (bead model_guided_research-1fr6): the gauge block REPLACES the
+whole transformer block (the A1 boundary decision from 7b0.1), but it carries
+the canonical pre-norm residual skeleton inside itself:
+
+    x = x + gauge_attention(norm(x))      # transport-wrapped attention
+    x = x + mlp(norm(x))                  # standard MLP slot (passed in by Block)
+
+Without the residuals, the repo's zero-init convention (c_proj and lm_head
+start at zero) made the whole network output exactly zero and the gradients
+mutually annihilate (total grad = 0.0) - gauge training was frozen at ln(V).
+The residual restores the each-block-starts-as-identity property the zero
+init is designed around. The MLP slot is passed in (mirroring the reversible
+block's F/G modules) so _build_ffn dispatch - including the tropical FFN -
+applies to gauge like every other block.
+
+KV-cache decode (bead model_guided_research-7b0.5): the obstacle is the
+cumulative gauge field - token t's global frame is the cumsum of all previous
+local angles. The KVCache carries a per-layer fp32 running-cumsum lane
+(engine.py, following the simplicial y1 precedent). Correctness crux, the
+frame-invariance argument: keys and values are computed from the GLOBALLY
+transported representation x_global_t = R(cumsum_t) @ norm(x_t) and inserted
+into the cache already in the global frame. The global frame is fixed once
+(frame of token 0), so a cached key never needs re-transporting when later
+queries arrive: at decode step t we reconstruct exactly the same cumsum_t
+(tracked in fp32 across steps so bf16 drift cannot accumulate), transport the
+new token into the same global frame, and attend against cached keys as-is.
+The output is pulled back to the local frame with the CURRENT token's angles,
+which are available at decode time without any history.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from nanochat.model_utils import apply_rotary_emb
+from nanochat.model_utils import apply_rotary_emb, norm, sdpa_causal_attend
 
 
 class GaugeBlock(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, mlp: nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.dim = config.n_embd
         if self.dim % 2 != 0:
             raise ValueError("GaugeBlock requires an even n_embd (pairwise Givens rotations).")
-        if config.n_kv_head != config.n_head:
-            raise ValueError("GaugeBlock does not support GQA; require n_kv_head == n_head.")
 
         # Lie Algebra Generators
         # We learn a skew-symmetric matrix A (generator of SO(D)) per token.
@@ -40,14 +66,22 @@ class GaugeBlock(nn.Module):
         # Network to predict local connection A_l (angles) from state x_l
         self.to_angles = nn.Linear(self.dim, self.n_pairs, bias=False)
 
-        # Standard Attention mechanism (inner block)
-        # We apply gauge transformation before and after this block.
-        self.c_attn = nn.Linear(self.dim, 3 * self.dim, bias=False)
-        self.c_proj = nn.Linear(self.dim, self.dim, bias=False)
+        # Attention projections in the global frame. Separate q/k/v (rather
+        # than a fused c_attn) so k/v can carry n_kv_head heads - GQA matches
+        # the standard path, with SDPA's enable_gqa broadcasting KV heads.
         self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
         self.head_dim = self.dim // self.n_head
+        self.c_q = nn.Linear(self.dim, self.n_head * self.head_dim, bias=False)
+        self.c_k = nn.Linear(self.dim, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = nn.Linear(self.dim, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = nn.Linear(self.dim, self.dim, bias=False)
 
-    def _apply_rotations(self, x, thetas, inverse=False):
+        # Standard MLP slot, constructed by Block via _build_ffn (so ffn_type
+        # dispatch - standard / tropical / tropical-rational - applies here).
+        self.mlp = mlp
+
+    def _apply_rotations(self, x: torch.Tensor, thetas: torch.Tensor, inverse: bool = False) -> torch.Tensor:
         """
         Apply 2x2 Givens rotations defined by thetas to x.
         x: (B, T, D)
@@ -79,12 +113,7 @@ class GaugeBlock(nn.Module):
         x_new[..., 1::2] = new_odd
         return x_new
 
-    def forward(self, x, cos_sin, kv_cache):
-        if kv_cache is not None:
-            raise NotImplementedError(
-                "GaugeBlock does not yet support KV-cache incremental decoding; "
-                "use non-cached generation or standard attention for inference."
-            )
+    def _gauge_attention(self, x, cos_sin, kv_cache) -> torch.Tensor:
         B, T, C = x.size()
 
         # 1. Compute Local Connections A_l (Angles)
@@ -93,32 +122,32 @@ class GaugeBlock(nn.Module):
         angles_local = self.to_angles(x)
 
         # 2. Compute Cumulative Transport (Gauge Field T_j)
-        # T_j = prod_{l<j} exp(A_l)
-        # Since 2x2 rotations in disjoint planes commute, exp(Sum A) = Prod exp(A).
-        # So we can just sum the angles cumulatively.
-        # angles_global[t] = sum_{k=0}^{t} angles_local[k]
-        # (Note: JAX code says T_j = prod_{l<j}, i.e., exclusive prefix sum?
-        #  "T_j can be applied ... via prefix-summed angles".
-        #  Let's use inclusive sum for T_j, meaning frame j includes rotation A_j.)
-
-        angles_global = torch.cumsum(angles_local, dim=1)
+        # T_j = prod_{l<=j} exp(A_l)
+        # Since 2x2 rotations in disjoint planes commute, exp(Sum A) = Prod exp(A),
+        # so the cumulative rotation is just the prefix sum of angles.
+        # Accumulation runs in fp32 REGARDLESS of autocast/input dtype: under a
+        # cached long decode, bf16 angle accumulation drifts over thousands of
+        # steps; the fp32 lane keeps the cached and full-forward frames aligned.
+        if kv_cache is not None:
+            kv_cache.ensure_gauge_angle_cache(n_pairs=self.n_pairs, device=x.device)
+            prev = kv_cache.gauge_cum_angles[self.layer_idx]  # (B, n_pairs) fp32
+            angles_global = prev.unsqueeze(1) + torch.cumsum(angles_local.float(), dim=1)
+            kv_cache.gauge_cum_angles[self.layer_idx] = angles_global[:, -1].detach()
+        else:
+            angles_global = torch.cumsum(angles_local.float(), dim=1)
 
         # 3. Transform to "Global Frame" (Gauge Fixing)
-        # v_global_j = T_j @ v_local_j
-        # This aligns all vectors to the frame at t=0 (or global identity).
-        # Then standard attention (dot product) computes v_global_i . v_global_j
-        # which is equivalent to v_local_i . (T_i^{-1} T_j) . v_local_j
-        # where T_i^{-1} T_j is the parallel transport R_{i<-j}.
-        x_global = self._apply_rotations(x, angles_global)
+        # v_global_j = T_j @ v_local_j aligns every token to the frame of t=0,
+        # so standard dot-product attention computes
+        # v_local_i . (T_i^{-1} T_j) . v_local_j - the parallel-transported
+        # comparison R_{i<-j}. Keys/values enter the KV cache ALREADY in this
+        # global frame (see the module docstring for why cached keys stay
+        # valid for all future queries).
+        x_global = self._apply_rotations(x, angles_global).to(x.dtype)
 
-        # 4. Apply Standard Operation in Global Frame
-        # In the global frame, vectors are aligned, so we can mix them with standard ops.
-
-        qkv = self.c_attn(x_global)
-        q, k, v = torch.split(qkv, self.dim, dim=-1)
-        q = q.view(B, T, self.n_head, self.head_dim)
-        k = k.view(B, T, self.n_head, self.head_dim)
-        v = v.view(B, T, self.n_head, self.head_dim)
+        q = self.c_q(x_global).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x_global).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x_global).view(B, T, self.n_kv_head, self.head_dim)
 
         # Apply RoPE (optional additional gauge field) in the (B, T, H, D) layout
         # expected by apply_rotary_emb (time at dim 1), BEFORE moving heads to the
@@ -127,13 +156,28 @@ class GaugeBlock(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        # Attention
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if kv_cache is not None:
+            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+
+        # Attention in the global frame (training / single-token / chunked decode)
+        enable_gqa = self.n_head != self.n_kv_head
+        y = sdpa_causal_attend(q, k, v, kv_cache=kv_cache, enable_gqa=enable_gqa)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
 
         # 5. Transform back to Local Frame (Pullback)
-        # y_local_i = T_i^{-1} @ y_global_i
-        y_local = self._apply_rotations(y, angles_global, inverse=True)
+        # y_local_i = T_i^{-1} @ y_global_i — uses only the CURRENT tokens'
+        # cumulative angles, available at decode time without history.
+        y_local = self._apply_rotations(y, angles_global, inverse=True).to(y.dtype)
 
         return y_local
+
+    def forward(self, x: torch.Tensor, cos_sin, kv_cache) -> torch.Tensor:
+        # Canonical pre-norm residual skeleton (see module docstring / 1fr6):
+        # zero-initialized c_proj weights make both branches vanish at init,
+        # so the block starts as the identity instead of annihilating the
+        # residual stream.
+        x = x + self._gauge_attention(norm(x), cos_sin, kv_cache)
+        mlp_out: torch.Tensor = self.mlp(norm(x))
+        x = x + mlp_out
+        return x

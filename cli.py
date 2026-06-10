@@ -3220,6 +3220,43 @@ def _run_certify_checks(
             detail="R(t2) R(t1) = R(t1+t2): the property that justifies cumsum-as-transport",
         )
 
+        def gauge_kv_decode_measure() -> float:
+            # Cached-mode gauge invariance (bead 7b0.5): the fp32 cumulative-angle
+            # lane must rebuild the SAME global frame token-by-token that the
+            # full forward builds in one cumsum, so cached keys (stored already
+            # in the global frame) stay valid for every later query.
+            from nanochat.engine import KVCache
+            from nanochat.gpt import GPT
+
+            torch.manual_seed(seed)
+            cfg = _certify_tiny_config("gauge")
+            # No dtype cast: GPT params default to fp32 and the rotary buffers
+            # must STAY bf16 (GPT.forward asserts it). The fp32-vs-bf16 sweep
+            # of the other certify checks does not apply to a whole-model run.
+            model = GPT(cfg).to(device=device).eval()
+            ids = torch.randint(0, cfg.vocab_size, (1, 8), device=device)
+            with torch.inference_mode():
+                full = model(ids).float()
+                kv = KVCache(
+                    batch_size=1,
+                    num_heads=cfg.n_kv_head,
+                    seq_len=ids.size(1),
+                    head_dim=cfg.n_embd // cfg.n_head,
+                    num_layers=cfg.n_layer,
+                )
+                steps = [model(ids[:, t : t + 1], kv_cache=kv)[:, -1, :].float() for t in range(ids.size(1))]
+            decoded = torch.stack(steps, dim=1)
+            return float((decoded - full).abs().max())
+
+        add_check(
+            "gauge",
+            "kv_decode_matches_full_forward",
+            "classical",
+            gauge_kv_decode_measure,
+            tolerance=1e-4,
+            detail="token-by-token decode through the fp32 angle lane vs one full forward (frame invariance)",
+        )
+
     # ----- ultrametric: strong triangle inequality on hard digits (exact) -----
     if "ultrametric" in mechanisms:
 
@@ -4191,6 +4228,7 @@ _CERTIFY_NAMED_CHECKS: frozenset[str] = frozenset(
         "braid.restricted_law_violates_ybe",
         "braid.ybe_law_holds",
         "fractal.router_branch_simplex",
+        "gauge.kv_decode_matches_full_forward",
         "gauge.rotation_additivity_cumsum_law",
         "gauge.rotation_inverse_roundtrip",
         "gauge.rotation_pairwise_norm_preservation",

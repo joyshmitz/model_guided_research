@@ -85,6 +85,7 @@ def test_documentation_exists():
         "octonion",
         "surreal",
         "reversible",
+        "gauge",
     ],
 )
 def test_nanochat_kv_cache_last_token_matches_full_forward(attention_type: str):
@@ -225,6 +226,7 @@ def test_nanochat_standard_attention_entropy_records_per_head_stats():
         "octonion",
         "surreal",
         "reversible",
+        "gauge",
     ],
 )
 def test_nanochat_kv_cache_chunk_is_causal(attention_type: str):
@@ -502,32 +504,115 @@ def test_nanochat_gpt_synaptic_flexattention_smoke():
         require(torch.isfinite(p.grad).all().item(), "FlexAttention gradients must be finite")
 
 
-def test_nanochat_gauge_attention_rejects_kv_cache():
+def _tiny_gauge_model_and_cache(seq_len: int = 16, n_layer: int = 2):
     import torch
 
     from nanochat.engine import KVCache
     from nanochat.gpt import GPT, GPTConfig
 
+    torch.manual_seed(0)
     config = GPTConfig(
-        sequence_len=16,
+        sequence_len=seq_len,
         vocab_size=128,
-        n_layer=1,
+        n_layer=n_layer,
+        n_head=4,
+        n_kv_head=2,  # exercise the GQA path 7b0.5 unlocked
+        n_embd=64,
+        attention_type="gauge",
+    )
+    model = GPT(config).train(False)
+
+    def make_cache(total_len: int) -> KVCache:
+        return KVCache(
+            batch_size=1,
+            num_heads=config.n_kv_head,
+            seq_len=total_len,
+            head_dim=config.n_embd // config.n_head,
+            num_layers=config.n_layer,
+        )
+
+    return model, config, make_cache
+
+
+def test_nanochat_gauge_token_by_token_decode_matches_full_forward():
+    """Gauge KV-cache decode (7b0.5): the fp32 cumulative-angle lane must reproduce
+    the full-forward gauge field exactly enough for token-by-token parity."""
+    import torch
+
+    model, config, make_cache = _tiny_gauge_model_and_cache()
+    ids = torch.randint(0, config.vocab_size, (1, 8), dtype=torch.long)
+    with torch.inference_mode():
+        full = model(ids).float()
+        kv_cache = make_cache(ids.size(1))
+        steps = [model(ids[:, t : t + 1], kv_cache=kv_cache)[:, -1, :].float() for t in range(ids.size(1))]
+    decoded = torch.stack(steps, dim=1)
+    torch.testing.assert_close(decoded, full, rtol=1e-3, atol=1e-2)
+
+
+def test_nanochat_gauge_long_decode_drift_is_bounded():
+    """2k-step decode: fp32 angle accumulation must not drift away from the
+    full-forward gauge field (bead 7b0.5 acceptance criterion)."""
+    import torch
+
+    model, config, make_cache = _tiny_gauge_model_and_cache(seq_len=256, n_layer=1)
+    total = 2048  # within the 10x rotary overcompute for sequence_len=256
+    ids = torch.randint(0, config.vocab_size, (1, total), dtype=torch.long)
+    with torch.inference_mode():
+        full_last = model(ids)[:, -1, :].float()
+        kv_cache = make_cache(total)
+        # prefill all but the final token in chunks, then decode the last one
+        for start in range(0, total - 1, 256):
+            _ = model(ids[:, start : min(start + 256, total - 1)], kv_cache=kv_cache)
+        cached_last = model(ids[:, -1:], kv_cache=kv_cache)[:, -1, :].float()
+    drift = (cached_last - full_last).abs().max().item()
+    assert drift < 1e-2, f"gauge long-decode drift {drift:.3e} exceeds bound 1e-2 after {total} positions"
+
+
+def test_nanochat_gauge_cache_reset_clears_angle_lane():
+    """KVCache.reset() must zero the gauge cumsum lane: it ACCUMULATES (unlike
+    the positionally-overwritten kv/simplicial lanes), so a reused cache would
+    otherwise start from a stale gauge field."""
+    import torch
+
+    model, config, make_cache = _tiny_gauge_model_and_cache()
+    ids = torch.randint(0, config.vocab_size, (1, 6), dtype=torch.long)
+    with torch.inference_mode():
+        kv_cache = make_cache(ids.size(1))
+        first = model(ids, kv_cache=kv_cache)[:, -1, :].float()
+        assert kv_cache.gauge_cum_angles is not None
+        assert kv_cache.gauge_cum_angles.abs().sum() > 0
+        kv_cache.reset()
+        assert kv_cache.gauge_cum_angles.abs().sum() == 0
+        second = model(ids, kv_cache=kv_cache)[:, -1, :].float()
+    torch.testing.assert_close(first, second, rtol=0.0, atol=0.0)
+
+
+def test_nanochat_gauge_training_escapes_zero_init():
+    """Regression for model_guided_research-1fr6: without the residual skeleton,
+    zero-init c_proj/lm_head mutually annihilated ALL gradients (total |grad|
+    was exactly 0.0) and gauge training was frozen at ln(vocab) forever."""
+    import torch
+
+    from nanochat.gpt import GPT, GPTConfig
+
+    torch.manual_seed(0)
+    config = GPTConfig(
+        sequence_len=32,
+        vocab_size=128,
+        n_layer=2,
         n_head=4,
         n_kv_head=4,
         n_embd=64,
         attention_type="gauge",
     )
-    model = GPT(config).train(False)
-    ids = torch.randint(0, config.vocab_size, (1, 4), dtype=torch.long)
-    kv_cache = KVCache(
-        batch_size=1,
-        num_heads=config.n_kv_head,
-        seq_len=ids.size(1),
-        head_dim=config.n_embd // config.n_head,
-        num_layers=config.n_layer,
-    )
-    with pytest.raises(NotImplementedError):
-        _ = model(ids, kv_cache=kv_cache)
+    model = GPT(config)
+    model.init_weights()
+    ids = torch.randint(0, config.vocab_size, (2, 32), dtype=torch.long)
+    targets = torch.randint(0, config.vocab_size, (2, 32), dtype=torch.long)
+    loss = model(ids, targets=targets)
+    loss.backward()
+    total_grad = sum(p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None)
+    require(total_grad > 0.0, "gauge zero-init gradient deadlock is back: total |grad| == 0.0")
 
 
 def test_execution_execute_code_allows_disabling_memory_limit():
@@ -802,8 +887,6 @@ def test_fuzz_detects_nan_injection(monkeypatch):
 
     import nanochat.gpt as gpt_mod
     from cli import _run_fuzz_cells
-
-    real_block = gpt_mod.Block
 
     class NaNBlock(torch.nn.Module):
         def __init__(self, cfg, layer_idx):
