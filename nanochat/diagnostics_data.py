@@ -102,6 +102,23 @@ class TaskSpec:
     # these are the ground truth for the eval harness metrics (vdc.2).
     checker: Callable[[str], bool | None]
     delimiters: tuple[str, ...] = field(default_factory=tuple)
+    # Eval-harness knowledge (vdc.2): the token that separates prompt from
+    # answer (None = LM-only, perplexity is the only metric), and the
+    # difficulty axis for extrapolation curves (accuracy-vs-difficulty with
+    # in-range vs held-out buckets marked).
+    answer_marker: str | None = None
+    difficulty_axis: str | None = None
+    difficulty: Callable[[str], float] | None = None
+
+    def split_prompt(self, doc: str) -> tuple[str, str] | None:
+        """(prompt-including-marker, expected answer) or None for LM-only docs."""
+        if self.answer_marker is None:
+            return None
+        marker = f" {self.answer_marker} "
+        pos = doc.rfind(marker)
+        if pos < 0:
+            return None
+        return doc[: pos + len(marker) - 1], doc[pos + len(marker) :]
 
     def resolve_dials(self, overrides: dict[str, float] | None) -> dict[str, float]:
         values = {d.name: d.default for d in self.dials}
@@ -886,6 +903,46 @@ def realhier_provenance() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# difficulty axes for the extrapolation curves (vdc.2)
+
+
+def _difficulty_nesting_depth(doc: str) -> float:
+    depth = best = 0
+    for tok in doc.split():
+        if tok in "([{":
+            depth += 1
+            best = max(best, depth)
+        elif tok in ")]}":
+            depth = max(0, depth - 1)
+    return float(best)
+
+
+def _difficulty_span(start: str, end: str) -> Callable[[str], float]:
+    def measure(doc: str) -> float:
+        parts = doc.split()
+        return float(parts.index(end) - parts.index(start) - 1)
+
+    return measure
+
+
+def _difficulty_token_count(token: str) -> Callable[[str], float]:
+    def measure(doc: str) -> float:
+        return float(doc.split().count(token))
+
+    return measure
+
+
+def _difficulty_exponent_spread(doc: str) -> float:
+    parts = doc.split()
+    exps = [abs(int(parts[i].split("e")[1])) for i in (3, 4)]
+    return float(max(exps))
+
+
+def _difficulty_doc_words(doc: str) -> float:
+    return float(len(doc.split()))
+
+
+# ---------------------------------------------------------------------------
 # registry
 
 TASKS: dict[str, TaskSpec] = {
@@ -899,6 +956,9 @@ TASKS: dict[str, TaskSpec] = {
             generate=_gen_dyck,
             checker=check_dyck,
             delimiters=("(", ")", "[", "]", "{", "}", "LABEL"),
+            answer_marker="LABEL",
+            difficulty_axis="nesting_depth",
+            difficulty=_difficulty_nesting_depth,
         ),
         TaskSpec(
             name="copyops",
@@ -908,6 +968,9 @@ TASKS: dict[str, TaskSpec] = {
             generate=_gen_copyops,
             checker=check_copyops,
             delimiters=("OP", "SEQ", "OUT"),
+            answer_marker="OUT",
+            difficulty_axis="sequence_length",
+            difficulty=_difficulty_span("SEQ", "OUT"),
         ),
         TaskSpec(
             name="hier",
@@ -921,6 +984,9 @@ TASKS: dict[str, TaskSpec] = {
             generate=_gen_hier,
             checker=check_hier,
             delimiters=("(", ")", "TREE", "PATH", "OUT"),
+            answer_marker="OUT",
+            difficulty_axis="path_depth",
+            difficulty=_difficulty_span("PATH", "OUT"),
         ),
         TaskSpec(
             name="rel",
@@ -930,6 +996,9 @@ TASKS: dict[str, TaskSpec] = {
             generate=_gen_rel,
             checker=check_rel,
             delimiters=("FACT", ";", "QUERY", "OUT"),
+            answer_marker="OUT",
+            difficulty_axis="fact_count",
+            difficulty=_difficulty_token_count("FACT"),
         ),
         TaskSpec(
             name="rot",
@@ -939,6 +1008,9 @@ TASKS: dict[str, TaskSpec] = {
             generate=_gen_rot,
             checker=check_rot,
             delimiters=("SEQ", "OUT"),
+            answer_marker="OUT",
+            difficulty_axis="rotation_count",
+            difficulty=_difficulty_span("SEQ", "OUT"),
         ),
         TaskSpec(
             name="arith",
@@ -948,6 +1020,9 @@ TASKS: dict[str, TaskSpec] = {
             generate=_gen_arith,
             checker=check_arith,
             delimiters=("CMP", "OUT"),
+            answer_marker="OUT",
+            difficulty_axis="exponent_spread",
+            difficulty=_difficulty_exponent_spread,
         ),
         TaskSpec(
             name="regime",
@@ -972,6 +1047,9 @@ TASKS: dict[str, TaskSpec] = {
             generate=_gen_needle,
             checker=check_needle,
             delimiters=("PAIR", "QUERY", "OUT"),
+            answer_marker="OUT",
+            difficulty_axis="context_words",
+            difficulty=_difficulty_doc_words,
         ),
         TaskSpec(
             name="group",
@@ -984,6 +1062,9 @@ TASKS: dict[str, TaskSpec] = {
             generate=_gen_group,
             checker=check_group,
             delimiters=("G", "SEQ", "OUT"),
+            answer_marker="OUT",
+            difficulty_axis="word_length",
+            difficulty=_difficulty_span("SEQ", "OUT"),
         ),
         TaskSpec(
             name="bag",
@@ -996,6 +1077,9 @@ TASKS: dict[str, TaskSpec] = {
             generate=_gen_bag,
             checker=check_bag,
             delimiters=("INS", "DEL", "NOP", ";", "QUERY", "OUT"),
+            answer_marker="OUT",
+            difficulty_axis="op_count",
+            difficulty=_difficulty_token_count(";"),
         ),
         TaskSpec(
             name="placebo",
@@ -1017,6 +1101,9 @@ TASKS: dict[str, TaskSpec] = {
             generate=_gen_realhier,
             checker=check_hier,  # same TREE/PATH/OUT format as the synthetic task
             delimiters=("(", ")", "TREE", "PATH", "OUT"),
+            answer_marker="OUT",
+            difficulty_axis="path_depth",
+            difficulty=_difficulty_span("PATH", "OUT"),
         ),
     ]
 }

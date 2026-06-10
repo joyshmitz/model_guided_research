@@ -609,11 +609,17 @@ class GPT(nn.Module):
 
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
-        matrix_params = list(self.transformer.h.parameters())
+        # Separate out all parameters into 3 groups (matrix, embedding, lm_head).
+        # Muon's Newton-Schulz orthogonalization requires ndim >= 2, but some
+        # mechanisms carry sub-2D block parameters (simplicial mix_1/mix_2
+        # scalars, TropicalMLP bias vectors) - those route to AdamW at the
+        # matrix LR instead of crashing Muon.
+        block_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in block_params if p.ndim >= 2]
+        lowdim_block_params = [p for p in block_params if p.ndim < 2]
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        expected = len(matrix_params) + len(embedding_params) + len(lm_head_params)
+        expected = len(block_params) + len(embedding_params) + len(lm_head_params)
         if len(list(self.parameters())) != expected:
             raise RuntimeError("Parameter count mismatch between blocks, embeddings, and lm_head")
         # Create the AdamW optimizer for the embedding and lm_head
@@ -625,6 +631,8 @@ class GPT(nn.Module):
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
         ]
+        if lowdim_block_params:
+            adam_groups.append(dict(params=lowdim_block_params, lr=matrix_lr))
         adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
         AdamWFactory = DistAdamW if ddp else torch.optim.AdamW
         if (

@@ -4180,6 +4180,351 @@ def gen_tasks(
     console.print(f"[bold green]Generated {len(names)} task(s)[/bold green] in {time.perf_counter() - t0:.1f}s")
 
 
+def _load_eval_checkpoint(checkpoint_dir: Path, step: int | None, device: Any) -> tuple[Any, dict[str, Any], int]:
+    """Load a nanochat GPT checkpoint for evaluation.
+
+    Deliberately NOT checkpoint_manager.build_model: that helper asserts the
+    tokenizer vocab matches the model config, but nanochat training configs
+    use the padded default (50304) with the 50257-token GPT-2 tokenizer -
+    a deliberate mismatch (every tokenizer id is still a valid input).
+    """
+    import torch
+
+    from nanochat.checkpoint_manager import find_last_step, load_checkpoint
+    from nanochat.gpt import GPT, GPTConfig
+
+    resolved_step = step if step is not None else find_last_step(str(checkpoint_dir))
+    model_data, _optim, meta = load_checkpoint(str(checkpoint_dir), resolved_step, device)
+    model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+    if meta.get("model_type", "gpt") != "gpt":
+        raise ValueError(f"eval-tasks supports model_type=gpt checkpoints, got {meta.get('model_type')!r}")
+    config = GPTConfig(**meta["model_config"])
+    model = GPT(config).to(device)
+    if device.type in {"cpu", "mps"}:
+        model_data = {k: v.float() if v.dtype == torch.bfloat16 else v for k, v in model_data.items()}
+    model.load_state_dict(model_data, strict=True)
+    model.eval()
+    return model, meta, resolved_step
+
+
+_EVAL_TASKS_SCHEMA_VERSION = "mgr.evaltasks.v1"
+# SCHEMA CONTRACT (consumed by C4 scorecards and the G2 verdict engine):
+# {"schema_version", "kind": "eval-tasks",
+#  "meta": {run_id, generated_at, checkpoint{dir, step, attention_type, n_params,
+#           budget, lineage}, device, seeds, examples_per_seed, decode_modes, git},
+#  "tasks": {<name>: {
+#     "difficulty_axis": str|null, "in_range_max": float|null,
+#     "exact_match": {<mode>: {"in_range"|"held_out":
+#         {"mean": float, "ci95": [lo, hi], "per_seed": [float, ...]}}} | null,
+#     "perplexity": {"in_range": float, "held_out": float},
+#     "curve": {"buckets": [...], "accuracy": [...], "counts": [...]} | null,
+#     "skipped_too_long": int, "n_examples_per_seed": int}}}
+# Changing this layout requires a schema_version bump and a migration note.
+
+
+def _eval_split_examples(spec: Any, *, n: int, seed: int) -> tuple[list[str], list[str], float | None]:
+    """(in-range docs, held-out docs, in_range_max difficulty)."""
+    splits = spec.generate(max(10 * n, 30), seed, spec.resolve_dials(None))
+    in_range = splits["train"][:n]
+    held_out = splits["test"][:n]
+    in_range_max = None
+    if spec.difficulty is not None:
+        in_range_max = max(spec.difficulty(d) for d in splits["train"])
+    return in_range, held_out, in_range_max
+
+
+def _eval_doc_perplexity(model: Any, tok: Any, doc: str, device: Any) -> float:
+    import torch
+
+    ids = tok.encode(doc)[: model.config.sequence_len + 1]
+    if len(ids) < 2:
+        return float("nan")
+    x = torch.tensor([ids[:-1]], dtype=torch.long, device=device)
+    y = torch.tensor([ids[1:]], dtype=torch.long, device=device)
+    with torch.inference_mode():
+        loss = model(x, targets=y)
+    return float(torch.exp(loss).item())
+
+
+def _eval_score_doc(
+    model: Any,
+    tok: Any,
+    spec: Any,
+    doc: str,
+    *,
+    device: Any,
+    temperature: float,
+    seed: int,
+) -> tuple[bool | None, str, str] | None:
+    """(correct, expected, got) for answer-bearing docs; None when the prompt
+    does not fit the rotary cache (caller counts these as skipped)."""
+    sp = spec.split_prompt(doc)
+    if sp is None:
+        return (None, "", "")
+    prompt, expected = sp
+    prompt_ids = tok.encode(prompt)
+    expected_words = expected.split()
+    # answer + a small margin; canonicalize via whitespace split so tokenizer
+    # quirks (leading spaces, merged pieces) cannot fail a correct answer
+    max_new = len(tok.encode(" " + expected)) + 2
+    if len(prompt_ids) + max_new >= model.rotary_seq_len:
+        return None
+    pieces = list(model.generate(prompt_ids, max_tokens=max_new, temperature=temperature, seed=seed))
+    got = tok.decode(pieces)
+    got_words = got.split()
+    correct = got_words[: len(expected_words)] == expected_words
+    return (correct, expected, got)
+
+
+@app.command("eval-tasks")
+def eval_tasks(
+    checkpoint: Annotated[Path, typer.Option(help="Checkpoint directory (rz8.1 layout)")],
+    step: Annotated[int | None, typer.Option(help="Checkpoint step (default: latest in the directory)")] = None,
+    task: Annotated[list[str] | None, typer.Option("--task", "-t", help="Task name (repeatable)")] = None,
+    all_tasks: Annotated[bool, typer.Option("--all-tasks", help="Evaluate the full synthetic battery")] = False,
+    device_str: Annotated[str, typer.Option("--device", help="cpu | cuda")] = "cpu",
+    seeds: Annotated[str, typer.Option(help="Comma-separated eval seeds (multi-seed mean +/- CI)")] = "0",
+    examples: Annotated[int, typer.Option(help="Examples per split per seed")] = 24,
+    sampled: Annotated[bool, typer.Option("--sampled", help="Also score temperature-1 sampled decoding")] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", help="Log per-example failures (capped per task)")] = False,
+    artifacts_dir: Annotated[Path, typer.Option(help="Artifacts root")] = Path("artifacts"),
+    run_id: Annotated[str | None, typer.Option(help="Run identifier (default: timestamp)")] = None,
+) -> None:
+    """Evaluate a trained checkpoint on the diagnostic task battery (bead vdc.2).
+
+    Headline output: extrapolation curves (accuracy vs difficulty, in-range vs
+    held-out marked) per task, exact-match via the vdc.1 brute-force format,
+    per-task perplexity as the secondary metric. Writes summary.json (schema
+    mgr.evaltasks.v1 - a versioned contract) + run.md + curve PNGs.
+    """
+    import statistics as stats_mod
+
+    import torch
+
+    from nanochat.diagnostics_data import DEFAULT_TASKS, TASKS
+    from nanochat.tokenizer import get_tokenizer
+
+    device = torch.device(device_str)
+    if task and all_tasks:
+        console.print("[bold red]Provide --task or --all-tasks, not both.[/bold red]")
+        raise typer.Exit(code=2)
+    if all_tasks:
+        names = [t for t in DEFAULT_TASKS if TASKS[t].answer_marker is not None or t in ("regime", "placebo")]
+    elif task:
+        unknown = [t for t in task if t not in TASKS]
+        if unknown:
+            console.print(f"[bold red]Unknown task(s) {unknown}; available: {', '.join(sorted(TASKS))}[/bold red]")
+            raise typer.Exit(code=2)
+        names = list(task)
+    else:
+        console.print("[bold red]Provide --task NAME (repeatable) or --all-tasks.[/bold red]")
+        raise typer.Exit(code=2)
+
+    seed_list = [int(s) for s in seeds.split(",") if s.strip() != ""]
+    if not seed_list:
+        console.print("[bold red]--seeds must contain at least one integer.[/bold red]")
+        raise typer.Exit(code=2)
+
+    model, ckpt_meta, resolved_step = _load_eval_checkpoint(checkpoint, step, device)
+    tok = get_tokenizer()
+    n_params = sum(p.numel() for p in model.parameters())
+
+    # Run header: every eval artifact is self-identifying (D1 meta lineage).
+    header = Table(title="eval-tasks — checkpoint header", box=box.SIMPLE_HEAVY)
+    header.add_column("field", style="bold")
+    header.add_column("value")
+    header.add_row("checkpoint", f"{checkpoint} @ step {resolved_step}")
+    header.add_row("attention_type", str(ckpt_meta.get("model_config", {}).get("attention_type")))
+    header.add_row("n_params", f"{n_params:,}")
+    header.add_row("training budget", json.dumps(ckpt_meta.get("budget", {})))
+    header.add_row("lineage", json.dumps(ckpt_meta.get("lineage", {})))
+    header.add_row("seeds", repr(seed_list))
+    console.print(header)
+
+    decode_modes = [("greedy", 0.0)] + ([("sampled", 1.0)] if sampled else [])
+    results: dict[str, Any] = {}
+    failure_log_cap = 10
+
+    for name in names:
+        spec = TASKS[name]
+        per_seed_em: dict[str, dict[str, list[float]]] = {
+            mode: {"in_range": [], "held_out": []} for mode, _ in decode_modes
+        }
+        ppl_in: list[float] = []
+        ppl_out: list[float] = []
+        curve_points: list[tuple[float, bool]] = []
+        skipped = 0
+        failures_logged = 0
+        in_range_max: float | None = None
+
+        with console.status(f"[bold cyan]evaluating {name}…[/bold cyan]"):
+            for eval_seed in seed_list:
+                in_docs, out_docs, in_range_max = _eval_split_examples(spec, n=examples, seed=eval_seed)
+                ppl_in.append(
+                    stats_mod.mean(_eval_doc_perplexity(model, tok, d, device) for d in in_docs)
+                )
+                ppl_out.append(
+                    stats_mod.mean(_eval_doc_perplexity(model, tok, d, device) for d in out_docs)
+                )
+                if spec.answer_marker is None:
+                    continue
+                for mode, temp in decode_modes:
+                    for region, docs in (("in_range", in_docs), ("held_out", out_docs)):
+                        correct_n = 0
+                        scored_n = 0
+                        for doc in docs:
+                            scored = _eval_score_doc(
+                                model, tok, spec, doc, device=device, temperature=temp, seed=eval_seed
+                            )
+                            if scored is None:
+                                skipped += 1
+                                continue
+                            correct, expected, got = scored
+                            if correct is None:
+                                continue
+                            scored_n += 1
+                            correct_n += int(correct)
+                            if mode == "greedy":
+                                diff = spec.difficulty(doc) if spec.difficulty else None
+                                if diff is not None:
+                                    curve_points.append((diff, correct))
+                            if verbose and not correct and failures_logged < failure_log_cap:
+                                failures_logged += 1
+                                console.print(
+                                    f"[yellow]{name} fail[/yellow] [{mode}/{region}] "
+                                    f"expected={expected!r} got={got!r}"
+                                )
+                        if scored_n:
+                            per_seed_em[mode][region].append(correct_n / scored_n)
+
+        def agg(values: list[float]) -> dict[str, Any] | None:
+            if not values:
+                return None
+            mean = stats_mod.mean(values)
+            if len(values) > 1:
+                half = 1.96 * stats_mod.stdev(values) / (len(values) ** 0.5)
+            else:
+                half = 0.0
+            return {"mean": mean, "ci95": [mean - half, mean + half], "per_seed": values}
+
+        exact_match: dict[str, Any] | None = None
+        if spec.answer_marker is not None:
+            exact_match = {
+                mode: {region: agg(vals) for region, vals in regions.items()}
+                for mode, regions in per_seed_em.items()
+            }
+
+        curve: dict[str, Any] | None = None
+        if curve_points:
+            buckets = sorted({d for d, _ in curve_points})
+            accuracy = []
+            counts = []
+            for b in buckets:
+                hits = [c for d, c in curve_points if d == b]
+                accuracy.append(sum(hits) / len(hits))
+                counts.append(len(hits))
+            curve = {"buckets": buckets, "accuracy": accuracy, "counts": counts}
+
+        results[name] = {
+            "difficulty_axis": spec.difficulty_axis,
+            "in_range_max": in_range_max,
+            "exact_match": exact_match,
+            "perplexity": {"in_range": stats_mod.mean(ppl_in), "held_out": stats_mod.mean(ppl_out)},
+            "curve": curve,
+            "skipped_too_long": skipped,
+            "n_examples_per_seed": examples,
+        }
+
+    resolved_run_id = run_id or time.strftime("%Y%m%d_%H%M%S")
+    run_dir = artifacts_dir / "evals" / "tasks" / resolved_run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Extrapolation curves (matplotlib, headless)
+    curve_files: dict[str, str] = {}
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        for name, rec in results.items():
+            if not rec["curve"]:
+                continue
+            fig, ax = plt.subplots(figsize=(5, 3))
+            ax.plot(rec["curve"]["buckets"], rec["curve"]["accuracy"], marker="o")
+            if rec["in_range_max"] is not None:
+                ax.axvline(rec["in_range_max"], linestyle="--", color="red", label="train-regime max")
+                ax.legend(fontsize=7)
+            ax.set_xlabel(rec["difficulty_axis"] or "difficulty")
+            ax.set_ylabel("exact-match accuracy (greedy)")
+            ax.set_ylim(-0.05, 1.05)
+            ax.set_title(f"{name}: extrapolation curve")
+            fig.tight_layout()
+            out_png = run_dir / f"curve_{name}.png"
+            fig.savefig(out_png, dpi=120)
+            plt.close(fig)
+            curve_files[name] = out_png.name
+    except Exception as exc:  # noqa: BLE001 - curves are best-effort; the JSON is the contract
+        console.print(f"[yellow]curve rendering skipped: {exc}[/yellow]")
+
+    summary: dict[str, Any] = {
+        "schema_version": _EVAL_TASKS_SCHEMA_VERSION,
+        "kind": "eval-tasks",
+        "meta": {
+            "run_id": resolved_run_id,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "checkpoint": {
+                "dir": str(checkpoint),
+                "step": resolved_step,
+                "attention_type": ckpt_meta.get("model_config", {}).get("attention_type"),
+                "n_params": n_params,
+                "budget": ckpt_meta.get("budget"),
+                "lineage": ckpt_meta.get("lineage"),
+            },
+            "device": str(device),
+            "seeds": seed_list,
+            "examples_per_seed": examples,
+            "decode_modes": [m for m, _ in decode_modes],
+            "git": _get_git_info(),
+        },
+        "tasks": results,
+    }
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+
+    table = Table(title=f"eval-tasks — {checkpoint} @ {resolved_step}", box=box.SIMPLE_HEAVY)
+    table.add_column("task", style="bold")
+    table.add_column("EM in-range", justify="right")
+    table.add_column("EM held-out", justify="right")
+    table.add_column("ppl in/held", justify="right")
+    table.add_column("axis")
+    md_rows = []
+    for name, rec in results.items():
+        em = rec["exact_match"]
+        em_in = em_out = "-"
+        if em and em.get("greedy"):
+            g_in, g_out = em["greedy"].get("in_range"), em["greedy"].get("held_out")
+            em_in = f"{g_in['mean']:.3f}" if g_in else "-"
+            em_out = f"{g_out['mean']:.3f}" if g_out else "-"
+        ppl = f"{rec['perplexity']['in_range']:.1f}/{rec['perplexity']['held_out']:.1f}"
+        table.add_row(name, em_in, em_out, ppl, rec["difficulty_axis"] or "(lm-only)")
+        curve_link = f" ([curve]({curve_files[name]}))" if name in curve_files else ""
+        md_rows.append(f"| {name} | {em_in} | {em_out} | {ppl} |{curve_link}")
+    console.print(table)
+
+    report_md = (
+        f"# eval-tasks — {resolved_run_id}\n\n"
+        f"- checkpoint: `{checkpoint}` @ step {resolved_step}\n"
+        f"- attention_type: {summary['meta']['checkpoint']['attention_type']}\n"
+        f"- n_params: {n_params:,}\n"
+        f"- seeds: {seed_list} · examples/seed: {examples} · decode: {[m for m, _ in decode_modes]}\n\n"
+        "| task | EM in-range | EM held-out | ppl in/held |\n|---|---|---|---|\n"
+        + "\n".join(md_rows)
+        + "\n\nSee `summary.json` (schema mgr.evaltasks.v1) for the full contract output.\n"
+    )
+    (run_dir / "run.md").write_text(report_md)
+    console.print(f"[bold green]Wrote eval artifacts[/bold green] → {run_dir}")
+
+
 @app.command("profile-data")
 def profile_data(
     data: Annotated[Path | None, typer.Option(help="Directory (or file) of .txt/.md/.parquet documents")] = None,
