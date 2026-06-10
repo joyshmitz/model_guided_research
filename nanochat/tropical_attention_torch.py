@@ -10,7 +10,7 @@ import math
 import torch
 import torch.nn as nn
 
-from nanochat.model_utils import apply_rotary_emb, causal_attn_mask, norm, repeat_kv_heads
+from nanochat.model_utils import AttentionCore, causal_attn_mask
 
 
 def _tropical_center(x: torch.Tensor, *, dim: int = -1) -> torch.Tensor:
@@ -247,21 +247,12 @@ def tropical_max_plus_attention(
     return y, gamma
 
 
-class TropicalCausalSelfAttention(nn.Module):
+class TropicalCausalSelfAttention(AttentionCore):
     def __init__(self, config, layer_idx):
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
+        super().__init__(config, layer_idx)
         self.tropical_gauge_fix = bool(getattr(config, "tropical_gauge_fix", True))
         self.tropical_score_center = bool(getattr(config, "tropical_score_center", True))
         self.tropical_record_margins = bool(getattr(config, "tropical_record_margins", False))
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.register_buffer(
             "tropical_gamma_head_mean",
             torch.full((self.n_head,), float("nan"), dtype=torch.float32),
@@ -278,24 +269,10 @@ class TropicalCausalSelfAttention(nn.Module):
             persistent=False,
         )
 
-    def forward(self, x, cos_sin, kv_cache):
-        B, T, C = x.size()
-
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-
-        if kv_cache is not None:
-            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-
-        if self.n_kv_head != self.n_head:
-            k, v = repeat_kv_heads(k, v, n_head=self.n_head)
-
+    def attend(self, q, k, v, *, kv_cache, pos0):
+        # Causal masking lives inside tropical_max_plus_attention (-inf is
+        # the additive identity of the max-plus semiring), so the default
+        # mask/softmax pipeline does not apply here.
         y, gamma = tropical_max_plus_attention(
             q,
             k,
@@ -315,9 +292,11 @@ class TropicalCausalSelfAttention(nn.Module):
                 self.tropical_gamma_head_mean.copy_(mean)
                 self.tropical_gamma_head_min.copy_(gamma_f.amin(dim=(0, 2)))
                 self.tropical_gamma_min.copy_(gamma_f.amin())
+        return y
 
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
-        y = self.c_proj(y)
+    def finalize(self, y: torch.Tensor) -> torch.Tensor:
+        # Output gauge-fix: re-center so the max coordinate sits at 0 (a pure
+        # tropical gauge choice; argmax structure is preserved).
         if self.tropical_gauge_fix:
             y = _tropical_center(y, dim=-1)
         return y
