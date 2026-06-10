@@ -13,7 +13,7 @@ Also covered: bootstrap CI sanity, distance-function semantics (edit /
 Jaccard), order-sensitivity direction on structured vs shuffled data,
 dynamic-range extraction, the distance-concentration degeneracy warning,
 profile schema + determinism, and the CLI surface (--json round-trip,
-actionable failure on missing data, --task pointing at vdc.1).
+actionable failure on missing data, --task profiling a vdc.1 generated corpus).
 
 Every assertion carries enough context to reproduce: seeds are fixed module
 constants and failure messages embed the measured values.
@@ -261,10 +261,18 @@ def test_cli_profile_data_missing_data_actionable() -> None:
     assert "--data" in result.output
 
 
-def test_cli_profile_data_task_points_at_vdc1() -> None:
-    result = runner.invoke(cli.app, ["profile-data", "--task", "dyck"])
-    assert result.exit_code == 2
-    assert "vdc.1" in result.output
+def test_cli_profile_data_task_profiles_generated_corpus() -> None:
+    # Until vdc.1 landed this asserted a stub rejection; --task now generates
+    # the named diagnostic corpus in memory and profiles it.
+    result = runner.invoke(
+        cli.app, ["profile-data", "--task", "dyck", "--sample", "24", "--points", "16", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    profile = json.loads(result.output)
+    assert profile["corpus"] == "task:dyck"
+    result_bad = runner.invoke(cli.app, ["profile-data", "--task", "not-a-task"])
+    assert result_bad.exit_code == 2
+    assert "Unknown task" in result_bad.output
 
 
 def test_cli_profile_data_empty_dir_actionable(tmp_path: Path) -> None:

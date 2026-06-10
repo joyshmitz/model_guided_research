@@ -4095,6 +4095,91 @@ def doctor(
 # ---------------------------------------------------------------------------
 
 
+@app.command("gen-tasks")
+def gen_tasks(
+    task: Annotated[str, typer.Option(help="Task name or 'all' (synthetic battery; realhier is --include-real)")] = "all",
+    out: Annotated[Path, typer.Option(help="Output root; datasets land in <out>/<task>/")] = Path(
+        "artifacts/diagnostics"
+    ),
+    size: Annotated[int, typer.Option(help="Documents per task (split ~80/10/10 train/val/heldout-test)")] = 2000,
+    seed: Annotated[int, typer.Option(help="Generator seed (same seed -> byte-identical parquet)")] = 42,
+    dial: Annotated[
+        list[str] | None, typer.Option(help="Difficulty dial override name=value (repeatable)")
+    ] = None,
+    include_real: Annotated[
+        bool, typer.Option("--include-real", help="Include the realhier task in --task all")
+    ] = False,
+    list_tasks: Annotated[bool, typer.Option("--list", help="List tasks, mechanisms, hypotheses, dials")] = False,
+) -> None:
+    """Generate the theory-aligned diagnostic task battery (bead vdc.1)."""
+    from nanochat.diagnostics_data import DEFAULT_TASKS, TASKS, generate_task
+
+    if list_tasks:
+        table = Table(title="Diagnostic task battery (vdc.1)", box=box.SIMPLE_HEAVY)
+        table.add_column("task", style="bold")
+        table.add_column("targets")
+        table.add_column("dials")
+        table.add_column("hypothesis")
+        for name, spec in TASKS.items():
+            dials = ", ".join(f"{d.name}={d.default} [{d.lo},{d.hi}]" for d in spec.dials) or "-"
+            table.add_row(name, ", ".join(spec.target_mechanisms) or "(control)", dials, spec.hypothesis)
+        console.print(table)
+        return
+
+    dial_overrides: dict[str, float] = {}
+    for pair in dial or []:
+        key, sep, value = pair.partition("=")
+        if not sep:
+            console.print(f"[bold red]--dial expects name=value, got {pair!r}[/bold red]")
+            raise typer.Exit(code=2)
+        dial_overrides[key.strip()] = float(value)
+
+    if task == "all":
+        names = list(DEFAULT_TASKS) + (["realhier"] if include_real else [])
+        if dial_overrides:
+            console.print("[bold red]--dial applies to a single --task, not --task all.[/bold red]")
+            raise typer.Exit(code=2)
+    elif task in TASKS:
+        names = [task]
+    else:
+        console.print(f"[bold red]Unknown task {task!r}; available: {', '.join(sorted(TASKS))} or 'all'[/bold red]")
+        raise typer.Exit(code=2)
+
+    summary = Table(title=f"gen-tasks → {out} (seed={seed}, size={size})", box=box.SIMPLE_HEAVY)
+    summary.add_column("task", style="bold")
+    summary.add_column("train", justify="right")
+    summary.add_column("val", justify="right")
+    summary.add_column("test", justify="right")
+    summary.add_column("doc words min/med/max", justify="right")
+    summary.add_column("dials")
+    summary.add_column("sha256 (train)", style="dim")
+
+    t0 = time.perf_counter()
+    for name in names:
+        with console.status(f"[bold cyan]generating {name}…[/bold cyan]"):
+            manifest = generate_task(
+                name, out_dir=out, size=size, seed=seed, dial_overrides=dial_overrides or None
+            )
+        import pyarrow.parquet as _pq
+
+        train_path = out / name / "train_000.parquet"
+        lengths = sorted(len(t.split()) for t in _pq.read_table(train_path).column("text").to_pylist())
+        med = lengths[len(lengths) // 2]
+        sizes = manifest["split_sizes"]
+        dials_txt = ", ".join(f"{k}={v:g}" for k, v in manifest["dials"].items()) or "-"
+        summary.add_row(
+            name,
+            str(sizes["train"]),
+            str(sizes["val"]),
+            str(sizes["test"]),
+            f"{lengths[0]}/{med}/{lengths[-1]}",
+            dials_txt,
+            manifest["sha256"]["train_000.parquet"][:12],
+        )
+    console.print(summary)
+    console.print(f"[bold green]Generated {len(names)} task(s)[/bold green] in {time.perf_counter() - t0:.1f}s")
+
+
 @app.command("profile-data")
 def profile_data(
     data: Annotated[Path | None, typer.Option(help="Directory (or file) of .txt/.md/.parquet documents")] = None,
@@ -4107,30 +4192,51 @@ def profile_data(
     out: Annotated[Path | None, typer.Option(help="Write profile.json to this path")] = None,
     json_out: Annotated[bool, typer.Option("--json", help="Emit the profile JSON to stdout")] = False,
 ) -> None:
-    """Profile a corpus's data geometry (mgr profile-data --data DIR)."""
+    """Profile a corpus's data geometry (mgr profile-data --data DIR | --task NAME[:dial=v,...])."""
     import geometry_profile as gp
 
-    if task is not None:
+    if task is not None and data is not None:
+        console.print("[bold red]Provide --data or --task, not both.[/bold red]")
+        raise typer.Exit(code=2)
+    if task is None and data is None:
         console.print(
-            "[bold red]--task requires the diagnostic task generator (bead model_guided_research-vdc.1), "
-            "which has not landed yet.[/bold red] Use --data DIR for now."
+            "[bold red]Provide --data DIR (documents) or --task NAME[:dial=v,...] "
+            "(generated diagnostic task; see mgr gen-tasks --list).[/bold red]"
         )
         raise typer.Exit(code=2)
-    if data is None:
-        console.print("[bold red]Provide --data DIR (a directory of .txt/.md/.parquet documents).[/bold red]")
-        raise typer.Exit(code=2)
 
-    import numpy as _np
+    if task is not None:
+        from nanochat.diagnostics_data import TASKS, generate_texts
 
-    rng = _np.random.default_rng(seed)
-    try:
-        texts = gp.load_corpus_texts(data, max_docs=sample, rng=rng)
-    except (FileNotFoundError, ValueError) as exc:
-        console.print(f"[bold red]{exc}[/bold red]")
-        raise typer.Exit(code=2) from exc
+        task_name, _, dial_str = task.partition(":")
+        if task_name not in TASKS:
+            console.print(f"[bold red]Unknown task {task_name!r}; available: {', '.join(sorted(TASKS))}[/bold red]")
+            raise typer.Exit(code=2)
+        dial_overrides: dict[str, float] = {}
+        if dial_str:
+            for pair in dial_str.split(","):
+                key, _, value = pair.partition("=")
+                dial_overrides[key.strip()] = float(value)
+        try:
+            texts = generate_texts(task_name, size=sample, seed=seed, dial_overrides=dial_overrides)
+        except ValueError as exc:
+            console.print(f"[bold red]{exc}[/bold red]")
+            raise typer.Exit(code=2) from exc
+        corpus_label = f"task:{task}"
+    else:
+        import numpy as _np
+
+        assert data is not None  # guarded above: one of --data/--task is required
+        rng = _np.random.default_rng(seed)
+        try:
+            texts = gp.load_corpus_texts(data, max_docs=sample, rng=rng)
+        except (FileNotFoundError, ValueError) as exc:
+            console.print(f"[bold red]{exc}[/bold red]")
+            raise typer.Exit(code=2) from exc
+        corpus_label = str(data)
 
     cfg = gp.ProfileConfig(
-        mode=mode, sample_docs=sample, n_points=points, doc_tokens=doc_tokens, seed=seed, corpus_label=str(data)
+        mode=mode, sample_docs=sample, n_points=points, doc_tokens=doc_tokens, seed=seed, corpus_label=corpus_label
     )
     t0 = time.perf_counter()
     with console.status(f"[bold cyan]profiling {len(texts)} docs ({mode} mode, {points} points)…[/bold cyan]"):
@@ -4150,7 +4256,7 @@ def profile_data(
         print(gp.profile_to_json(profile))
     else:
         est = profile["estimators"]
-        table = Table(title=f"Data-geometry profile — {data} ({mode} mode)", box=box.SIMPLE_HEAVY)
+        table = Table(title=f"Data-geometry profile — {corpus_label} ({mode} mode)", box=box.SIMPLE_HEAVY)
         table.add_column("estimator", style="bold")
         table.add_column("value", justify="right")
         table.add_column("detail")
