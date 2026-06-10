@@ -28,24 +28,14 @@ Discrete mode (opt-in):
 import torch
 import torch.nn as nn
 
-from nanochat.model_utils import apply_rotary_emb, causal_attn_mask, norm, repeat_kv_heads
+from nanochat.model_utils import AttentionCore, causal_attn_mask
 
 
-class BraidCausalSelfAttention(nn.Module):
+class BraidCausalSelfAttention(AttentionCore):
     _ybe_checked: bool = False
 
     def __init__(self, config, layer_idx):
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        super().__init__(config, layer_idx)
 
         # Braid Scoring Network
         # JAX: "sigmoid(w*[tag, value] + b)"
@@ -110,25 +100,7 @@ class BraidCausalSelfAttention(nn.Module):
         if err > 1e-5:
             raise RuntimeError(f"YBE crossing law check failed: max |lhs-rhs| = {err:.3e}")
 
-    def forward(self, x, cos_sin, kv_cache):
-        B, T, C = x.size()
-
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
-
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-
-        if kv_cache is not None:
-            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-
-        if self.n_kv_head != self.n_head:
-            k, v = repeat_kv_heads(k, v, n_head=self.n_head)
-
+    def score(self, q, k):
         # Braid Attention Logic
         # 1. Compute priority scores for Q (Aggregator) and K (Tokens).
         # In Braid model, aggregator is just a designated strand.
@@ -144,11 +116,15 @@ class BraidCausalSelfAttention(nn.Module):
         # JAX: "Allowed set A = { j : p_j > tau }".
         # This implies interaction depends purely on the token j's score, relative to a threshold.
         # But in Attention, we need Q-dependence.
-        # Let's interpret: Q sets the threshold/context?
-        # "Score = s_q + s_k" (additive interaction) or "s_q * s_k" (multiplicative).
-        # The previous "s_q + s_k.T" gave a pairwise matrix.
+        # "Score = s_q + s_k" (additive interaction) gives the pairwise matrix.
+        return s_q + s_k.transpose(-2, -1)  # (B, H, Tq, Tk)
 
-        scores = s_q + s_k.transpose(-2, -1)  # (B, H, Tq, Tk)
+    def attend(self, q, k, v, *, kv_cache, pos0):
+        # Overrides the default pipeline: braid weights are sigmoid crossing
+        # probabilities (soft) or a hard threshold (discrete) - additive
+        # accumulation, NOT a softmax convex combination - and the discrete
+        # decode path reads the masked score matrix to record its schedule.
+        scores = self.score(q, k)
 
         # Masking (Causal)
         Tq = q.size(2)
@@ -214,8 +190,4 @@ class BraidCausalSelfAttention(nn.Module):
                         )
 
         y = attn_weights @ v  # [B, H, Tq, D]
-        y = y / (Tk**0.5 + 1e-6)
-
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
-        y = self.c_proj(y)
-        return y
+        return y / (Tk**0.5 + 1e-6)
