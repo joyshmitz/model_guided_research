@@ -3995,6 +3995,119 @@ def doctor(
 
 
 # ---------------------------------------------------------------------------
+# mgr profile-data — model-free DATA-GEOMETRY PROFILER (bead 77l.1, EPIC GEO)
+#
+# Measures the geometric properties the theory epics condition on - delta-
+# hyperbolicity, ultrametricity, dynamic range, order sensitivity, hierarchy
+# depth - on a corpus BEFORE any training. Estimator math + planted-geometry
+# calibration generators live in geometry_profile.py; this command is the
+# corpus-facing surface. Values are representation-relative: the registered
+# claims (77l.2) are about ORDERINGS across corpora, never absolute numbers.
+# ---------------------------------------------------------------------------
+
+
+@app.command("profile-data")
+def profile_data(
+    data: Annotated[Path | None, typer.Option(help="Directory (or file) of .txt/.md/.parquet documents")] = None,
+    task: Annotated[str | None, typer.Option(help="Profile a generated diagnostic task (requires vdc.1 gen-tasks)")] = None,
+    mode: Annotated[str, typer.Option(help="Representation mode: tokens | activations")] = "tokens",
+    sample: Annotated[int, typer.Option(help="Max documents to sample")] = 256,
+    points: Annotated[int, typer.Option(help="Points in the distance matrix (cost is O(points^2))")] = 96,
+    doc_tokens: Annotated[int, typer.Option(help="Tokens kept per document")] = 256,
+    seed: Annotated[int, typer.Option(help="Seed for sampling/bootstrap (determinism)")] = 42,
+    out: Annotated[Path | None, typer.Option(help="Write profile.json to this path")] = None,
+    json_out: Annotated[bool, typer.Option("--json", help="Emit the profile JSON to stdout")] = False,
+) -> None:
+    """Profile a corpus's data geometry (mgr profile-data --data DIR)."""
+    import geometry_profile as gp
+
+    if task is not None:
+        console.print(
+            "[bold red]--task requires the diagnostic task generator (bead model_guided_research-vdc.1), "
+            "which has not landed yet.[/bold red] Use --data DIR for now."
+        )
+        raise typer.Exit(code=2)
+    if data is None:
+        console.print("[bold red]Provide --data DIR (a directory of .txt/.md/.parquet documents).[/bold red]")
+        raise typer.Exit(code=2)
+
+    rng = __import__("numpy").random.default_rng(seed)
+    try:
+        texts = gp.load_corpus_texts(data, max_docs=sample, rng=rng)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        raise typer.Exit(code=2) from exc
+
+    cfg = gp.ProfileConfig(
+        mode=mode, sample_docs=sample, n_points=points, doc_tokens=doc_tokens, seed=seed, corpus_label=str(data)
+    )
+    t0 = time.perf_counter()
+    with console.status(f"[bold cyan]profiling {len(texts)} docs ({mode} mode, {points} points)…[/bold cyan]"):
+        profile = gp.profile_from_texts(texts, cfg)
+    elapsed = time.perf_counter() - t0
+
+    schema_errors = gp.validate_profile_schema(profile)
+    if schema_errors:  # defensive: should be impossible for our own output
+        for e in schema_errors:
+            console.print(f"[bold red]profile schema error: {e}[/bold red]")
+        raise typer.Exit(code=1)
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(gp.profile_to_json(profile), encoding="utf-8")
+    if json_out:
+        print(gp.profile_to_json(profile))
+    else:
+        est = profile["estimators"]
+        table = Table(title=f"Data-geometry profile — {data} ({mode} mode)", box=box.SIMPLE_HEAVY)
+        table.add_column("estimator", style="bold")
+        table.add_column("value", justify="right")
+        table.add_column("detail")
+        dh = est["delta_hyperbolicity"]
+        table.add_row(
+            "delta-hyperbolicity",
+            f"{dh['mean']:.4f}",
+            f"CI95 [{dh['ci95'][0]:.4f}, {dh['ci95'][1]:.4f}] · 0=tree-like, higher=flat",
+        )
+        um = est["ultrametricity"]
+        table.add_row(
+            "ultrametricity violation",
+            f"{um['violation_mean']:.4f}",
+            f"frac>{0:.0e}: {um['violation_fraction']:.2f} · cophenetic r={um['cophenetic_correlation']:.3f}",
+        )
+        dr = est["dynamic_range"]
+        table.add_row(
+            "dynamic range",
+            f"{dr['mean_decades']:.2f} dec",
+            f"{dr['numbers_found']} numerals · Hill tail={dr['hill_tail_exponent']:.2f}",
+        )
+        osens = est["order_sensitivity"]
+        table.add_row(
+            "order sensitivity",
+            f"{osens['relative_delta']:.4f}",
+            f"bigram NLL {osens['nll_original']:.3f} -> {osens['nll_transposed']:.3f} under transposition",
+        )
+        hd = est["hierarchy_depth"]
+        table.add_row(
+            "hierarchy depth",
+            f"{hd['normalized_mean_depth']:.3f}",
+            f"mean {hd['mean_depth']:.1f} / max {hd['max_depth']:.0f} merges (norm. by log2 n)",
+        )
+        console.print(table)
+        for w in profile["warnings"]:
+            console.print(Panel(f"[yellow]{w}[/yellow]", border_style="yellow"))
+        console.print(
+            Panel(
+                f"[dim]{profile['interpretation_note']}[/dim]\n"
+                f"docs={profile['sample']['docs']} points={profile['sample']['points']} "
+                f"seed={seed} elapsed={elapsed:.1f}s"
+                + (f" · written to {out}" if out else ""),
+                border_style="blue",
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
 # mgr theorems — the THEOREM REGISTRY (bead model_guided_research-vnl.1)
 #
 # The mathematical twin of the (future) hypothesis registry (hij.1): every
