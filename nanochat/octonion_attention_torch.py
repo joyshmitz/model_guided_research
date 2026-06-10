@@ -5,10 +5,9 @@ Octonions are 8D hypercomplex numbers. Multiplication is non-associative.
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-from nanochat.model_utils import apply_rotary_emb, causal_attn_mask, norm, repeat_kv_heads
+from nanochat.model_utils import AttentionCore
 from nanochat.quaternion_attention_torch import qconj, qmul
 
 # Octonion Multiplication via Cayley-Dickson
@@ -57,132 +56,50 @@ def onormalize(o):
     return F.normalize(o, p=2, dim=-1)
 
 
-class OctonionCausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
+class OctonionCausalSelfAttention(AttentionCore):
+    """Octonionic signal flow: standard scalar scores, non-associative mixing.
 
+    The value update is Y_i = sum_j probs_ij * ((Q_i * conj(K_j)) * V_j) with
+    the EXPLICIT parenthesization (rotor first, then value): octonions are
+    non-associative, so unlike the quaternion rotor-gate the query CANNOT be
+    factored out of the sum - the pairwise products are intrinsic to the
+    mechanism and cost O(T^2 * D). Q/K are per-channel normalized so the
+    octonion multiplications act as norm-preserving "rotors".
+    """
+
+    def __init__(self, config, layer_idx):
+        # Standard linear projections; the output is interpreted as
+        # head_dim/8 octonions per head.
+        super().__init__(config, layer_idx)
         if self.n_embd % 8 != 0:
             raise ValueError("n_embd must be divisible by 8 for Octonion attention")
-
-        self.head_dim = self.n_embd // self.n_head
-
         if self.head_dim % 8 != 0:
             raise ValueError("head_dim must be divisible by 8 for Octonion attention")
 
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+    def score(self, q, k):
+        return (q @ k.transpose(-2, -1)) * (1.0 / (self.head_dim**0.5))
 
-    def forward(self, x, cos_sin, kv_cache):
-        B, T, C = x.size()
+    def aggregate(self, weights, v, *, q, k, kv_cache, pos0):
+        B = q.size(0)
+        Tq = q.size(2)
 
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        # Rotary Embeddings (Standard)
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
-
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-
-        if kv_cache is not None:
-            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-
-        if self.n_kv_head != self.n_head:
-            k, v = repeat_kv_heads(k, v, n_head=self.n_head)
-
-        # Interpret as Octonions
-        # (..., D) -> (..., D/8, 8)
-        q_o = q.view(B, self.n_head, -1, self.head_dim // 8, 8)
-        k_o = k.view(B, self.n_head, -1, self.head_dim // 8, 8)
+        # Interpret as octonions: (..., D) -> (..., D/8, 8).
+        q_o = onormalize(q.view(B, self.n_head, -1, self.head_dim // 8, 8))
+        k_o = onormalize(k.view(B, self.n_head, -1, self.head_dim // 8, 8))
         v_o = v.view(B, self.n_head, -1, self.head_dim // 8, 8)
 
-        # Normalize queries/keys so octonion multiplications act as norm-preserving "rotors".
-        q_o = onormalize(q_o)
-        k_o = onormalize(k_o)
-
-        # Attention Score
-        # Standard Dot Product (Real part of Octonion product?)
-        scores = (q @ k.transpose(-2, -1)) * (1.0 / (self.head_dim**0.5))
-
-        # Masking
-        Tq = q.size(2)
-        Tk = k.size(2)
-        if kv_cache is None or Tq > 1:
-            mask = causal_attn_mask(Tq, Tk, device=q.device)
-            scores.masked_fill_(~mask, float("-inf"))
-
-        probs = F.softmax(scores, dim=-1)  # (B, H, Tq, Tk)
-
-        # Value Aggregation
-        # "Octonionic Signal Flow": Y = sum ( Q * K_conj * V )
-        # But Octonions are non-associative! (Q * K_conj) * V != Q * (K_conj * V)
-        # Which order?
-        # "Signal Flow" implies transformation along the path.
-        # K->Q is the path.
-        # R = Q * K_conj.
-        # Y = R * V.
-        # So (Q * K_conj) * V.
-
-        # Implementation:
-        # 1. R_ij = Q_i * K_j_conj  (Octonion Mul)
-        # 2. V'_ij = R_ij * V_j     (Octonion Mul)
-        # 3. Y_i = sum_j probs_ij * V'_ij
-
-        # This is O(T^2).
-        # Is there a trick?
-        # Associativity holds for real scalars.
-        # But not for Octonions.
-        # So we cannot factor out Q_i easily like in Quaternion/Real case?
-        # Actually, Quaternion IS associative. Octonion is NOT.
-        # So for Octonion attention, we MUST compute the pairwise product if we want full non-associativity.
-        # This makes it O(T^2 * D). Expensive.
-
-        # Simplification for "Efficient" Octonion Attention:
-        # Maybe "Associative Octonion" approximation?
-        # Or just accept O(T^2) for the demo (Sequence length is short, 256).
-        # Let's do O(T^2) for correctness of the "Idea".
-
-        # We need to broadcast Q, K, V to (B, H, Tq, Tk, N, 8)
-        # This will OOM if not careful.
-        # Loop over Tq?
-
+        # Per-query Python loop: broadcasting all of (B, H, Tq, Tk, N, 8) at
+        # once would blow memory, so each query's rotor row is materialized
+        # in turn. Vectorizing this loop is bead model_guided_research-7b0.6.
         k_conj = oconj(k_o)
         y_list = []
         for i in range(Tq):
-            # q_i: (B, H, 1, N, 8)
-            q_i = q_o[:, :, i : i + 1, :, :]
-
-            # k_all: (B, H, Tk, N, 8)
-            # v_all: (B, H, Tk, N, 8)
-
-            # R_i = q_i * k_all_conj
-            # We need to broadcast q_i to Tk
-            r_i = omul(q_i, k_conj)  # (B, H, Tk, N, 8)
-
-            # term = r_i * v_all
-            term = omul(r_i, v_o)  # (B, H, Tk, N, 8)
-
-            # weighted sum
-            # probs_i: (B, H, 1, Tk)
-            p_i = probs[:, :, i, :].unsqueeze(-1).unsqueeze(-1)  # (B, H, Tk, 1, 1)
-
-            # sum over Tk (dim 2)
+            q_i = q_o[:, :, i : i + 1, :, :]  # (B, H, 1, N, 8)
+            r_i = omul(q_i, k_conj)  # rotors for query i: (B, H, Tk, N, 8)
+            term = omul(r_i, v_o)  # (Q*conj(K))*V, parenthesized: (B, H, Tk, N, 8)
+            p_i = weights[:, :, i, :].unsqueeze(-1).unsqueeze(-1)  # (B, H, Tk, 1, 1)
             y_i = (term * p_i).sum(dim=2).unsqueeze(2)  # (B, H, 1, N, 8)
             y_list.append(y_i)
 
         y_o = torch.cat(y_list, dim=2)  # (B, H, Tq, N, 8)
-
-        # Flatten
-        y = y_o.view(B, self.n_head, Tq, self.head_dim)
-
-        y = y.transpose(1, 2).contiguous().view(B, Tq, -1)
-        y = self.c_proj(y)
-        return y
+        return y_o.view(B, self.n_head, Tq, self.head_dim)
