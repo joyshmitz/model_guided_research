@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nanochat.model_utils import apply_rotary_emb, causal_attn_mask, norm
+from nanochat.model_utils import AttentionCore, sdpa_causal_attend
 
 
 class SurrealProbe:
@@ -70,47 +70,15 @@ class SurrealLayer(nn.Module):
         return F.linear(input, w, self.bias)
 
 
-class SurrealCausalSelfAttention(nn.Module):
+class SurrealCausalSelfAttention(AttentionCore):
+    # GQA is handled inside SDPA via enable_gqa; no materialized repeat.
+    gqa_via_repeat = False
+
     def __init__(self, config, layer_idx):
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
+        # Surreal Linear Layers (w = exp(s) * normalize(v)) for all projections;
+        # attribute names and state-dict keys match the canonical scaffold.
+        super().__init__(config, layer_idx, linear_cls=SurrealLayer)
 
-        # Use Surreal Linear Layers for projections
-        self.c_q = SurrealLayer(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = SurrealLayer(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = SurrealLayer(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = SurrealLayer(self.n_embd, self.n_embd, bias=False)
-
-    def forward(self, x, cos_sin, kv_cache):
-        B, T, C = x.size()
-
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        # RoPE
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-
-        if kv_cache is not None:
-            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-
-        Tq = q.size(2)
-        Tk = k.size(2)
+    def attend(self, q, k, v, *, kv_cache, pos0):
         enable_gqa = self.n_head != self.n_kv_head
-        if kv_cache is None or Tq == Tk:
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
-        elif Tq == 1:
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
-        else:
-            attn_mask = causal_attn_mask(Tq, Tk, device=q.device)
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
-        y = self.c_proj(y)
-        return y
+        return sdpa_causal_attend(q, k, v, kv_cache=kv_cache, enable_gqa=enable_gqa)
