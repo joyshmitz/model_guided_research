@@ -287,6 +287,28 @@ def test_resume_under_torch_compile_round_trips(monkeypatch, tmp_path):
     )
 
 
+def test_validation_loss_evaluated_and_recorded(monkeypatch, tmp_path):
+    """Verification for bead 5fp (validation loss): --val-interval/--val-batches
+    drive periodic val CE evaluation and both train/val CE land in summary.json.
+    (The support landed untested in c6951ae; this pins it.)"""
+
+    def fake_plain_loader(B, T, split, device="cpu", **kwargs):
+        gen = torch.Generator().manual_seed(99 if split == "val" else 1234)
+        while True:
+            tokens = torch.randint(0, VOCAB_FAKE, (B, T + 1), generator=gen, dtype=torch.long)
+            yield tokens[:, :-1].contiguous(), tokens[:, 1:].contiguous()
+
+    monkeypatch.setattr(train_mod, "tokenizing_distributed_data_loader", fake_plain_loader)
+    summary = _run_train(monkeypatch, tmp_path, "with-val", val_interval=3, val_batches=2)
+
+    val_losses = summary["results"]["val_losses"]
+    assert [step for step, _ in val_losses] == [2, 5, 8, 11], f"unexpected val steps: {val_losses}"
+    assert all(v == v and v > 0 for _, v in val_losses), f"non-finite val CE: {val_losses}"
+    assert summary["results"]["val_ce_final"] == val_losses[-1][1]
+    assert summary["hparams"]["val_interval"] == 3
+    assert summary["hparams"]["val_batches"] == 2
+
+
 def test_ordinal_scheduler_state_dict_round_trip():
     """Unit: a restored scheduler continues the exact LR trajectory of the original."""
     from nanochat.ordinal_scheduler import OrdinalLRScheduler
