@@ -5083,5 +5083,547 @@ def theorems_validate(
         raise typer.Exit(code=1)
 
 
+# =============================================================================
+# Hypothesis registry (bead hij.1) — empirical twin of the theorem registry.
+# Same serialization (YAML/PyYAML, decided by vnl.1), same loader shape.
+# =============================================================================
+
+_HYP_ID_RE = r"^hyp-[a-z0-9][a-z0-9-]*$"
+_HYP_STATUSES = ("open", "supported", "refuted", "inconclusive", "blocked")
+_HYP_VERDICTS = ("supported", "refuted", "inconclusive")
+_HYP_SOURCE_KINDS = ("human", "model")
+_HYP_MECHANISMS = frozenset(
+    {
+        "standard",
+        "tropical",
+        "ultrametric",
+        "simplicial",
+        "quaternion",
+        "braid",
+        "fractal",
+        "octonion",
+        "surreal",
+        "reversible",
+        "gauge",
+        "hoss",
+        "ordinal",
+    }
+)
+_HYP_METRIC_SCHEMAS = ("evaltasks", "train", "certify", "bench")
+_HYP_COMPARATORS = (">=", "<=")
+_HYP_THRESHOLD_KINDS = ("absolute_delta", "ratio")
+
+
+def _hypotheses_registry_path() -> Path:
+    return Path(__file__).resolve().parent / "hypotheses" / "registry.yaml"
+
+
+def _load_hypothesis_registry(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    """Same loader contract as _load_theorem_registry (shared format decision)."""
+    if not path.exists():
+        return None, [f"registry file not found: {path}"]
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except yaml.YAMLError as exc:
+        return None, [f"YAML parse error: {exc}"]
+    if not isinstance(data, dict):
+        return None, ["registry root must be a mapping with schema_version + hypotheses"]
+    return data, []
+
+
+def _load_parent_hypothesis_registry(repo_root: Path) -> dict[str, Any] | None:
+    """The committed (HEAD) version of the registry, for append-only checks.
+    Returns None when unavailable (file new in this commit, or not a git repo)."""
+    try:
+        result = subprocess.run(  # nosec B603 - fixed argv, no shell
+            ["git", "show", "HEAD:hypotheses/registry.yaml"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        parent = yaml.safe_load(result.stdout)
+    except yaml.YAMLError:
+        return None
+    return parent if isinstance(parent, dict) else None
+
+
+def _validate_hypothesis_prediction(pred: Any, where: str, errors: list[str], warnings: list[str]) -> None:
+    if not isinstance(pred, dict):
+        errors.append(f"{where}: prediction must be a mapping or null")
+        return
+    metric_path = pred.get("metric_path")
+    if not isinstance(metric_path, str) or ":" not in metric_path:
+        errors.append(f"{where}: prediction.metric_path must be '<schema>:<dotted.path>'")
+    else:
+        schema, _, dotted = metric_path.partition(":")
+        if schema not in _HYP_METRIC_SCHEMAS:
+            errors.append(f"{where}: metric_path schema {schema!r} not in {sorted(_HYP_METRIC_SCHEMAS)}")
+        if not dotted or not all(seg.isidentifier() or seg.isdigit() for seg in dotted.split(".")):
+            errors.append(f"{where}: metric_path dotted path {dotted!r} is malformed")
+        elif schema == "evaltasks":
+            segs = dotted.split(".")
+            if len(segs) < 2 or segs[0] != "tasks":
+                errors.append(f"{where}: evaltasks metric_path must start with 'tasks.<task>.'")
+            else:
+                from nanochat.diagnostics_data import TASKS as _diag_tasks
+
+                if segs[1] not in _diag_tasks:
+                    errors.append(
+                        f"{where}: evaltasks metric_path names unknown task {segs[1]!r} "
+                        f"(known: {', '.join(sorted(_diag_tasks))})"
+                    )
+    if pred.get("comparator") not in _HYP_COMPARATORS:
+        errors.append(f"{where}: prediction.comparator must be one of {_HYP_COMPARATORS}")
+    if pred.get("threshold_kind") not in _HYP_THRESHOLD_KINDS:
+        errors.append(f"{where}: prediction.threshold_kind must be one of {_HYP_THRESHOLD_KINDS}")
+    threshold = pred.get("threshold")
+    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+        errors.append(f"{where}: prediction.threshold must be a number")
+    elif pred.get("threshold_kind") == "ratio" and threshold <= 0:
+        errors.append(f"{where}: ratio threshold must be > 0, got {threshold}")
+    baseline = pred.get("baseline")
+    if not isinstance(baseline, dict):
+        errors.append(f"{where}: prediction.baseline must be a mapping")
+    else:
+        if baseline.get("mechanism") not in _HYP_MECHANISMS:
+            errors.append(f"{where}: baseline.mechanism {baseline.get('mechanism')!r} unknown")
+        if baseline.get("equal_flops") is not True:
+            errors.append(
+                f"{where}: baseline.equal_flops must be true - equal-budget comparison is "
+                "the registry's fairness invariant"
+            )
+    min_seeds = pred.get("min_seeds")
+    if not isinstance(min_seeds, int) or isinstance(min_seeds, bool) or min_seeds < 1:
+        errors.append(f"{where}: prediction.min_seeds must be an integer >= 1")
+    elif min_seeds < 3:
+        warnings.append(f"{where}: min_seeds={min_seeds} is below the house convention of 3")
+
+
+def _validate_hypothesis_registry(
+    data: dict[str, Any] | None,
+    load_errors: list[str],
+    repo_root: Path,
+    *,
+    parent: dict[str, Any] | None = None,
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    """Validate the registry. Returns (errors, warnings, summary).
+
+    Checks: schema shape, id format/uniqueness, status/source enums, date
+    format, mechanism vocabulary, prediction contract (metric_path schema +
+    evaltasks task names, comparator/threshold/baseline/min_seeds),
+    prediction-null entries carry an operationalization_note, theorem_refs
+    resolve against hypotheses/theorems.yaml, verdict_history entry shape,
+    and - when the committed parent version is available - APPEND-ONLY
+    history (no entry deletions, no verdict_history rewrites, no
+    date_registered edits).
+    """
+    import re as _re
+
+    errors: list[str] = list(load_errors)
+    warnings: list[str] = []
+    summary: dict[str, Any] = {"entries": 0, "by_status": {}, "operationalized": 0, "needs_operationalization": 0}
+    if data is None:
+        return errors, warnings, summary
+
+    if not isinstance(data.get("schema_version"), int):
+        errors.append("schema_version must be an integer")
+    entries = data.get("hypotheses")
+    if not isinstance(entries, list) or not entries:
+        errors.append("hypotheses must be a non-empty list")
+        return errors, warnings, summary
+    summary["entries"] = len(entries)
+
+    theorem_ids: set[str] = set()
+    th_data, _th_errors = _load_theorem_registry(_theorems_registry_path())
+    if th_data is not None:
+        theorem_ids = {
+            str(t["id"]) for t in th_data.get("theorems", []) if isinstance(t, dict) and isinstance(t.get("id"), str)
+        }
+
+    id_re = _re.compile(_HYP_ID_RE)
+    date_re = _re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    seen_ids: set[str] = set()
+
+    for idx, h in enumerate(entries):
+        where = f"hypotheses[{idx}]"
+        if not isinstance(h, dict):
+            errors.append(f"{where}: entry must be a mapping")
+            continue
+        hid = h.get("id")
+        if not isinstance(hid, str) or not id_re.match(hid):
+            errors.append(f"{where}: id {hid!r} must match {_HYP_ID_RE}")
+        elif hid in seen_ids:
+            errors.append(f"{where}: duplicate id {hid!r}")
+        else:
+            seen_ids.add(hid)
+            where = hid
+        if not isinstance(h.get("statement"), str) or not h["statement"].strip():
+            errors.append(f"{where}: statement must be non-empty prose")
+        mechanisms = h.get("mechanisms")
+        if not isinstance(mechanisms, list) or not mechanisms:
+            errors.append(f"{where}: mechanisms must be a non-empty list")
+        else:
+            unknown = [m for m in mechanisms if m not in _HYP_MECHANISMS]
+            if unknown:
+                errors.append(f"{where}: unknown mechanism(s) {unknown} (vocab: {sorted(_HYP_MECHANISMS)})")
+        source = h.get("source")
+        if not isinstance(source, dict) or source.get("kind") not in _HYP_SOURCE_KINDS:
+            errors.append(f"{where}: source.kind must be one of {_HYP_SOURCE_KINDS}")
+        elif not isinstance(source.get("provenance"), str) or not source["provenance"].strip():
+            errors.append(f"{where}: source.provenance must trace the claim to its prose origin")
+        if not isinstance(h.get("date_registered"), str) or not date_re.match(h["date_registered"]):
+            errors.append(f"{where}: date_registered must be YYYY-MM-DD")
+        status = h.get("status")
+        if status not in _HYP_STATUSES:
+            errors.append(f"{where}: status {status!r} must be one of {_HYP_STATUSES}")
+        for ref in h.get("theorem_refs") or []:
+            if theorem_ids and ref not in theorem_ids:
+                errors.append(f"{where}: theorem_refs entry {ref!r} not found in hypotheses/theorems.yaml")
+
+        pred = h.get("prediction", "MISSING")
+        if pred == "MISSING":
+            errors.append(f"{where}: prediction key is required (may be null with an operationalization_note)")
+        elif pred is None:
+            summary["needs_operationalization"] += 1
+            note = h.get("operationalization_note")
+            if not isinstance(note, str) or not note.strip():
+                errors.append(
+                    f"{where}: prediction is null - an operationalization_note naming what is missing is required"
+                )
+            if status not in ("open", "blocked"):
+                errors.append(f"{where}: status {status!r} requires an operationalized prediction")
+        else:
+            summary["operationalized"] += 1
+            _validate_hypothesis_prediction(pred, where, errors, warnings)
+
+        if not isinstance(h.get("evidence"), list):
+            errors.append(f"{where}: evidence must be a list (may be empty)")
+        history = h.get("verdict_history")
+        if not isinstance(history, list):
+            errors.append(f"{where}: verdict_history must be a list (may be empty)")
+        else:
+            for j, v in enumerate(history):
+                vw = f"{where}.verdict_history[{j}]"
+                if not isinstance(v, dict):
+                    errors.append(f"{vw}: must be a mapping")
+                    continue
+                if not isinstance(v.get("date"), str) or not date_re.match(v["date"]):
+                    errors.append(f"{vw}: date must be YYYY-MM-DD")
+                if v.get("verdict") not in _HYP_VERDICTS:
+                    errors.append(f"{vw}: verdict must be one of {_HYP_VERDICTS}")
+                if not isinstance(v.get("artifacts"), list) or not v["artifacts"]:
+                    errors.append(f"{vw}: artifacts must be a non-empty list of artifact paths/run ids")
+                if not isinstance(v.get("adjudicator"), str) or not v["adjudicator"].strip():
+                    errors.append(f"{vw}: adjudicator must name a human or engine version")
+            if history and status in ("open", "blocked"):
+                warnings.append(f"{where}: has verdicts but status is still {status!r}")
+            if (
+                history
+                and status in _HYP_VERDICTS
+                and isinstance(history[-1], dict)
+                and history[-1].get("verdict") != status
+            ):
+                warnings.append(
+                    f"{where}: status {status!r} disagrees with the latest verdict {history[-1].get('verdict')!r}"
+                )
+
+        if status == "blocked" and pred is not None and pred != "MISSING":
+            warnings.append(f"{where}: blocked entries normally carry prediction: null until unblocked")
+
+    # ---- append-only governance against the committed parent ----
+    if parent is not None and isinstance(parent.get("hypotheses"), list):
+        new_by_id = {h.get("id"): h for h in entries if isinstance(h, dict)}
+        for ph in parent["hypotheses"]:
+            if not isinstance(ph, dict) or not isinstance(ph.get("id"), str):
+                continue
+            pid = ph["id"]
+            nh = new_by_id.get(pid)
+            if nh is None:
+                errors.append(f"{pid}: entry deleted - registry entries are retired by status, never removed")
+                continue
+            old_hist = ph.get("verdict_history") or []
+            new_hist = nh.get("verdict_history") or []
+            if new_hist[: len(old_hist)] != old_hist:
+                errors.append(
+                    f"{pid}: verdict_history rewritten - history is APPEND-ONLY "
+                    f"(parent has {len(old_hist)} entr{'y' if len(old_hist) == 1 else 'ies'}; "
+                    "they must be an unchanged prefix)"
+                )
+            if ph.get("date_registered") != nh.get("date_registered"):
+                errors.append(f"{pid}: date_registered changed - registration dates are immutable")
+            if ph.get("statement") != nh.get("statement"):
+                warnings.append(
+                    f"{pid}: statement text changed - claims should be retired and re-registered, not morphed"
+                )
+
+    for h in entries:
+        if isinstance(h, dict):
+            st = h.get("status", "?")
+            summary["by_status"][st] = summary["by_status"].get(st, 0) + 1
+    return errors, warnings, summary
+
+
+_HYP_STATUS_STYLE = {
+    "open": "yellow",
+    "supported": "green",
+    "refuted": "red",
+    "inconclusive": "magenta",
+    "blocked": "dim",
+}
+
+hypotheses_app = typer.Typer(
+    help="Hypothesis registry — the project's empirical claims with preregistered predictions.",
+    rich_markup_mode="rich",
+)
+app.add_typer(hypotheses_app, name="hypotheses")
+
+
+def _hypotheses_load_or_exit() -> dict[str, Any]:
+    data, load_errors = _load_hypothesis_registry(_hypotheses_registry_path())
+    if data is None:
+        for e in load_errors:
+            console.print(f"[bold red]{e}[/bold red]")
+        raise typer.Exit(code=1)
+    return data
+
+
+@hypotheses_app.command("list")
+def hypotheses_list(
+    status: Annotated[str | None, typer.Option(help=f"Filter by status: {' | '.join(_HYP_STATUSES)}")] = None,
+    mechanism: Annotated[str | None, typer.Option(help="Filter by mechanism (e.g. tropical)")] = None,
+    json_out: Annotated[bool, typer.Option("--json", help="Emit JSON instead of a table")] = False,
+) -> None:
+    """List registered hypotheses with status, mechanisms, and prediction state."""
+    data = _hypotheses_load_or_exit()
+    rows = data.get("hypotheses", [])
+    if status:
+        rows = [h for h in rows if h.get("status") == status]
+    if mechanism:
+        rows = [h for h in rows if mechanism in (h.get("mechanisms") or [])]
+    if json_out:
+        console.print_json(json.dumps({"schema_version": data.get("schema_version"), "hypotheses": rows}))
+        return
+    table = Table(
+        title=f"Hypothesis registry — {len(rows)} entr{'y' if len(rows) == 1 else 'ies'}", box=box.SIMPLE_HEAVY
+    )
+    table.add_column("id", style="bold")
+    table.add_column("status")
+    table.add_column("mechanisms")
+    table.add_column("prediction")
+    table.add_column("source")
+    for h in rows:
+        st = h.get("status", "?")
+        pred = h.get("prediction")
+        pred_cell = pred.get("metric_path", "?") if isinstance(pred, dict) else "[dim]needs operationalization[/dim]"
+        table.add_row(
+            str(h.get("id")),
+            f"[{_HYP_STATUS_STYLE.get(st, 'white')}]{st}[/{_HYP_STATUS_STYLE.get(st, 'white')}]",
+            ", ".join(h.get("mechanisms") or []),
+            pred_cell,
+            (h.get("source") or {}).get("kind", "?"),
+        )
+    console.print(table)
+    by_status: dict[str, int] = {}
+    for h in rows:
+        by_status[h.get("status", "?")] = by_status.get(h.get("status", "?"), 0) + 1
+    console.print(
+        Panel(
+            " · ".join(
+                f"[{_HYP_STATUS_STYLE.get(k, 'white')}]{k}: {v}[/{_HYP_STATUS_STYLE.get(k, 'white')}]"
+                for k, v in sorted(by_status.items())
+            )
+            or "no entries",
+            border_style="blue",
+        )
+    )
+
+
+@hypotheses_app.command("show")
+def hypotheses_show(
+    hypothesis_id: Annotated[str, typer.Argument(help="Hypothesis id, e.g. hyp-ultrametric-hier-heldout-depth")],
+    json_out: Annotated[bool, typer.Option("--json", help="Emit JSON")] = False,
+) -> None:
+    """Show one hypothesis entry in full."""
+    data = _hypotheses_load_or_exit()
+    match = next((h for h in data.get("hypotheses", []) if h.get("id") == hypothesis_id), None)
+    if match is None:
+        console.print(f"[bold red]No hypothesis with id {hypothesis_id!r}.[/bold red] Try: mgr hypotheses list")
+        raise typer.Exit(code=1)
+    if json_out:
+        console.print_json(json.dumps(match))
+        return
+    st = match.get("status", "?")
+    pred = match.get("prediction")
+    lines = [
+        f"[bold]{str(match.get('statement', '')).strip()}[/bold]",
+        "",
+        f"status: [{_HYP_STATUS_STYLE.get(st, 'white')}]{st}[/{_HYP_STATUS_STYLE.get(st, 'white')}]",
+        f"mechanisms: {', '.join(match.get('mechanisms') or [])}",
+        f"source: {(match.get('source') or {}).get('kind', '?')} — {(match.get('source') or {}).get('provenance', '?')}",
+        f"registered: {match.get('date_registered', '?')}",
+    ]
+    if match.get("theorem_refs"):
+        lines.append(f"theorem refs: {', '.join(match['theorem_refs'])}")
+    if isinstance(pred, dict):
+        lines.append("")
+        lines.append("[bold]prediction[/bold]")
+        lines.append(f"  metric: {pred.get('metric_path')}")
+        baseline = pred.get("baseline") or {}
+        lines.append(
+            f"  claim: metric {pred.get('comparator')} baseline[{baseline.get('mechanism')}] "
+            f"{'x' if pred.get('threshold_kind') == 'ratio' else '+'} {pred.get('threshold')} "
+            f"({pred.get('threshold_kind')}, equal FLOPs, >= {pred.get('min_seeds')} seeds)"
+        )
+        if pred.get("scale_caveats"):
+            lines.append(f"  caveats: {pred['scale_caveats']}")
+    else:
+        lines.append("")
+        lines.append(f"[dim]needs operationalization: {match.get('operationalization_note', '(no note)')}[/dim]")
+    if match.get("verdict_history"):
+        lines.append("")
+        lines.append("[bold]verdict history[/bold]")
+        for v in match["verdict_history"]:
+            lines.append(f"  {v.get('date')}: {v.get('verdict')} (adjudicator: {v.get('adjudicator')})")
+    console.print(Panel("\n".join(lines), title=f"[bold]{hypothesis_id}[/bold]", border_style="blue"))
+
+
+@hypotheses_app.command("validate")
+def hypotheses_validate(
+    json_out: Annotated[bool, typer.Option("--json", help="Emit JSON report")] = False,
+) -> None:
+    """Validate the registry: schema, vocab, prediction contract, append-only history. Exit 1 on errors."""
+    repo_root = Path(__file__).resolve().parent
+    data, load_errors = _load_hypothesis_registry(_hypotheses_registry_path())
+    parent = _load_parent_hypothesis_registry(repo_root)
+    errors, warnings, summary = _validate_hypothesis_registry(data, load_errors, repo_root, parent=parent)
+    if json_out:
+        console.print_json(
+            json.dumps(
+                {"errors": errors, "warnings": warnings, "summary": summary, "parent_checked": parent is not None}
+            )
+        )
+    else:
+        if errors:
+            etable = Table(title=f"[red]{len(errors)} error(s)[/red]", box=box.SIMPLE)
+            etable.add_column("error", style="red")
+            for e in errors:
+                etable.add_row(e)
+            console.print(etable)
+        if warnings:
+            wtable = Table(title=f"[yellow]{len(warnings)} warning(s)[/yellow]", box=box.SIMPLE)
+            wtable.add_column("warning", style="yellow")
+            for w in warnings:
+                wtable.add_row(w)
+            console.print(wtable)
+        color = "red" if errors else ("yellow" if warnings else "green")
+        governance = "append-only vs HEAD" if parent is not None else "no committed parent (first commit)"
+        console.print(
+            Panel(
+                f"[bold {color}]{summary['entries']} entries · {summary['by_status']} · "
+                f"{summary['operationalized']} operationalized / {summary['needs_operationalization']} need "
+                f"operationalization · governance: {governance} · "
+                f"{len(errors)} errors / {len(warnings)} warnings[/bold {color}]",
+                title="[bold]mgr hypotheses validate[/bold]",
+                border_style=color,
+            )
+        )
+    if errors:
+        raise typer.Exit(code=1)
+
+
+@hypotheses_app.command("add")
+def hypotheses_add(
+    hypothesis_id: Annotated[str, typer.Option("--id", help="Stable slug, e.g. hyp-tropical-foo")],
+    statement: Annotated[str, typer.Option(help="One-sentence prose claim")],
+    mechanism: Annotated[list[str], typer.Option("--mechanism", "-m", help="Mechanism (repeatable)")],
+    source_kind: Annotated[str, typer.Option(help="human | model")],
+    provenance: Annotated[str, typer.Option(help="Where the claim comes from (session, doc, table row)")],
+    metric_path: Annotated[
+        str | None, typer.Option(help="'<schema>:<dotted.path>' (omit for a not-yet-operationalized claim)")
+    ] = None,
+    comparator: Annotated[str, typer.Option(help=">= | <=")] = ">=",
+    threshold_kind: Annotated[str, typer.Option(help="absolute_delta | ratio")] = "absolute_delta",
+    threshold: Annotated[float, typer.Option(help="Effect size (delta or ratio)")] = 0.05,
+    baseline_mechanism: Annotated[
+        str, typer.Option(help="Baseline arm (equal FLOPs is implied and required)")
+    ] = "standard",
+    min_seeds: Annotated[int, typer.Option(help="Minimum seeds per arm")] = 3,
+    scale_caveats: Annotated[str | None, typer.Option(help="Scale caveats for the prediction")] = None,
+    note: Annotated[
+        str | None, typer.Option(help="operationalization_note (required when --metric-path is omitted)")
+    ] = None,
+    theorem_ref: Annotated[list[str] | None, typer.Option(help="theorems.yaml id (repeatable)")] = None,
+) -> None:
+    """Append a new hypothesis (text-append: hand-written comments are preserved), then validate."""
+    if metric_path is None and not (note and note.strip()):
+        console.print(
+            "[bold red]--note (operationalization_note) is required when --metric-path is omitted.[/bold red]"
+        )
+        raise typer.Exit(code=2)
+    path = _hypotheses_registry_path()
+    original = path.read_text(encoding="utf-8")
+
+    def yq(s: str) -> str:
+        return json.dumps(str(s))  # JSON string quoting is valid YAML
+
+    lines = [
+        "",
+        f"  - id: {hypothesis_id}",
+        "    statement: >-",
+        *[f"      {chunk}" for chunk in statement.strip().splitlines()],
+        f"    mechanisms: [{', '.join(mechanism)}]",
+        "    source:",
+        f"      kind: {source_kind}",
+        f"      provenance: {yq(provenance)}",
+        f'    date_registered: "{time.strftime("%Y-%m-%d")}"',
+    ]
+    if theorem_ref:
+        lines.append(f"    theorem_refs: [{', '.join(theorem_ref)}]")
+    if metric_path is not None:
+        lines.extend(
+            [
+                "    prediction:",
+                f"      metric_path: {yq(metric_path)}",
+                f'      comparator: "{comparator}"',
+                f"      threshold_kind: {threshold_kind}",
+                f"      threshold: {threshold}",
+                f"      baseline: {{mechanism: {baseline_mechanism}, equal_flops: true}}",
+                f"      min_seeds: {min_seeds}",
+            ]
+        )
+        if scale_caveats:
+            lines.append(f"      scale_caveats: {yq(scale_caveats)}")
+        lines.append("    status: open")
+    else:
+        lines.extend(
+            [
+                "    prediction: null",
+                f"    operationalization_note: {yq(note or '')}",
+                "    status: blocked",
+            ]
+        )
+    lines.extend(["    evidence: []", "    verdict_history: []", ""])
+
+    path.write_text(original.rstrip("\n") + "\n" + "\n".join(lines), encoding="utf-8")
+    repo_root = Path(__file__).resolve().parent
+    data, load_errors = _load_hypothesis_registry(path)
+    parent = _load_parent_hypothesis_registry(repo_root)
+    errors, _warnings, _summary = _validate_hypothesis_registry(data, load_errors, repo_root, parent=parent)
+    if errors:
+        path.write_text(original, encoding="utf-8")  # roll back: never leave the registry invalid
+        for e in errors:
+            console.print(f"[red]{e}[/red]")
+        console.print("[bold red]add rolled back: the new entry failed validation.[/bold red]")
+        raise typer.Exit(code=1)
+    console.print(f"[bold green]Registered {hypothesis_id}[/bold green] → {path}")
+
+
 if __name__ == "__main__":
     app()

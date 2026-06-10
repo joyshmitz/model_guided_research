@@ -1,0 +1,601 @@
+# =============================================================================
+# HYPOTHESIS REGISTRY — the empirical twin of hypotheses/theorems.yaml.
+#
+# Bead: model_guided_research-hij.1 (EPIC model_guided_research-hij)
+#
+# WHAT THIS FILE IS
+#   Every load-bearing EMPIRICAL claim in this project gets one entry here: a
+#   stable id, the claim in prose, where the claim came from, and — when the
+#   claim is operationalized — a PREREGISTERED prediction naming the exact
+#   metric, comparator, baseline, effect size, and seed count that would
+#   support or refute it. Mathematical claims live in theorems.yaml; a claim
+#   lives in exactly one registry. Before this file, claims lived in README
+#   prose and the framework docs where none could ever be formally confirmed
+#   or retired.
+#
+# SERIALIZATION (inherited from vnl.1, which landed first and decided for
+#   both registries): YAML via PyYAML safe_load.
+#
+# STATUS SEMANTICS
+#   open          — registered, no adjudicated evidence yet.
+#   supported     — adjudicated evidence meets the registered prediction.
+#   refuted       — adjudicated evidence contradicts the registered prediction.
+#   inconclusive  — evidence gathered but does not decide (e.g. CI spans 0).
+#   blocked       — cannot run yet; operationalization_note names the blocker.
+#
+# PREDICTION SEMANTICS (the contract the verdict engine hij.2 will execute)
+#   metric_path: "<schema>:<dotted.path>" into a versioned artifact schema:
+#     evaltasks — mgr.evaltasks.v1 (mgr eval-tasks summary.json)
+#     train     — mgr.telemetry.v1 (nanochat train summary.json)
+#     certify   — mgr certify summary.json
+#     bench     — mgr bench-fixed-flops aggregate
+#   comparator + threshold_kind define the claim, with M = metric(mechanism)
+#   and B = metric(baseline.mechanism) at the SAME FLOPs budget:
+#     ">=" + absolute_delta : claim holds iff M >= B + threshold
+#     "<=" + absolute_delta : claim holds iff M <= B - threshold
+#     ">=" + ratio          : claim holds iff M >= threshold * B
+#     "<=" + ratio          : claim holds iff M <= threshold * B
+#   min_seeds: the verdict needs at least this many seeds per arm; the CI
+#   convention (mean +/- CI95 must clear the threshold) is adjudicated by
+#   hij.2, recorded in verdict_history.
+#   prediction: null is allowed ONLY with an operationalization_note naming
+#   what is missing — visible debt, never silent omission.
+#
+# GOVERNANCE
+#   Changes flow through normal git review. verdict_history is APPEND-ONLY:
+#   `mgr hypotheses validate` compares against the committed parent version
+#   (git HEAD) and rejects any rewrite or truncation of an existing entry's
+#   history. New evidence appends; it never replaces.
+# =============================================================================
+
+schema_version: 1
+
+hypotheses:
+  # ---------------------------------------------------------------------------
+  # Retrieval & hierarchy (ultrametric / fractal)
+  # ---------------------------------------------------------------------------
+  - id: hyp-ultrametric-hier-heldout-depth
+    statement: >-
+      Ultrametric (LCP-routing) attention beats standard attention on
+      hierarchical key-path retrieval at HELD-OUT tree depths, because digit
+      routing resolves nesting that dense similarity must memorize.
+    mechanisms: [ultrametric]
+    source:
+      kind: model
+      provenance: "README 'Why It Matters' (ultrametric: natural for hierarchical data); GPT-5 Pro framework proposal"
+    date_registered: "2026-06-10"
+    theorem_refs: [thm-lcp-is-padic-valuation]
+    prediction:
+      metric_path: "evaltasks:tasks.hier.exact_match.greedy.held_out.mean"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 0.05
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: "registered at nanochat research scale; E1 rungs decide persistence"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-fractal-hier-heldout-depth
+    statement: >-
+      Fractal (IFS soft-routing) attention beats standard attention on
+      hierarchical retrieval at held-out depths: m-ary path addressing should
+      generalize across depth where flat attention does not.
+    mechanisms: [fractal]
+    source:
+      kind: model
+      provenance: "README 'Why It Matters' (fractal: natural for recursive/hierarchical data); Expected Performance table row 'Fractal -> Hierarchy'"
+    date_registered: "2026-06-10"
+    theorem_refs: [thm-ifs-cylinder-ultrametric]
+    prediction:
+      metric_path: "evaltasks:tasks.hier.exact_match.greedy.held_out.mean"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 0.05
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: "registered at nanochat research scale"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-ultrametric-needle-long-context
+    statement: >-
+      Ultrametric attention retrieves planted key-value pairs at context
+      lengths past the training regime better than standard attention, because
+      hierarchical addressing does not dilute with context size the way dense
+      softmax does.
+    mechanisms: [ultrametric]
+    source:
+      kind: model
+      provenance: "README 'Why It Matters' (ultrametric: sub-quadratic, cache-friendly hierarchical access); ultrametric doc '## 6) Attention in a tree'"
+    date_registered: "2026-06-10"
+    theorem_refs: [thm-gromov-product-equals-lcp]
+    prediction:
+      metric_path: "evaltasks:tasks.needle.exact_match.greedy.held_out.mean"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 0.05
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: "held-out lengths are 4x train; longer contexts need E1"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-ultrametric-trie-decode-speedup
+    statement: >-
+      Trie-mode ultrametric decode is faster per token than the dense kernel
+      at long contexts (the O(K) vs O(n) claim), with the crossover within
+      reach of nanochat-scale contexts (<= 4096).
+    mechanisms: [ultrametric]
+    source:
+      kind: model
+      provenance: "ultrametric doc '## 6) Attention in a tree' (O(K) per-token claim)"
+    date_registered: "2026-06-10"
+    prediction: null
+    operationalization_note: >-
+      needs a versioned perf artifact: perf_sanity_ultrametric_trie_decode
+      (nanochat/ultrametric_attention_torch.py) measures exactly this but
+      writes no schema'd summary; promote it into the bench schema first.
+    status: blocked
+    evidence: []
+    verdict_history: []
+
+  # ---------------------------------------------------------------------------
+  # Topology & composition (braid / reversible)
+  # ---------------------------------------------------------------------------
+  - id: hyp-braid-dyck-depth-extrapolation
+    statement: >-
+      Braid attention classifies Dyck-bracket validity at held-out nesting
+      depths better than standard attention: crossing structure tracks the
+      stack topology that pairwise similarity has to memorize.
+    mechanisms: [braid]
+    source:
+      kind: model
+      provenance: "README 'Why It Matters' (braid: natural for sequential data, topologically protected); braid doc Dyck experiments precedent"
+    date_registered: "2026-06-10"
+    prediction:
+      metric_path: "evaltasks:tasks.dyck.exact_match.greedy.held_out.mean"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 0.05
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: "registered at nanochat research scale"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-braid-length-generalization
+    statement: >-
+      Braid attention extrapolates permutation-style sequence transforms
+      (copy/reverse/rotate) to held-out lengths far better than fixed-depth
+      pairwise baselines; the JAX demo reports near-perfect accuracy at 2-5x
+      training length where a depth-4 convolution collapses to near-chance.
+    mechanisms: [braid]
+    source:
+      kind: model
+      provenance: "braid doc '## 6) Compositionality task (braids generalize, fixed-depth conv collapses)' (1.00 vs 0.035 at length 20-40 after training on 4-10)"
+    date_registered: "2026-06-10"
+    prediction:
+      metric_path: "evaltasks:tasks.copyops.exact_match.greedy.held_out.mean"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 0.10
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: "demo numbers come from a task-built JAX model; the nanochat LM setting is the harder version of the claim"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-reversible-activation-memory
+    statement: >-
+      Reversible blocks cut peak activation memory by at least 2x against the
+      standard block at matched quality (README's measured observation; the
+      docs' 10x claim did not survive demo scale and is registered at the
+      observed effect size).
+    mechanisms: [reversible]
+    source:
+      kind: human
+      provenance: "README 'Empirical Observations' (reversible blocks reduce memory by 2-4x, not 10x at demo scale); reversible doc '## 8) Tiny benchmark (LM)'"
+    date_registered: "2026-06-10"
+    prediction:
+      metric_path: "train:results.peak_memory_allocated_gb"
+      comparator: "<="
+      threshold_kind: ratio
+      threshold: 0.5
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: "CUDA-only metric (peak_memory_allocated_gb is null on CPU); quality parity gate: val_ce_final within 2% of baseline"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-reversible-gradient-stability
+    statement: >-
+      Volume preservation (det J = 1) keeps gradient norms bounded in deep
+      reversible stacks: zero-sum Lyapunov exponents rule out global
+      explosion/vanishing even where per-subspace dynamics vary.
+    mechanisms: [reversible]
+    source:
+      kind: model
+      provenance: "reversible doc '## 2) Gradient propagation in volume-preserving, reversible stacks'"
+    date_registered: "2026-06-10"
+    prediction: null
+    operationalization_note: >-
+      needs per-step gradient-norm telemetry (D2 / bead rz8.2 metrics.jsonl);
+      register the depth-sweep comparison once that stream exists.
+    status: blocked
+    evidence: []
+    verdict_history: []
+
+  # ---------------------------------------------------------------------------
+  # Algebraic structure (tropical / quaternion / octonion / simplicial)
+  # ---------------------------------------------------------------------------
+  - id: hyp-tropical-needle-no-dilution
+    statement: >-
+      Tropical (max-plus) attention retrieves a planted pivot amid growing
+      crowds of decoys without degradation, where softmax attention dilutes:
+      max is idempotent, so adding decoys cannot shrink the winner's weight.
+    mechanisms: [tropical]
+    source:
+      kind: model
+      provenance: "tropical doc '## 9) A small synthetic dataset where classic models stumble but T2 is trivial' (zero test error at length 64 vs softmax degradation past train lengths)"
+    date_registered: "2026-06-10"
+    theorem_refs: [thm-tropicalization-of-attention]
+    prediction:
+      metric_path: "evaltasks:tasks.needle.exact_match.greedy.held_out.mean"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 0.10
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: "registered at nanochat research scale"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-tropical-certified-robustness
+    statement: >-
+      Tropical attention's 1-Lipschitz structure yields measurably flatter
+      accuracy degradation under sup-norm-bounded embedding perturbations than
+      standard attention, and the gamma-margin certificates predict the safe
+      radius.
+    mechanisms: [tropical]
+    source:
+      kind: model
+      provenance: "README 'Why It Matters' (tropical: 1-Lipschitz robustness guarantees, verifiable margins); Expected Performance table row 'Tropical -> Robustness'"
+    date_registered: "2026-06-10"
+    theorem_refs: [thm-tropical-1-lipschitz, thm-maxplus-ffn-lipschitz]
+    prediction: null
+    operationalization_note: >-
+      the eps-probe spec exists (diagnostics_data.apply_embedding_perturbation,
+      vdc.1) but no eval consumer reports a robustness curve yet; vdc.3 / 8gk.7
+      own that wiring. Register the slope comparison when the metric exists.
+    status: blocked
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-quaternion-rotation-composition
+    statement: >-
+      Quaternion rotor attention predicts composed 3D orientations at held-out
+      sequence lengths better than standard attention: the value path
+      multiplies rotors natively instead of approximating composition in a
+      flat vector space.
+    mechanisms: [quaternion]
+    source:
+      kind: model
+      provenance: "README 'Why It Matters' (quaternion: built-in rotation invariances); Expected Performance table row 'Quaternion -> Geometry'"
+    date_registered: "2026-06-10"
+    theorem_refs: [thm-quaternion-composition-algebra]
+    prediction:
+      metric_path: "evaltasks:tasks.rot.exact_match.greedy.held_out.mean"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 0.05
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: "registered at nanochat research scale"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-octonion-rotation-composition
+    statement: >-
+      Octonion attention also beats standard attention on rotation
+      composition, but the mechanism-specificity control is quaternion vs
+      octonion: associativity suffices for SO(3) composition, so octonions
+      should NOT beat quaternions here — a larger octonion gap would indicate
+      a confound, not non-associative structure.
+    mechanisms: [octonion]
+    source:
+      kind: model
+      provenance: "README 'Why It Matters' (octonion: richer algebraic structure); registered with the specificity control made explicit"
+    date_registered: "2026-06-10"
+    theorem_refs: [thm-octonion-composition-algebra]
+    prediction:
+      metric_path: "evaltasks:tasks.rot.exact_match.greedy.held_out.mean"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 0.05
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: "secondary check (octonion vs quaternion expected ~equal) adjudicated alongside"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-octonion-norm-stability
+    statement: >-
+      Octonion/quaternion rotor mixing keeps activation magnitudes stable
+      across depth without explicit normalization layers, because unit-rotor
+      products preserve norms exactly.
+    mechanisms: [octonion, quaternion]
+    source:
+      kind: model
+      provenance: "octonion doc '## 4) Attention as a constrained product' (norm preservation without separate normalization)"
+    date_registered: "2026-06-10"
+    prediction: null
+    operationalization_note: >-
+      needs per-layer activation-magnitude telemetry (D2 / rz8.2); the
+      mathematical half is already certified (rotor_norm_preservation in
+      mgr certify) — this entry tracks the architectural consequence.
+    status: blocked
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-simplicial-two-hop-composition
+    statement: >-
+      Simplicial attention answers two-hop relation queries (who is connected
+      to X via Y?) at held-out context sizes better than standard attention:
+      the cached 2-hop aggregation is exactly the triangle term pairwise
+      attention lacks.
+    mechanisms: [simplicial]
+    source:
+      kind: model
+      provenance: "README 'Why It Matters' (simplicial: k-way interactions beyond pairwise); simplicial doc '## 5) Synthetic dataset where pairwise models fail (provably)'"
+    date_registered: "2026-06-10"
+    prediction:
+      metric_path: "evaltasks:tasks.rel.exact_match.greedy.held_out.mean"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 0.05
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: "the doc's provably-impossible construction is stronger than this LM proxy; a dedicated task may sharpen the threshold later"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  # ---------------------------------------------------------------------------
+  # Scale & dynamics (surreal / ordinal / hoss / gauge)
+  # ---------------------------------------------------------------------------
+  - id: hyp-surreal-wide-dynamic-range
+    statement: >-
+      Surreal (scale-direction separated) parameterization compares and orders
+      numbers spanning many decades better than standard parameterization at
+      held-out magnitude spreads: w = exp(s) * v gives the model native scale
+      arithmetic.
+    mechanisms: [surreal]
+    source:
+      kind: model
+      provenance: "README 'Why It Matters' (surreal: wide dynamic ranges, magnitude/direction separation); Expected Performance table row 'Surreal -> Scale'"
+    date_registered: "2026-06-10"
+    prediction:
+      metric_path: "evaltasks:tasks.arith.exact_match.greedy.held_out.mean"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 0.05
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: "registered at nanochat research scale"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-surreal-scaling-axis-prediction
+    statement: >-
+      The transseries damage ratios (T_D, T_H, T_W from half-projections of
+      data/depth/width) predict the most profitable next scaling axis with
+      better than 70% accuracy against oracle ground truth.
+    mechanisms: [surreal]
+    source:
+      kind: model
+      provenance: "surreal doc '## One predictive formula' and '## 8) Practical Selection Rule: Rank/Z-Score Dominance'"
+    date_registered: "2026-06-10"
+    prediction: null
+    operationalization_note: >-
+      needs the E2 scaling-fit artifact (epic w94): the prediction is over
+      scaling-ladder outcomes, which do not exist as a schema yet.
+    status: blocked
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-ordinal-regime-shift-recovery
+    statement: >-
+      The ordinal (transfinite patience) scheduler recovers lower final loss
+      than a fixed schedule on streams whose distribution flips at boundaries,
+      because plateau-driven anneals and principled restarts track regime
+      changes that cosine/linear schedules ignore.
+    mechanisms: [ordinal]
+    source:
+      kind: model
+      provenance: "ordinal doc '## 6) Test plan (noisy objective where cosine/linear underperform)' (final MSE <= 0.95x best fixed schedule in >= 16/20 runs); README ordinal section"
+    date_registered: "2026-06-10"
+    theorem_refs: [thm-ordinal-termination]
+    prediction:
+      metric_path: "train:results.val_ce_final"
+      comparator: "<="
+      threshold_kind: ratio
+      threshold: 0.98
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 5
+      scale_caveats: >-
+        both arms train standard attention on the vdc.1 regime task corpus;
+        the contrast is --scheduler-type ordinal vs none. The doc's 16/20-run
+        protocol at 0.95 is the deep version; this registers the direction at
+        a conservative ratio first.
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-hoss-stiff-lr-robustness
+    statement: >-
+      HOSS converges across a far wider learning-rate range than first-order
+      optimizers on stiff (ill-conditioned) objectives — the doc's toy shows
+      unconditional convergence where SGD's stable step range collapses with
+      the condition number.
+    mechanisms: [hoss]
+    source:
+      kind: model
+      provenance: "nonstandard doc '## 6) Toy problem where HOSS converges but SGD diverges'; README HOSS section (escape saddle points, principled noise)"
+    date_registered: "2026-06-10"
+    prediction: null
+    operationalization_note: >-
+      tests/test_practical_utility.py contains an LR-robustness benchmark but
+      writes no versioned artifact; promote it into the bench schema (or a D2
+      consumer) before registering thresholds.
+    status: blocked
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-gauge-gradient-stability
+    statement: >-
+      Gauge-transported attention trains stably on ill-conditioned inputs
+      where standard attention shows gradient pathologies: orthogonal
+      transport cannot amplify activations, so gradient norms stay bounded.
+    mechanisms: [gauge]
+    source:
+      kind: model
+      provenance: "README 'Why It Matters' (gauge: provable stability, prevents gradient pathologies); Expected Performance table row 'Gauge -> Stability'"
+    date_registered: "2026-06-10"
+    theorem_refs: [thm-curvature-gauge-invariance]
+    prediction: null
+    operationalization_note: >-
+      needs per-step grad-norm telemetry (D2 / rz8.2). NOTE: gauge was
+      untrainable until 1fr6 (zero-init residual deadlock, fixed 2026-06-10);
+      no pre-1fr6 result can bear on this entry.
+    status: blocked
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-gauge-bag-conservation
+    statement: >-
+      Mechanisms with conservation structure (gauge transport; reversible
+      coupling) track multiset contents across distractor spans better than
+      standard attention: count queries are exactly a conserved-charge
+      readout.
+    mechanisms: [gauge, reversible]
+    source:
+      kind: model
+      provenance: "EPIC THEORY-II framing (u55.5 Noether conserved-charge channels); task design in vdc.1 (bag task docstring)"
+    date_registered: "2026-06-10"
+    theorem_refs: [thm-noether-conserved-charges]
+    prediction:
+      metric_path: "evaltasks:tasks.bag.exact_match.greedy.held_out.mean"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 0.05
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: "u55.5's symplectic transformer is the designed carrier of this prediction; gauge/reversible are the available proxies"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  # ---------------------------------------------------------------------------
+  # State tracking (group word problems) & controls
+  # ---------------------------------------------------------------------------
+  - id: hyp-group-nonsolvable-barrier
+    statement: >-
+      No fixed-depth mechanism in the current zoo solves held-out-length word
+      problems in non-solvable groups (S5/A5) — the known TC0 state-tracking
+      barrier — while solvable controls (Z60/S3) remain learnable; a
+      mechanism that moves the S5/A5 curve without moving the controls would
+      be evidence of genuinely new state-tracking structure.
+    mechanisms: [standard, braid, gauge]
+    source:
+      kind: model
+      provenance: "EPIC THEORY-II (u55.3 group word-problem barrier); vdc.1 group task docstring"
+    date_registered: "2026-06-10"
+    theorem_refs: [thm-ybe-transfer-commutativity]
+    prediction: null
+    operationalization_note: >-
+      the discriminating contrast (integrable/R-matrix attention vs the zoo)
+      needs u55.3 to land its mechanism; until then the group task only
+      establishes the baseline curves.
+    status: blocked
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-placebo-no-winner
+    statement: >-
+      On the structure-free placebo task NO mechanism beats standard attention
+      beyond noise at equal FLOPs. This is the registered NULL hypothesis
+      guarding the whole program: a significant placebo gap means a harness
+      fairness bug or a pure-optimization-rate effect, and it blocks
+      publication of affected comparisons until root-caused (re-run at 2x
+      budget separates the two causes).
+    mechanisms: [tropical, ultrametric, simplicial, quaternion, braid, fractal, octonion, surreal, reversible, gauge]
+    source:
+      kind: human
+      provenance: "vdc.1 placebo task design (idea-wizard round 2 + fresh-eyes correction on the two-cause protocol)"
+    date_registered: "2026-06-10"
+    prediction:
+      metric_path: "evaltasks:tasks.placebo.perplexity.in_range"
+      comparator: "<="
+      threshold_kind: ratio
+      threshold: 1.02
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: "two-sided in spirit: a mechanism ppl BELOW 0.98x baseline is equally a red flag; hij.2 adjudicates both tails"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  # ---------------------------------------------------------------------------
+  # Training-dynamics observations already in the README (registered so they
+  # can be confirmed or retired instead of living as folklore)
+  # ---------------------------------------------------------------------------
+  - id: hyp-ordinal-cosine-parity-simple
+    statement: >-
+      On simple stationary tasks the ordinal scheduler is merely comparable
+      to cosine — its advantage is specific to regime-shifted objectives
+      (this bounds hyp-ordinal-regime-shift-recovery from below).
+    mechanisms: [ordinal]
+    source:
+      kind: human
+      provenance: "README 'Empirical Observations' (ordinal scheduling comparable to cosine on simple tasks)"
+    date_registered: "2026-06-10"
+    prediction:
+      metric_path: "train:results.val_ce_final"
+      comparator: "<="
+      threshold_kind: ratio
+      threshold: 1.02
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: "both arms standard attention on FineWeb shards (stationary); contrast is scheduler ordinal vs none"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-gauge-grad-stability-demo
+    statement: >-
+      Matrix-exponential (gauge) methods show improved gradient stability over
+      unconstrained parameterizations in the JAX demos' exploding/vanishing
+      benchmark.
+    mechanisms: [gauge]
+    source:
+      kind: human
+      provenance: "README 'Empirical Observations' (matrix exponential methods show improved gradient stability); tests/test_practical_utility.py matrix-gauge benchmark"
+    date_registered: "2026-06-10"
+    prediction: null
+    operationalization_note: >-
+      the practical-utility suite measures this but writes no versioned
+      artifact; same blocker as hyp-hoss-stiff-lr-robustness.
+    status: blocked
+    evidence: []
+    verdict_history: []

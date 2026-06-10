@@ -643,19 +643,24 @@ python -m nanochat.train \
 
 ### Expected Performance Characteristics
 
-| Framework | Expected Benefit | Best For |
-|-----------|------------------|----------|
-| Standard | Baseline | General purpose |
-| Tropical | Robustness | Safety-critical, adversarial |
-| Ultrametric | Efficiency | Long sequences, hierarchical |
-| Simplicial | Expressivity | Multi-entity reasoning |
-| Quaternion | Geometry | 3D/spatial data |
-| Braid | Composition | Sequential/permutation tasks |
-| Fractal | Hierarchy | Recursive/self-similar data |
-| Octonion | Symmetry | High-dimensional rotations |
-| Surreal | Scale | Wide dynamic range |
-| Reversible | Memory | Very deep networks |
-| Gauge | Stability | Ill-conditioned problems |
+The per-framework performance claims that used to live here as a prose table
+are now **preregistered hypotheses** in [`hypotheses/registry.yaml`](hypotheses/registry.yaml):
+each one names the exact metric, comparator, equal-FLOPs baseline, effect
+size, and seed count that would support or refute it — so claims get formally
+confirmed or retired instead of accumulating as folklore. (Mathematical
+claims live in the twin registry, [`hypotheses/theorems.yaml`](hypotheses/theorems.yaml).)
+
+```bash
+mgr hypotheses list                     # all claims with status + predictions
+mgr hypotheses list --status open       # awaiting adjudication
+mgr hypotheses show hyp-ultrametric-hier-heldout-depth
+mgr hypotheses validate                 # schema + append-only governance
+```
+
+Snapshot at registration time (2026-06-10): 24 claims — 15 operationalized
+against the `evaltasks`/`train` artifact schemas, 9 explicitly blocked on
+named infrastructure with the blocker recorded in the entry. The registry,
+not this README, is the source of truth for what this project predicts.
 
 ## 💡 CLI Usage
 
