@@ -1008,6 +1008,16 @@ python tests/test_practical_utility.py > results.txt 2>&1
 
 ## 🔧 Troubleshooting
 
+### Start with the doctor
+
+```bash
+# One-command environment diagnosis: versions, devices, data, tokenizer,
+# disk space, and a tiny end-to-end forward pass — with a fix-it hint on
+# every failing row. Exit codes: 0 = ok, 1 = warnings, 2 = failures.
+mgr doctor
+mgr doctor --json   # machine-readable (for agents/scripts)
+```
+
 ### Installation Issues
 
 ```bash

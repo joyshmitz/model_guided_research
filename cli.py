@@ -3790,5 +3790,208 @@ def fuzz(
         raise typer.Exit(code=1)
 
 
+# ---------------------------------------------------------------------------
+# mgr doctor — environment diagnostics (br: model_guided_research-rz8.7)
+#
+# Preflight for humans and agents: checks the four-way version matrix
+# (Python/torch/JAX/CUDA), data presence, tokenizer, Triton, disk space, and
+# runs a tiny end-to-end forward pass. Every failing row carries an actionable
+# fix-it hint. Exit codes: 0 = all ok, 1 = warnings, 2 = failures.
+# ---------------------------------------------------------------------------
+
+
+def _run_doctor_checks() -> list[dict[str, Any]]:
+    """Return one record per check: {name, status: ok|warn|fail, detail, hint}."""
+    import shutil
+    import sys as _sys
+
+    rows: list[dict[str, Any]] = []
+
+    def add(name: str, status: str, detail: str, hint: str = "") -> None:
+        rows.append({"name": name, "status": status, "detail": detail, "hint": hint})
+
+    # Python + tooling
+    py = _sys.version_info
+    if (py.major, py.minor) >= (3, 13):
+        add("python", "ok", f"{py.major}.{py.minor}.{py.micro}")
+    else:
+        add("python", "fail", f"{py.major}.{py.minor}.{py.micro}", "This project targets Python 3.13+ (see AGENTS.md)")
+    add(
+        "uv",
+        "ok" if shutil.which("uv") else "warn",
+        shutil.which("uv") or "not on PATH",
+        "" if shutil.which("uv") else "Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh",
+    )
+    in_venv = _sys.prefix != _sys.base_prefix
+    add(
+        "venv",
+        "ok" if in_venv else "warn",
+        _sys.prefix if in_venv else "no virtualenv active",
+        "" if in_venv else "Run: uv venv && source .venv/bin/activate && uv sync --extra dev",
+    )
+
+    # torch
+    try:
+        import torch
+
+        detail = f"torch {torch.__version__}"
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            bf16 = torch.cuda.is_bf16_supported()
+            detail += f" · CUDA {torch.version.cuda} · {props.name} ({props.total_memory // (1 << 20)} MiB)"
+            detail += f" · bf16={'yes' if bf16 else 'no'}"
+            add("torch", "ok", detail)
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            add("torch", "ok", detail + " · MPS available (no CUDA)")
+        else:
+            add("torch", "warn", detail + " · CPU only", "GPU optional; nanochat training is much faster on CUDA")
+    except Exception as exc:  # noqa: BLE001
+        add("torch", "fail", f"{type(exc).__name__}: {exc}", "uv sync --extra dev")
+
+    # JAX
+    try:
+        import jax
+
+        from utils import get_device_info
+
+        info = get_device_info()
+        add("jax", "ok", f"jax {jax.__version__} · backend={info['default_backend']} · devices={info['devices']}")
+    except Exception as exc:  # noqa: BLE001
+        add("jax", "fail", f"{type(exc).__name__}: {exc}", "uv sync --extra dev (JAX powers the mgr demos)")
+
+    # Triton (A7 kernel prerequisite; optional)
+    try:
+        import triton  # noqa: F401
+
+        add("triton", "ok", f"triton {getattr(triton, '__version__', '?')}")
+    except Exception:  # noqa: BLE001
+        add("triton", "warn", "not importable", "Optional: needed only for custom GPU kernels (tropical Triton path)")
+
+    # Training data (parquet shards)
+    try:
+        from nanochat.dataset import DATA_DIR, list_parquet_files
+
+        files = list_parquet_files()
+        if len(files) >= 2:
+            add("training data", "ok", f"{len(files)} parquet shard(s) in {DATA_DIR}")
+        elif len(files) == 1:
+            add(
+                "training data",
+                "warn",
+                f"only 1 parquet shard in {DATA_DIR} (train/val split needs >= 2)",
+                "python -m nanochat.train --auto-download-data, or stage shards into the data dir",
+            )
+        else:
+            add(
+                "training data",
+                "warn",
+                f"no parquet shards in {DATA_DIR}",
+                "python -m nanochat.train --auto-download-data downloads FineWeb-Edu shards",
+            )
+    except Exception as exc:  # noqa: BLE001
+        add("training data", "warn", f"{type(exc).__name__}: {exc}", "check NANOCHAT_BASE_DIR")
+
+    # Tokenizer
+    try:
+        from nanochat.tokenizer import get_tokenizer
+
+        tok = get_tokenizer()
+        n_vocab = tok.get_vocab_size() if hasattr(tok, "get_vocab_size") else "?"
+        add("tokenizer", "ok", f"{type(tok).__name__} (vocab={n_vocab})")
+    except Exception as exc:  # noqa: BLE001
+        add(
+            "tokenizer",
+            "warn",
+            f"{type(exc).__name__}: {exc}",
+            "tokenizer assets load on first training run; check network access if this persists",
+        )
+
+    # Disk space at the nanochat cache dir
+    try:
+        from nanochat.common import get_base_dir
+
+        base = get_base_dir()
+        usage = shutil.disk_usage(base)
+        free_gb = usage.free / (1 << 30)
+        status = "ok" if free_gb >= 5.0 else "warn"
+        add(
+            "disk space",
+            status,
+            f"{free_gb:.1f} GiB free at {base}",
+            "" if status == "ok" else "training data + checkpoints need headroom; free space or move NANOCHAT_BASE_DIR",
+        )
+    except Exception as exc:  # noqa: BLE001
+        add("disk space", "warn", f"{type(exc).__name__}: {exc}", "")
+
+    # End-to-end smoke: tiny GPT forward on the best available device
+    try:
+        import torch
+
+        from nanochat.gpt import GPT, GPTConfig
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        cfg = GPTConfig(sequence_len=32, vocab_size=128, n_layer=1, n_head=2, n_kv_head=2, n_embd=64)
+        model = GPT(cfg).to(device)
+        # GPT.forward requires bf16 rotary buffers (asserted in forward); init_weights would
+        # recompute them, but for a smoke test the constructor buffers are already bf16.
+        idx = torch.randint(0, 128, (1, 16), device=device)
+        with torch.no_grad():
+            logits = model(idx)
+        if logits.shape == (1, 16, 128) and bool(torch.isfinite(logits).all()):
+            add("model smoke", "ok", f"tiny GPT forward on {device}: logits {tuple(logits.shape)}, finite")
+        else:
+            add("model smoke", "fail", f"unexpected logits: shape={tuple(logits.shape)}", "investigate nanochat.gpt")
+    except Exception as exc:  # noqa: BLE001
+        add("model smoke", "fail", f"{type(exc).__name__}: {exc}", "uv sync --extra dev; then rerun mgr doctor")
+
+    return rows
+
+
+@app.command()
+def doctor(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only")] = False,
+):
+    """
+    Environment diagnostics: versions, devices, data, tokenizer, disk, and a tiny
+    end-to-end forward pass — with an actionable fix-it hint on every failing row.
+
+    Exit codes: 0 = all ok, 1 = warnings present, 2 = failures present.
+    """
+    rows = _run_doctor_checks()
+    n_warn = sum(1 for r in rows if r["status"] == "warn")
+    n_fail = sum(1 for r in rows if r["status"] == "fail")
+
+    if json_output:
+        payload = {
+            "schema_version": 1,
+            "kind": "doctor",
+            "checks": rows,
+            "counts": {"ok": len(rows) - n_warn - n_fail, "warn": n_warn, "fail": n_fail},
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        table = Table(box=box.SIMPLE_HEAVY, title="mgr doctor")
+        table.add_column("Check", style="cyan")
+        table.add_column("Status")
+        table.add_column("Detail", max_width=70)
+        table.add_column("Fix hint", style="dim", max_width=50)
+        style = {"ok": "[green]OK[/green]", "warn": "[yellow]WARN[/yellow]", "fail": "[bold red]FAIL[/bold red]"}
+        for r in rows:
+            table.add_row(r["name"], style[r["status"]], r["detail"], r["hint"])
+        console.print(table)
+        color = "green" if n_fail == 0 and n_warn == 0 else ("yellow" if n_fail == 0 else "red")
+        console.print(
+            Panel(
+                f"[bold {color}]{len(rows) - n_warn - n_fail} ok · {n_warn} warn · {n_fail} fail[/bold {color}]",
+                border_style=color,
+            )
+        )
+
+    if n_fail > 0:
+        raise typer.Exit(code=2)
+    if n_warn > 0:
+        raise typer.Exit(code=1)
+
+
 if __name__ == "__main__":
     app()

@@ -825,6 +825,32 @@ def test_fuzz_detects_nan_injection(monkeypatch):
     require(records[0]["out_nan_inf"] > 0, "out_nan_inf must count the injected NaNs")
 
 
+def test_doctor_runs_and_reports(monkeypatch):
+    """mgr doctor: runs on CPU-only env, JSON schema stable, missing-data hint present (br-rz8.7)."""
+    import json as json_mod
+
+    from typer.testing import CliRunner
+
+    import cli as mgr_cli
+    import nanochat.dataset as ds_mod
+
+    monkeypatch.setattr(ds_mod, "list_parquet_files", lambda data_dir=None: [])
+    runner = CliRunner()
+    result = runner.invoke(mgr_cli.app, ["doctor", "--json"])
+    # CPU-only CI: warns are expected (exit 1); failures are not (exit 2).
+    require(result.exit_code in (0, 1), f"doctor must not FAIL on a healthy CPU env: {result.output}")
+    payload = json_mod.loads(result.output)
+    require(payload["kind"] == "doctor", "JSON payload must identify itself")
+    names = {r["name"] for r in payload["checks"]}
+    for expected in ("python", "torch", "jax", "training data", "tokenizer", "disk space", "model smoke"):
+        require(expected in names, f"doctor missing check: {expected}")
+    data_row = next(r for r in payload["checks"] if r["name"] == "training data")
+    require(data_row["status"] == "warn", "empty data dir must produce a WARN")
+    require("auto-download-data" in data_row["hint"], "missing-data hint must name the fix flag")
+    smoke = next(r for r in payload["checks"] if r["name"] == "model smoke")
+    require(smoke["status"] == "ok", f"model smoke must pass: {smoke}")
+
+
 if __name__ == "__main__":
     import sys
 
