@@ -180,3 +180,30 @@ Notes:
 - Prefer **Rich-first** console output, but always write the final summary to `summary.json` + `run.md`.
 - Record: seed, commit (and dirty/clean), resolved config, and key environment info.
 - Avoid ad-hoc one-off output paths; keep results discoverable under this structure.
+
+## Per-Step Metrics Stream (`metrics.jsonl`, schema `mgr.metrics.v1`)
+
+Every `nanochat.train` run writes `metrics.jsonl` next to `summary.json` (bead rz8.2):
+one JSON record per line, rank-0 only under DDP, buffered with flushes at val
+intervals and on exit (KeyboardInterrupt included via try/finally). This is the
+durable per-step record consumed by scaling fits (E2), verdict adjudication (G2),
+the dashboard (nyp), and regression forensics.
+
+Record types:
+
+- `header` (first line, flushed immediately): the **provenance block** —
+  `{schema_version, git_sha, git_dirty, config_hash, data_snapshot_hash, tainted}`.
+  `tainted: true` (dirty tree or no git) means the artifact is fine for
+  exploration but the G2 verdict engine refuses it as evidence: results from a
+  working tree no reviewer can reconstruct are unattributable to any code state.
+  The same block is embedded in `summary.json` under `provenance`.
+- `step` (per `--log-interval`): `{step, loss, lr, lr_groups, grad_norm,
+  tokens_per_s, tflops, peak_mem_gb (CUDA else null), elapsed_s (since
+  measurement start)}` plus, when present: `ordinal` (scheduler counters
+  `A/B/C`, `best_loss`, `ema_loss`) and `tropical_gamma_min/_mean/_head_mean`
+  (with `--tropical-record-margins`).
+- `val` (per `--val-interval`): `{step, val_loss, train_loss}`.
+
+Reader: `nanochat.report.read_metrics_jsonl(path) -> (header, records, problems)` —
+schema-checks the header and skips malformed lines into `problems` rather than
+crashing an analysis over one bad line.

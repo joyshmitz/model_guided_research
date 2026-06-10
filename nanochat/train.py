@@ -39,7 +39,7 @@ from nanochat.dataset import ensure_min_parquet_files, list_parquet_files
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.gpt_synaptic import GPTSynaptic, GPTSynapticConfig
 from nanochat.ordinal_scheduler import OrdinalLRScheduler
-from nanochat.report import get_git_info, get_gpu_info, get_system_info
+from nanochat.report import MetricsStream, build_provenance, get_git_info, get_gpu_info, get_system_info
 from nanochat.synaptic import SynapticConfig
 
 console = Console()
@@ -809,6 +809,23 @@ def train(args) -> None:
     checkpoint_dir = str(getattr(args, "checkpoint_dir", None) or (run_dir / "checkpoints"))
     checkpoint_saved_steps: list[int] = []
 
+    # Per-step metrics stream (bead rz8.2): rank-0 only; the header (with the
+    # tamper-evidence provenance block) is flushed immediately so even a
+    # crashed run leaves an attributable artifact.
+    provenance = build_provenance(asdict(config))
+    metrics_stream: MetricsStream | None = None
+    if ddp_rank == 0:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        metrics_stream = MetricsStream(run_dir / "metrics.jsonl", provenance=provenance)
+
+    def _grad_norm() -> float:
+        # Called in the log block AFTER opt.step() and BEFORE the next
+        # iteration's zero_grad, so gradients are still populated.
+        # clip_grad_norm_ with max_norm=inf is the canonical foreach-optimized
+        # total-norm computation: no clipping happens, the return value is the
+        # global L2 norm (a hand-rolled per-param pow/sum costs ~3x more).
+        return float(torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=float("inf")))
+
     def save_training_checkpoint(step: int) -> None:
         """Capture FULL training state at a completed step (bead rz8.1)."""
         t_save0 = time.perf_counter()
@@ -934,6 +951,9 @@ def train(args) -> None:
 
     last_loader_state: dict[str, int] = {}
     last_completed_step = start_step - 1
+    # pre-clip grad norm captured by the clipping call for reuse in metrics
+    # (one-element list: assigned inside the loop, read in the log block)
+    last_preclip_grad_norm: list[float | None] = [None]
     try:
         for step, (inputs, targets, loader_state) in enumerate(loader, start=start_step):
             if step >= max_steps:
@@ -1007,7 +1027,11 @@ def train(args) -> None:
                     raise FloatingPointError("Non-finite loss detected (NaN/Inf).")
                 loss.backward()
                 if grad_clip_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=grad_clip_norm)
+                    # The clip call computes the pre-clip total norm anyway;
+                    # reuse it in the metrics record (zero added cost).
+                    last_preclip_grad_norm[0] = float(
+                        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=grad_clip_norm)
+                    )
                 if check_numerics:
                     bad_grads: list[tuple[str, dict[str, Any]]] = []
                     for n, p in raw_model.named_parameters():
@@ -1110,6 +1134,46 @@ def train(args) -> None:
                 last_log_time = step_t1
                 last_log_step = step
 
+                if metrics_stream is not None:
+                    record: dict[str, Any] = {
+                        "type": "step",
+                        "step": step,
+                        "loss": loss_item,
+                        "lr": float(optimizers[0].param_groups[0]["lr"]),
+                        "lr_groups": [float(g["lr"]) for opt in optimizers for g in opt.param_groups],
+                        "grad_norm": (
+                            last_preclip_grad_norm[0] if last_preclip_grad_norm[0] is not None else _grad_norm()
+                        ),
+                        "tokens_per_s": float(toks_s),
+                        "tflops": float(tflops),
+                        "peak_mem_gb": (
+                            float(torch.cuda.max_memory_allocated(device) / (1024**3))
+                            if device.type == "cuda"
+                            else None
+                        ),
+                        "elapsed_s": step_t1 - (meas_start_time or step_t1),
+                    }
+                    if schedulers:
+                        s0 = schedulers[0]
+                        record["ordinal"] = {
+                            "A": s0.A,
+                            "B": s0.B,
+                            "C": s0.C,
+                            "best_loss": s0.best_loss,
+                            "ema_loss": s0.ema_loss,
+                        }
+                    if (
+                        model_type == "gpt"
+                        and getattr(config, "attention_type", None) == "tropical"
+                        and bool(getattr(config, "tropical_record_margins", False))
+                    ):
+                        trop_stats = _collect_tropical_margin_stats(raw_model)
+                        if trop_stats is not None:
+                            record["tropical_gamma_min"] = trop_stats.get("gamma_min")
+                            record["tropical_gamma_mean"] = trop_stats.get("gamma_mean")
+                            record["tropical_gamma_head_mean"] = trop_stats.get("head_mean")
+                    metrics_stream.write(record)
+
             # Periodic validation evaluation
             if val_loader is not None and val_interval > 0 and (step + 1) % val_interval == 0:
                 val_loss = evaluate_validation(val_loader, val_batches)
@@ -1120,7 +1184,16 @@ def train(args) -> None:
                         f"[dim]val_ce[/dim] {val_loss:.4f}  "
                         f"[dim]train_ce[/dim] {loss_item:.4f}"
                     )
+                    if metrics_stream is not None:
+                        metrics_stream.write(
+                            {"type": "val", "step": step, "val_loss": float(val_loss), "train_loss": loss_item}
+                        )
+                        metrics_stream.flush()  # val cadence is the bead's flush point
     finally:
+        # Land the buffered metrics even on KeyboardInterrupt/crash, BEFORE
+        # the process group teardown can get in the way.
+        if metrics_stream is not None:
+            metrics_stream.close()
         compute_cleanup()
 
     # Final checkpoint so downstream consumers (eval C2, teachers C6) always
@@ -1269,6 +1342,7 @@ def train(args) -> None:
             "parquet_files": parquet_files,
         },
         "budget": budget,
+        "provenance": provenance,
         "checkpointing": checkpointing,
         "resume": resume_record,
         "results": results,

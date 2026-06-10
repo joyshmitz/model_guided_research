@@ -309,6 +309,105 @@ def test_validation_loss_evaluated_and_recorded(monkeypatch, tmp_path):
     assert summary["hparams"]["val_batches"] == 2
 
 
+def test_metrics_stream_written_and_readable(monkeypatch, tmp_path):
+    """rz8.2: metrics.jsonl exists with a provenance header, one step record
+    per log interval, val records at the val cadence, and the reader
+    round-trips it with schema validation."""
+    import nanochat.train as train_mod
+    from nanochat.report import METRICS_SCHEMA_VERSION, read_metrics_jsonl
+
+    def fake_plain_loader(B, T, split, device="cpu", **kwargs):
+        gen = torch.Generator().manual_seed(99)
+        while True:
+            tokens = torch.randint(0, VOCAB_FAKE, (B, T + 1), generator=gen, dtype=torch.long)
+            yield tokens[:, :-1].contiguous(), tokens[:, 1:].contiguous()
+
+    monkeypatch.setattr(train_mod, "tokenizing_distributed_data_loader", fake_plain_loader)
+    _run_train(monkeypatch, tmp_path, "metrics-run", val_interval=4, val_batches=2, scheduler_type="ordinal")
+
+    path = tmp_path / "artifacts" / "baseline" / "nanochat" / "metrics-run" / "metrics.jsonl"
+    assert path.exists(), "metrics.jsonl must be written next to summary.json"
+    header, records, problems = read_metrics_jsonl(path)
+    assert problems == [], f"clean run must produce a clean stream: {problems}"
+    assert header is not None and header["schema_version"] == METRICS_SCHEMA_VERSION
+    for key in ("git_sha", "git_dirty", "config_hash", "tainted"):
+        assert key in header, f"provenance header missing {key}"
+
+    steps = [r for r in records if r["type"] == "step"]
+    vals = [r for r in records if r["type"] == "val"]
+    assert [r["step"] for r in steps] == list(range(12)), "default log-interval 1 -> one record per step"
+    assert [r["step"] for r in vals] == [3, 7, 11], "val records at the val cadence"
+    for r in steps:
+        for key in ("loss", "lr", "lr_groups", "grad_norm", "tokens_per_s", "tflops", "elapsed_s"):
+            assert key in r, f"step record missing {key}"
+        assert r["grad_norm"] > 0, "gradients exist at logging time (post-step, pre-zero)"
+        assert "ordinal" in r and set(r["ordinal"]) == {"A", "B", "C", "best_loss", "ema_loss"}
+
+    # summary.json carries the same provenance block
+    summary = json.loads((path.parent / "summary.json").read_text())
+    assert summary["provenance"]["config_hash"] == header["config_hash"]
+
+
+def test_metrics_stream_tropical_gamma_passthrough(monkeypatch, tmp_path):
+    from nanochat.report import read_metrics_jsonl
+
+    _run_train(
+        monkeypatch,
+        tmp_path,
+        "metrics-tropical",
+        max_steps=4,
+        attention_type="tropical",
+        tropical_record_margins=None,  # boolean flag
+    )
+    path = tmp_path / "artifacts" / "baseline" / "nanochat" / "metrics-tropical" / "metrics.jsonl"
+    _header, records, problems = read_metrics_jsonl(path)
+    assert problems == []
+    steps = [r for r in records if r["type"] == "step"]
+    assert steps and all("tropical_gamma_min" in r and "tropical_gamma_head_mean" in r for r in steps)
+
+
+def test_metrics_reader_tolerates_malformed_lines(tmp_path):
+    from nanochat.report import METRICS_SCHEMA_VERSION, read_metrics_jsonl
+
+    path = tmp_path / "metrics.jsonl"
+    path.write_text(
+        json.dumps({"type": "header", "schema_version": METRICS_SCHEMA_VERSION, "git_sha": "x", "git_dirty": False, "config_hash": "y", "tainted": False})
+        + "\n"
+        + '{"type": "step", "step": 0, "loss": 1.0}\n'
+        + "{not json at all\n"
+        + '{"no_type_field": true}\n'
+        + '{"type": "step", "step": 1, "loss": 0.9}\n'
+    )
+    header, records, problems = read_metrics_jsonl(path)
+    assert header is not None
+    assert [r["step"] for r in records] == [0, 1], "good lines survive bad neighbors"
+    assert len(problems) == 2, f"each bad line reported once: {problems}"
+
+
+def test_provenance_taint_semantics(monkeypatch):
+    from nanochat import report as report_mod
+
+    def fake_git(info):
+        return lambda: dict(info)
+
+    monkeypatch.setattr(report_mod, "get_git_info", fake_git({"commit_full": "abc123", "dirty": False}))
+    clean = report_mod.build_provenance({"a": 1})
+    assert clean["tainted"] is False and clean["git_sha"] == "abc123"
+
+    monkeypatch.setattr(report_mod, "get_git_info", fake_git({"commit_full": "abc123", "dirty": True}))
+    dirty = report_mod.build_provenance({"a": 1})
+    assert dirty["tainted"] is True and dirty["git_dirty"] is True
+
+    monkeypatch.setattr(report_mod, "get_git_info", fake_git({"commit_full": "unknown", "dirty": False}))
+    nogit = report_mod.build_provenance({"a": 1})
+    assert nogit["tainted"] is True and nogit["git_sha"] is None
+
+    # config_hash is canonical: key order must not matter
+    assert report_mod.build_provenance({"a": 1, "b": 2})["config_hash"] == report_mod.build_provenance(
+        {"b": 2, "a": 1}
+    )["config_hash"]
+
+
 def test_ordinal_scheduler_state_dict_round_trip():
     """Unit: a restored scheduler continues the exact LR trajectory of the original."""
     from nanochat.ordinal_scheduler import OrdinalLRScheduler

@@ -104,6 +104,125 @@ def get_system_info():
     return info
 
 
+# -----------------------------------------------------------------------------
+# Per-step metrics stream (bead rz8.2): one JSONL record per logged step, the
+# durable data source for scaling fits (E2), verdict adjudication (G2), the
+# dashboard (nyp), and regression forensics. Schema documented in
+# artifacts/README.md.
+
+METRICS_SCHEMA_VERSION = "mgr.metrics.v1"
+
+
+def build_provenance(config_dict: dict[str, Any]) -> dict[str, Any]:
+    """Tamper-evidence block for artifacts used as adjudication evidence.
+
+    git_dirty=true (or no git at all) marks the artifact TAINTED: fine for
+    exploration, but the G2 verdict engine refuses tainted evidence — results
+    from a working tree no reviewer can reconstruct are unattributable to any
+    code state.
+    """
+    import hashlib
+    import json as json_mod
+
+    git = get_git_info()
+    sha = git.get("commit_full") or "unknown"
+    git_available = sha != "unknown"
+    dirty = bool(git.get("dirty", False))
+    config_hash = hashlib.sha256(
+        json_mod.dumps(config_dict, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    return {
+        "schema_version": METRICS_SCHEMA_VERSION,
+        "git_sha": sha if git_available else None,
+        "git_dirty": dirty if git_available else None,
+        "config_hash": config_hash,
+        "data_snapshot_hash": None,  # wiz bead's helper, when it lands
+        "tainted": (not git_available) or dirty,
+    }
+
+
+class MetricsStream:
+    """Buffered JSONL writer for per-step training metrics.
+
+    The header line (record type "header", carrying the provenance block) is
+    written and flushed IMMEDIATELY so even a crashed run leaves an
+    attributable artifact; step records buffer in memory and flush every
+    `flush_every` records, at val evaluations, and on close() — the caller
+    closes inside try/finally so KeyboardInterrupt still lands the buffer.
+    """
+
+    def __init__(self, path: Any, *, provenance: dict[str, Any], flush_every: int = 50):
+        import json as json_mod
+
+        self._json = json_mod
+        self._flush_every = max(1, int(flush_every))
+        self._buffer: list[str] = []
+        self._fh = open(path, "w", encoding="utf-8")  # noqa: SIM115 - lifetime managed by close()
+        header = {"type": "header", **provenance}
+        self._fh.write(self._json.dumps(header, sort_keys=True) + "\n")
+        self._fh.flush()
+
+    def write(self, record: dict[str, Any]) -> None:
+        self._buffer.append(self._json.dumps(record, sort_keys=True))
+        if len(self._buffer) >= self._flush_every:
+            self.flush()
+
+    def flush(self) -> None:
+        if self._buffer:
+            self._fh.write("\n".join(self._buffer) + "\n")
+            self._buffer.clear()
+        self._fh.flush()
+
+    def close(self) -> None:
+        if not self._fh.closed:
+            self.flush()
+            self._fh.close()
+
+
+def read_metrics_jsonl(path: Any) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[str]]:
+    """Read a metrics.jsonl stream. Returns (header, records, problems).
+
+    Malformed lines are skipped and reported in `problems` — one bad line must
+    never crash an analysis (E2/G2 consume these files programmatically).
+    """
+    import json as json_mod
+
+    header: dict[str, Any] | None = None
+    records: list[dict[str, Any]] = []
+    problems: list[str] = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        return None, [], [f"cannot read {path}: {exc}"]
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            obj = json_mod.loads(line)
+        except json_mod.JSONDecodeError as exc:
+            problems.append(f"line {lineno}: malformed JSON ({exc})")
+            continue
+        if not isinstance(obj, dict) or "type" not in obj:
+            problems.append(f"line {lineno}: record must be a mapping with a 'type' field")
+            continue
+        if obj["type"] == "header":
+            if header is not None:
+                problems.append(f"line {lineno}: duplicate header")
+            elif obj.get("schema_version") != METRICS_SCHEMA_VERSION:
+                problems.append(
+                    f"line {lineno}: schema_version {obj.get('schema_version')!r} != {METRICS_SCHEMA_VERSION!r}"
+                )
+                header = obj
+            else:
+                header = obj
+        else:
+            records.append(obj)
+    if header is None:
+        problems.append("no header line found")
+    return header, records, problems
+
+
 def estimate_cost(gpu_info, runtime_hours=None):
     """Estimate training cost based on GPU type and runtime."""
 
