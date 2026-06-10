@@ -20,7 +20,9 @@ WHAT THIS MODULE IS
          k adjacent-token transpositions (the data-side shadow of
          non-commutativity; predicts braid/integrable/gauge).
       5. HIERARCHY DEPTH      — single-linkage merge-tree depth statistics
-         (explicit depth readout complementing 1-2).
+         (explicit depth readout complementing 1-2; normalized ~1 = balanced
+         hierarchy, >> 1 = flat data chaining — see the function docstring,
+         the direction is easy to invert).
 
     Estimator cores operate on DISTANCE MATRICES or token sequences, so the
     calibration suite can feed them planted geometries directly; the corpus
@@ -183,8 +185,14 @@ def cophenetic_correlation(D: np.ndarray) -> float:
 
 def hierarchy_depth_spectrum(D: np.ndarray) -> dict[str, float]:
     """Depth statistics of the single-linkage dendrogram, normalized by the
-    balanced-tree depth log2(n) (a flat geometry chains shallowly; nested
-    cluster structure produces deep, balanced merge paths)."""
+    balanced-tree depth log2(n).
+
+    DIRECTION (verified on planted geometries; the easy mistake is inverting
+    it): balanced nested structure merges in ~log2(n) levels, so
+    normalized_mean_depth ~ 1; FLAT/uniform geometries CHAIN under single
+    linkage, producing much DEEPER merge paths (planted Euclidean measures
+    ~3.3). Values near 1 mean clean hierarchy; large values mean flat/chained.
+    """
     n = D.shape[0]
     if n < 3:
         return {"mean_depth": float("nan"), "max_depth": float("nan"), "normalized_mean_depth": float("nan")}
@@ -230,12 +238,15 @@ def dynamic_range_stats(texts: list[str]) -> dict[str, Any]:
             decades.append(math.log10(max(vals)) - math.log10(min(vals)))
     hill = float("nan")
     if len(magnitudes) >= 20:
-        # Hill estimator over the top 10% order statistics
+        # Hill estimator over the top-10% order statistics; if the tail is
+        # degenerate (all equal magnitudes -> mean log ratio 0) report NaN
+        # rather than letting 1/0 produce inf in the profile
         mags = np.sort(np.asarray(magnitudes, dtype=np.float64))
         k = max(5, len(mags) // 10)
         tail = mags[-k:]
         if tail[0] > 0:
-            hill = float(1.0 / np.mean(np.log(tail / tail[0]) + 1e-300)) if k > 1 else float("nan")
+            mean_log = float(np.mean(np.log(tail / tail[0])))
+            hill = 1.0 / mean_log if mean_log > 0 else float("nan")
     return {
         "numbers_found": len(magnitudes),
         "docs_with_spread": len(decades),
@@ -347,10 +358,10 @@ def activation_distance_matrix(seqs: list[list[int]], seed: int) -> np.ndarray:
         feats = []
         for s in seqs:
             ids = torch.tensor([t % cfg.vocab_size for t in s], dtype=torch.long).unsqueeze(0)
-            # hidden states via forward hook on the final norm input: use the
-            # token embedding pathway through blocks by calling the model's
-            # backbone; logits are fine as features too, but pooled hidden
-            # states are cheaper - reuse logits mean-pool as a robust fallback
+            # feature = mean-pooled LOGITS of the seeded random-init model:
+            # a deterministic random-feature encoding that needs no hooks and
+            # no trained checkpoint (random projections preserve geometry
+            # well enough for ORDERING comparisons, which is all we claim)
             logits = model(ids)
             feats.append(logits.float().mean(dim=1).squeeze(0))
         X = torch.stack(feats)
@@ -447,7 +458,12 @@ def load_corpus_texts(data_path: Path, max_docs: int, rng: np.random.Generator) 
         if f.suffix == ".parquet":
             import pyarrow.parquet as pq
 
-            table = pq.read_table(f, columns=["text"])
+            try:
+                table = pq.read_table(f, columns=["text"])
+            except Exception as exc:  # pyarrow raises several types here
+                raise ValueError(
+                    f"could not read parquet {f.name} (expected a 'text' column, the FineWeb convention): {exc}"
+                ) from exc
             texts.extend(str(x) for x in table.column("text").to_pylist())
         else:
             # split markdown/plaintext into paragraph-ish documents

@@ -123,7 +123,9 @@ def test_bootstrap_ci_brackets_mean_and_narrows() -> None:
     lo_b, hi_b = gp.bootstrap_ci(big, rng())
     assert lo_s < 5.0 < hi_s, f"small-sample CI [{lo_s:.2f},{hi_s:.2f}] should bracket the true mean"
     assert (hi_b - lo_b) < (hi_s - lo_s), "CI must narrow with sample size"
-    assert gp.bootstrap_ci(np.zeros((0,)), rng()) == (float("nan"), float("nan")) or True  # empty -> NaNs, no crash
+    # empty input -> (NaN, NaN), never a crash (NaN != NaN, so test via isnan)
+    lo_e, hi_e = gp.bootstrap_ci(np.zeros((0,)), rng())
+    assert np.isnan(lo_e) and np.isnan(hi_e), f"empty bootstrap must return NaNs, got ({lo_e}, {hi_e})"
 
 
 def test_edit_and_jaccard_distance_semantics() -> None:
@@ -170,6 +172,11 @@ def test_dynamic_range_extraction() -> None:
     assert out["max_decades"] >= 8.9, f"0.001..1e6 spans 9 decades, got {out['max_decades']:.2f}"
     empty = gp.dynamic_range_stats(["nothing numeric"])
     assert empty["numbers_found"] == 0 and np.isnan(empty["mean_decades"])  # NaN, never fabricated
+    # degenerate tail (all magnitudes equal) -> Hill is NaN, never inf
+    degenerate = gp.dynamic_range_stats(["7 " * 30])
+    assert np.isnan(degenerate["hill_tail_exponent"]), (
+        f"all-equal magnitudes must give NaN Hill exponent, got {degenerate['hill_tail_exponent']}"
+    )
 
 
 def test_distance_concentration_warning_fires_on_uniform_metric() -> None:

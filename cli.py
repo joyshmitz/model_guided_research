@@ -4031,7 +4031,9 @@ def profile_data(
         console.print("[bold red]Provide --data DIR (a directory of .txt/.md/.parquet documents).[/bold red]")
         raise typer.Exit(code=2)
 
-    rng = __import__("numpy").random.default_rng(seed)
+    import numpy as _np
+
+    rng = _np.random.default_rng(seed)
     try:
         texts = gp.load_corpus_texts(data, max_docs=sample, rng=rng)
     except (FileNotFoundError, ValueError) as exc:
@@ -4073,7 +4075,7 @@ def profile_data(
         table.add_row(
             "ultrametricity violation",
             f"{um['violation_mean']:.4f}",
-            f"frac>{0:.0e}: {um['violation_fraction']:.2f} · cophenetic r={um['cophenetic_correlation']:.3f}",
+            f"violating frac: {um['violation_fraction']:.2f} · cophenetic r={um['cophenetic_correlation']:.3f}",
         )
         dr = est["dynamic_range"]
         table.add_row(
@@ -4091,7 +4093,7 @@ def profile_data(
         table.add_row(
             "hierarchy depth",
             f"{hd['normalized_mean_depth']:.3f}",
-            f"mean {hd['mean_depth']:.1f} / max {hd['max_depth']:.0f} merges (norm. by log2 n)",
+            f"mean {hd['mean_depth']:.1f} / max {hd['max_depth']:.0f} merges · ~1=balanced hierarchy, >>1=flat/chained",
         )
         console.print(table)
         for w in profile["warnings"]:
