@@ -44,6 +44,7 @@ dependencies = [
     "filelock>=3.13.0",
     "tokenizers>=0.15.0",
     "cmaes>=0.12.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -140,4 +141,9 @@ compile-bytecode = true
 filterwarnings = [
     "ignore::pytest.PytestReturnNotNoneWarning",
     "ignore::pytest.PytestCollectionWarning",
+]
+
+[dependency-groups]
+dev = [
+    "types-pyyaml>=6.0.12.20260518",
 ]

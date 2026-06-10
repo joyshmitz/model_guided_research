@@ -1,0 +1,678 @@
+# =============================================================================
+# THEOREM REGISTRY — the mathematical twin of the (future) hypothesis registry.
+#
+# Bead: model_guided_research-vnl.1 (EPIC FORMAL, model_guided_research-vnl)
+#
+# WHAT THIS FILE IS
+#   Every load-bearing MATHEMATICAL claim in this project gets one entry here:
+#   a stable id, a precise statement, a proof status, where its prose proof
+#   lives (or will live), which numerical checks exercise its implementations,
+#   and which beads/hypotheses consume it. The G1 hypothesis registry
+#   (hij.1, hypotheses/registry.yaml when it lands) tracks EMPIRICAL claims;
+#   this file tracks MATHEMATICAL ones. A claim lives in exactly one registry.
+#
+# SERIALIZATION DECISION (binding for hij.1, per the cross-link note there):
+#   This registry landed first, so it sets the format for BOTH registries:
+#   YAML via PyYAML (yaml.safe_load). Rationale: registry entries carry
+#   multi-sentence prose statements; YAML block scalars keep them readable
+#   and hand-editable in review, which JSON string-escaping does not.
+#   PyYAML is an explicit dependency in pyproject.toml. hij.1 inherits this.
+#
+# STATUS SEMANTICS
+#   conjecture       — falsifiable mathematical claim, no proof yet.
+#   proved-on-paper  — proof exists (classical literature and/or a bead/note
+#                      sketch); not yet machine-checked. If source_note.path
+#                      is "pending", the project theory note is unwritten and
+#                      the proof currently lives in the cited bead/literature.
+#   lean-checked     — formalized in proofs/ (vnl.2/vnl.3); proof_location
+#                      names the Lean file and lemma.
+#
+# ANCHOR SEMANTICS
+#   source_note.anchor, when non-null, is a case-insensitive SUBSTRING of a
+#   markdown heading line (a line starting with '#') in source_note.path.
+#   `mgr theorems validate` enforces this whenever status >= proved-on-paper
+#   and path != "pending".
+#
+# NUMERICAL CHECK POINTERS
+#   kind: certify — a "<mechanism>.<check>" name from `mgr certify`
+#                   (resolved against the canonical check-name list in cli.py).
+#   kind: pytest  — a pytest node id or node-id prefix
+#                   (resolved against `pytest --collect-only` under --deep).
+#   kind: demo    — a property-check name printed by a JAX demo
+#                   (informational; not mechanically resolved).
+#   Checks test IMPLEMENTATIONS of a theorem's objects, not the theorem
+#   itself — a lean-checked entry keeps its numerical checks.
+# =============================================================================
+
+schema_version: 1
+
+theorems:
+  # ---------------------------------------------------------------------------
+  # PILLAR I — non-archimedean / valued fields (epic 8gk)
+  # ---------------------------------------------------------------------------
+  - id: thm-tropical-1-lipschitz
+    statement: >-
+      Tropical (max-plus) attention is 1-Lipschitz in the sup-norm: max and +
+      are both nonexpansive, so any composition of max-plus score and
+      aggregation stages moves outputs by at most the sup-norm perturbation of
+      the inputs. This is the source of the mechanism's robustness
+      certificates.
+    status: proved-on-paper
+    mechanisms: [tropical]
+    source_note:
+      path: markdown_documentation/tropical_geometry_and_idempotent_algebra.md
+      anchor: "Exact uncertainty bounds"
+    proof_location: "tropical doc section 6; nonexpansiveness of max/+ is elementary"
+    numerical_checks:
+      - kind: certify
+        ref: tropical.lipschitz_1_sup_norm_q
+      - kind: certify
+        ref: tropical.lipschitz_1_sup_norm_v
+    used_by: [model_guided_research-8gk.1, model_guided_research-8gk.7]
+    depends_on: []
+
+  - id: thm-lse-max-sandwich
+    statement: >-
+      For a finite nonempty family x_1..x_n and beta > 0:
+      max_i x_i <= (1/beta) log(sum_i exp(beta x_i)) <= max_i x_i + log(n)/beta.
+      The inflation is one-sided: log-sum-exp never underestimates the max.
+    status: proved-on-paper
+    mechanisms: [tropical, standard]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "stated with proof sketch in bead 8gk.1; formalization target of vnl.2"
+    numerical_checks: []
+    used_by: [model_guided_research-8gk.1, model_guided_research-vnl.2]
+    depends_on: []
+
+  - id: thm-route-stability
+    statement: >-
+      Two-family form: let x_1..x_n be tropical route scores with runner-up
+      margin gamma = x(argmax) - second_max(x) > 0, and let y satisfy
+      x_i <= y_i <= x_i + c for all i. If gamma > c then argmax y = argmax x
+      and is unique. In beta-attention, c = log(m)/beta where m is the INNER
+      aggregation arity (e.g. head_dim), not the number of routes.
+    status: proved-on-paper
+    mechanisms: [tropical]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "3-line proof from thm-lse-max-sandwich; formalization target #1 of vnl.2"
+    numerical_checks:
+      - kind: certify
+        ref: tropical.margin_matches_bruteforce
+    used_by:
+      [model_guided_research-8gk.1, model_guided_research-8gk.7, model_guided_research-vnl.2]
+    depends_on: [thm-lse-max-sandwich]
+
+  - id: thm-maslov-semiring-family
+    statement: >-
+      For every beta > 0, x (+)_beta y = (1/beta) log(exp(beta x) + exp(beta y))
+      is a commutative, associative semiring addition on R with ordinary + as
+      multiplication, isomorphic to (R+, +, x) via x -> exp(beta x); as
+      beta -> infinity it converges uniformly to max. Softmax attention and
+      tropical attention are two points on one exact semiring family.
+    status: proved-on-paper
+    mechanisms: [tropical, standard]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "Maslov dequantization (classical); assembly in bead 8gk.1"
+    numerical_checks:
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_tropical_max_associative_commutative_exact
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_tropical_distributivity_exact
+    used_by: [model_guided_research-8gk.1, model_guided_research-7b0.8]
+    depends_on: []
+
+  - id: thm-valuation-arithmetic
+    statement: >-
+      For a non-archimedean valuation v: v(xy) = v(x) + v(y) always, and
+      v(x + y) >= min(v(x), v(y)) with equality whenever v(x) != v(y)
+      (no leading-term cancellation). The valuation is a semiring
+      homomorphism onto (min,+) off the cancellation locus.
+    status: proved-on-paper
+    mechanisms: [ultrametric, tropical]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "classical valuation theory; project assembly in bead 8gk.2"
+    numerical_checks: []
+    used_by: [model_guided_research-8gk.2]
+    depends_on: []
+
+  - id: thm-lcp-is-padic-valuation
+    statement: >-
+      For x, y in Z_p with base-p digit expansions, the longest-common-prefix
+      depth satisfies LCP(x, y) = v_p(x - y) exactly; the ultrametric
+      mechanism's similarity is the p-adic valuation of a difference, and its
+      trie is a finite subtree of the Bruhat-Tits tree.
+    status: proved-on-paper
+    mechanisms: [ultrametric]
+    source_note:
+      path: markdown_documentation/ultrametric_worlds_and_p_adic_computation.md
+      anchor: "Distance and retrieval"
+    proof_location: "elementary digit computation; stated in bead 8gk.2"
+    numerical_checks:
+      - kind: certify
+        ref: ultrametric.strong_triangle_inequality_lcp
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_lcp_strong_triangle_inequality_exact
+    used_by: [model_guided_research-8gk.2, model_guided_research-8gk.4]
+    depends_on: []
+
+  - id: thm-tropicalization-of-attention
+    statement: >-
+      For valuation-generic inputs (no leading-term cancellation),
+      v(<q, k>_{Q_p}) equals the (min,+) inner product of the valuation
+      vectors: tropical attention computes exactly the valuation of p-adic
+      bilinear attention, with the tie locus being the tropical variety where
+      routes switch.
+    status: proved-on-paper
+    mechanisms: [ultrametric, tropical]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "follows from thm-valuation-arithmetic; genericity analysis owed by 8gk.2's note"
+    numerical_checks: []
+    used_by: [model_guided_research-8gk.2]
+    depends_on: [thm-valuation-arithmetic]
+
+  - id: thm-flat-error
+    statement: >-
+      In a field with non-archimedean valuation v, for k >= 0: if v(e_i) >= k
+      for all i in a finite family, then v(sum_i e_i) >= k and
+      v(prod_i (1 + e_i) - 1) >= k. Truncation errors cannot accumulate under
+      sums or products. The k >= 0 hypothesis is required for the product part.
+    status: proved-on-paper
+    mechanisms: [ultrametric]
+    source_note:
+      path: markdown_documentation/ultrametric_worlds_and_p_adic_computation.md
+      anchor: "Accumulation, interference, and error propagation"
+    proof_location: "3-line proof from the strong triangle inequality; formalization target #2 of vnl.2"
+    numerical_checks: []
+    used_by: [model_guided_research-8gk.4, model_guided_research-vnl.2]
+    depends_on: []
+
+  - id: thm-hensel-residue-preservation
+    statement: >-
+      Hensel lifting (the p-adic Newton method) refines a solution mod p^j to
+      one mod p^(j+1) while preserving the previous residue exactly: digit-wise
+      curricula built on it cannot destroy coarse structure already learned.
+    status: proved-on-paper
+    mechanisms: [ultrametric]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "classical (Hensel's lemma); curriculum translation in bead 8gk.4"
+    numerical_checks: []
+    used_by: [model_guided_research-8gk.4]
+    depends_on: []
+
+  - id: thm-ifs-cylinder-ultrametric
+    statement: >-
+      The address space of an iterated function system carries the cylinder
+      metric d(a,b) = prod of contraction ratios over the common prefix - a
+      (weighted) ultrametric; FractalKV and the ultrametric trie are the same
+      valuation-tree data structure differing only in radii conventions, and
+      learned non-uniform radii strictly generalize both.
+    status: proved-on-paper
+    mechanisms: [fractal, ultrametric]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "Proposition 1 of bead 8gk.5"
+    numerical_checks: []
+    used_by: [model_guided_research-8gk.5, model_guided_research-77l.4]
+    depends_on: []
+
+  - id: thm-moran-capacity
+    statement: >-
+      The similarity dimension s of an IFS solves sum_i r_i^s = 1 (Moran);
+      the number of eps-separated addresses scales as eps^(-s), so memory
+      capacity under a readout-noise floor eps is eps^(-s) with closed-form
+      collision probabilities from cylinder measures.
+    status: proved-on-paper
+    mechanisms: [fractal]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "classical (Moran equation / Hutchinson); capacity reading in bead 8gk.5"
+    numerical_checks: []
+    used_by: [model_guided_research-8gk.5, model_guided_research-77l.4]
+    depends_on: [thm-ifs-cylinder-ultrametric]
+
+  - id: thm-cylinder-zero-interference
+    statement: >-
+      Writes to disjoint cylinders of the address ultrametric are exactly
+      orthogonal: interference is zero, not small, whenever addressing
+      respects cylinder disjointness.
+    status: proved-on-paper
+    mechanisms: [fractal, ultrametric]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "Proposition 3 of bead 8gk.5; immediate from cylinder disjointness"
+    numerical_checks: []
+    used_by: [model_guided_research-8gk.5]
+    depends_on: [thm-ifs-cylinder-ultrametric]
+
+  - id: thm-gromov-product-equals-lcp
+    statement: >-
+      In a rooted metric tree with unit edge lengths, the Gromov product of two
+      leaves at the root equals the depth of their deepest common ancestor,
+      i.e. exactly the LCP length of their address strings; tree boundaries
+      carry the ultrametric exp(-(x|y)), making ultrametric attention
+      boundary-of-a-tree attention exactly.
+    status: proved-on-paper
+    mechanisms: [ultrametric, hyperbolic]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "Proposition 1 of bead 8gk.6; formalization target of vnl.3"
+    numerical_checks: []
+    used_by:
+      [model_guided_research-8gk.6, model_guided_research-mnn.4, model_guided_research-vnl.3]
+    depends_on: []
+
+  - id: thm-hyperbolic-score-decomposition
+    statement: >-
+      In hyperbolic space, distance-based attention scores decompose as
+      -d(q,k) = 2(q|k)_o - d(q,o) - d(k,o): a Gromov-product hierarchy-overlap
+      term plus radial depth-in-hierarchy terms, separating "how much do our
+      hierarchies overlap" from "how specific are we".
+    status: proved-on-paper
+    mechanisms: [hyperbolic]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "identity; derived in bead 8gk.6 Proposition 2"
+    numerical_checks: []
+    used_by: [model_guided_research-8gk.6, model_guided_research-mnn.4]
+    depends_on: []
+
+  - id: thm-curvature-homotopy-endpoints
+    statement: >-
+      Rescaled hyperbolic spaces converge to R-trees as curvature -> -infinity
+      and hyperbolic attention reduces to Euclidean dot-product attention as
+      c -> 0: one learnable-curvature mechanism traverses Euclidean <->
+      hyperbolic <-> tree/ultrametric attention.
+    status: proved-on-paper
+    mechanisms: [hyperbolic, ultrametric, standard]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "metric-geometry literature (CAT(kappa) asymptotics), cited per bead 8gk.6 Proposition 3"
+    numerical_checks: []
+    used_by: [model_guided_research-8gk.6, model_guided_research-mnn.4]
+    depends_on: []
+
+  - id: thm-newton-polytope-region-bound
+    statement: >-
+      The linear regions of a tropical polynomial are the cells of the regular
+      subdivision of its Newton polytope induced by the coefficient lifting;
+      region counts are bounded by upper-hull vertex counts, and multi-head
+      superposition obeys mixed-subdivision (mixed-volume) bounds.
+    status: proved-on-paper
+    mechanisms: [tropical]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "classical tropical geometry; attention-map application in bead 8gk.3"
+    numerical_checks: []
+    used_by: [model_guided_research-8gk.3]
+    depends_on: []
+
+  - id: conj-region-count-separation
+    statement: >-
+      Per-parameter linear-region count of tropical attention exceeds that of
+      parameter-matched ReLU MLPs by a factor growing with context length T
+      (the inner max ranges over a data-dependent index set of size T).
+    status: conjecture
+    mechanisms: [tropical]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "stated with counting protocol in bead 8gk.3"
+    numerical_checks: []
+    used_by: [model_guided_research-8gk.3]
+    depends_on: [thm-newton-polytope-region-bound]
+
+  - id: thm-maxplus-ffn-collapse
+    statement: >-
+      Stacked pure max-plus layers compose by max-plus matrix multiplication,
+      so a deep pure max-plus FFN collapses to a single tropical-affine map;
+      the standard two-layer shape collapses to a map of Barvinok rank at most
+      d_ff - hidden width is a tropical-rank budget, not a feature count.
+    status: proved-on-paper
+    mechanisms: [tropical]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "direct computation; stated in bead 8gk.8 (collapse + rank enrichment)"
+    numerical_checks: []
+    used_by: [model_guided_research-8gk.8, model_guided_research-8gk.3]
+    depends_on: []
+
+  - id: thm-maxplus-ffn-lipschitz
+    statement: >-
+      A pure max-plus FFN layer y_j = max_d (W_jd + x_d) is 1-Lipschitz
+      sup-norm to sup-norm; a tropical-rational layer (difference of two
+      max-plus maps) is 2-Lipschitz; residual connections add 1 to the block
+      constant; stacked rational layers compound multiplicatively (2^L).
+    status: proved-on-paper
+    mechanisms: [tropical]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "elementary; stated with constants in bead 8gk.8"
+    numerical_checks: []
+    used_by: [model_guided_research-8gk.8, model_guided_research-8gk.7]
+    depends_on: [thm-tropical-1-lipschitz]
+
+  # ---------------------------------------------------------------------------
+  # PILLAR II — Lie-theoretic composition (epic u55)
+  # ---------------------------------------------------------------------------
+  - id: thm-bch-nilpotent-termination
+    statement: >-
+      If all layer generators lie in a nilpotent Lie algebra of step k, the
+      Baker-Campbell-Hausdorff series terminates at nested-commutator weight k:
+      an L-layer composite is exactly a single exponential of a polynomial in
+      the generators - depth collapses algebraically with no approximation.
+    status: proved-on-paper
+    mechanisms: [gauge]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "classical (BCH for nilpotent algebras); compression program in bead u55.1"
+    numerical_checks: []
+    used_by: [model_guided_research-u55.1]
+    depends_on: []
+
+  - id: thm-magnus-convergence
+    statement: >-
+      The Magnus expansion for a nonautonomous linear flow X' = A(t) X
+      converges to a single exponential exp(Omega) while int ||A|| dt < pi,
+      with computable truncation bounds at each order.
+    status: proved-on-paper
+    mechanisms: [gauge]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "classical (Magnus; convergence by Moan-Niesen), cited in bead u55.1"
+    numerical_checks: []
+    used_by: [model_guided_research-u55.1]
+    depends_on: []
+
+  - id: thm-curvature-gauge-invariance
+    statement: >-
+      The norm of the discrete curvature (log-holonomy around elementary
+      plaquettes of the depth x position lattice) is invariant under position-
+      and layer-dependent basis changes - unlike neuron/feature observables,
+      which are basis-dependent.
+    status: proved-on-paper
+    mechanisms: [gauge]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "gauge covariance of holonomy (classical); lattice definitions in bead u55.2"
+    numerical_checks:
+      - kind: certify
+        ref: gauge.rotation_inverse_roundtrip
+    used_by: [model_guided_research-u55.2]
+    depends_on: []
+
+  - id: conj-curvature-binding
+    statement: >-
+      Plaquette curvature concentrates at order-sensitive computation
+      (binding, coreference, induction-copy events); its norm is an
+      unsupervised detector of annotated binding sites with AUROC > 0.75
+      against entropy/gradient baselines.
+    status: conjecture
+    mechanisms: [gauge]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "conjecture C2 of bead u55.2 with quantitative protocol"
+    numerical_checks: []
+    used_by: [model_guided_research-u55.2]
+    depends_on: [thm-curvature-gauge-invariance]
+
+  - id: thm-ybe-transfer-commutativity
+    statement: >-
+      For R-matrices with spectral parameter satisfying the Yang-Baxter
+      equation (trigonometric U_q(sl_2) family), row transfer matrices commute,
+      [T(u), T(v)] = 0, and log-derivative expansions yield a tower of charges
+      conserved exactly through depth.
+    status: proved-on-paper
+    mechanisms: [braid]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "classical integrability; finite-chain/boundary proof owed by u55.3's note"
+    numerical_checks:
+      - kind: certify
+        ref: braid.ybe_law_holds
+      - kind: certify
+        ref: braid.restricted_law_violates_ybe
+    used_by: [model_guided_research-u55.3]
+    depends_on: []
+
+  - id: thm-triality-invariance
+    statement: >-
+      Spin(8) triality permutes the three inequivalent 8-dimensional
+      representations, and the octonionic trilinear form t(x,y,z) =
+      Re((xy) conj(z)) is invariant under triality triples acting on the three
+      slots - the symmetry type matching attention's (Q,K,V) trilinearity.
+    status: proved-on-paper
+    mechanisms: [octonion]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "classical (Cartan/triality); construction route in bead u55.4"
+    numerical_checks:
+      - kind: certify
+        ref: octonion.omul_norm_multiplicative
+    used_by: [model_guided_research-u55.4]
+    depends_on: [thm-octonion-composition-algebra]
+
+  - id: thm-kick-kick-symplectic
+    statement: >-
+      With F = grad(phi_F) and G = grad(phi_G), the coupled updates
+      y1 = x1 + F(x2); y2 = x2 + G(y1) compose two gradient shears, each an
+      exact symplectic map (Hessian symmetry), so the block is an exact
+      symplectic integrator for the separable Hamiltonian
+      H(x1,x2) = phi_F(x2) + phi_G(x1).
+    status: proved-on-paper
+    mechanisms: [reversible]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "5-line proof in bead u55.5; formalization target of vnl.3"
+    numerical_checks:
+      - kind: certify
+        ref: reversible.forward_inverse_roundtrip
+    used_by: [model_guided_research-u55.5, model_guided_research-vnl.3]
+    depends_on: []
+
+  - id: thm-shadow-hamiltonian
+    statement: >-
+      A symplectic integrator exactly conserves a shadow Hamiltonian
+      H-tilde = H + O(h^2) for exponentially long times; translated to depth,
+      a quantity epsilon-close to the learned energy is conserved across
+      layers, so activations oscillate boundedly instead of drifting.
+    status: proved-on-paper
+    mechanisms: [reversible]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "classical backward error analysis (Hairer-Lubich-Wanner), adapted in bead u55.5"
+    numerical_checks: []
+    used_by: [model_guided_research-u55.5]
+    depends_on: [thm-kick-kick-symplectic]
+
+  - id: thm-noether-conserved-charges
+    statement: >-
+      Every continuous symmetry of the potentials phi yields an exactly
+      conserved charge of the symplectic block; potentials invariant under
+      within-segment token permutations conserve a multiset memory through
+      depth by theorem.
+    status: proved-on-paper
+    mechanisms: [reversible]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "Noether correspondence worked for this architecture in bead u55.5"
+    numerical_checks: []
+    used_by: [model_guided_research-u55.5]
+    depends_on: [thm-kick-kick-symplectic]
+
+  # ---------------------------------------------------------------------------
+  # PILLAR III — asymptotics of learning (epic lab)
+  # ---------------------------------------------------------------------------
+  - id: thm-evt-maxplus-concentration
+    statement: >-
+      The max of N independent Gaussian-scale terms concentrates at
+      sqrt(2 ln N) with Gumbel fluctuations - extreme-value class, not the
+      sqrt(N) CLT class - so max-plus layers (attention or FFN, width N or
+      d_ff) require log-width-corrected initialization and learning-rate
+      exponents.
+    status: proved-on-paper
+    mechanisms: [tropical]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "classical EVT (Fisher-Tippett-Gnedenko); parameterization program in bead lab.1"
+    numerical_checks: []
+    used_by:
+      [model_guided_research-lab.1, model_guided_research-8gk.8]
+    depends_on: []
+
+  - id: conj-resurgent-scaling
+    statement: >-
+      Neural scaling curves are resurgent-like: Borel-Pade analysis of
+      perturbative fit residuals at small compute predicts the location and
+      rough size of the first nonperturbative correction (the "break") at
+      larger compute, better than unconstrained broken-power-law selection.
+    status: conjecture
+    mechanisms: [surreal]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "stated as the falsifiable core of bead lab.2"
+    numerical_checks: []
+    used_by: [model_guided_research-lab.2]
+    depends_on: []
+
+  - id: thm-ordinal-termination
+    statement: >-
+      Any event system whose every event strictly decreases a rank taking
+      values in the ordinals terminates; with the Cantor-normal-form rank
+      rho = omega^2 A + omega B + C, multi-phase training programs with
+      restarts provably terminate regardless of which failure branches fire.
+    status: proved-on-paper
+    mechanisms: [ordinal]
+    source_note:
+      path: markdown_documentation/ordinal_schedules_and_well_founded_optimization.md
+      anchor: "Progress guarantee"
+    proof_location: "well-foundedness of ordinals; program-level calculus in bead lab.3; formalization target of vnl.3"
+    numerical_checks:
+      - kind: pytest
+        ref: tests/test_mathematical_properties.py::TestOrdinalSchedules
+    used_by: [model_guided_research-lab.3, model_guided_research-vnl.3]
+    depends_on: []
+
+  - id: thm-ordinal-program-composition
+    statement: >-
+      Sequencing of ordinal-orchestrated programs corresponds to ordinal
+      addition of their ranks and nesting to ordinal multiplication, giving a
+      compositional budget semantics for multi-phase training programs.
+    status: proved-on-paper
+    mechanisms: [ordinal]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "elementary ordinal arithmetic; made precise in bead lab.3 item 1"
+    numerical_checks: []
+    used_by: [model_guided_research-lab.3]
+    depends_on: [thm-ordinal-termination]
+
+  # ---------------------------------------------------------------------------
+  # ALGEBRAIC KERNELS (cross-pillar; the implementations under B1/B2 test)
+  # ---------------------------------------------------------------------------
+  - id: thm-quaternion-composition-algebra
+    statement: >-
+      Quaternion multiplication is associative, norm-multiplicative
+      (|q1 q2| = |q1||q2|), and conjugation is an anti-homomorphism
+      ((q1 q2)* = q2* q1*); unit-quaternion rotor application preserves value
+      norms.
+    status: proved-on-paper
+    mechanisms: [quaternion]
+    source_note:
+      path: markdown_documentation/octonionic_quaternionic_signal_flow.md
+      anchor: null
+    proof_location: "classical; exercised throughout the quaternion mechanism"
+    numerical_checks:
+      - kind: certify
+        ref: quaternion.qmul_associativity
+      - kind: certify
+        ref: quaternion.qmul_norm_multiplicative
+      - kind: certify
+        ref: quaternion.qconj_antihomomorphism
+      - kind: certify
+        ref: quaternion.rotor_norm_preservation
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_quaternion_norm_multiplicative
+    used_by: [model_guided_research-5ki.2, model_guided_research-mnn.1]
+    depends_on: []
+
+  - id: thm-octonion-composition-algebra
+    statement: >-
+      Octonion multiplication is norm-multiplicative and alternative
+      (x(xy) = (xx)y), satisfies the Moufang identities, and is genuinely
+      non-associative (the associator is nonzero for generic triples) -
+      the premise the octonion mechanism depends on.
+    status: proved-on-paper
+    mechanisms: [octonion]
+    source_note:
+      path: markdown_documentation/octonionic_quaternionic_signal_flow.md
+      anchor: null
+    proof_location: "classical (Cayley-Dickson); witness checks in certify/B2"
+    numerical_checks:
+      - kind: certify
+        ref: octonion.omul_norm_multiplicative
+      - kind: certify
+        ref: octonion.omul_alternativity
+      - kind: certify
+        ref: octonion.omul_nonassociativity_witness
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_octonion_moufang_identity
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_octonion_nonassociativity_exists
+    used_by:
+      [model_guided_research-5ki.2, model_guided_research-u55.4, model_guided_research-mnn.1]
+    depends_on: []
+
+  - id: thm-causal-attention-no-future-flow
+    statement: >-
+      Under causal masking, the gradient of output position t with respect to
+      input position t+k (k >= 1) is exactly zero for every attention
+      mechanism in the repo - the shared causality certificate.
+    status: proved-on-paper
+    mechanisms:
+      [standard, tropical, ultrametric, quaternion, octonion, braid, fractal, simplicial, surreal, reversible, gauge]
+    source_note:
+      path: pending
+      anchor: null
+    proof_location: "structural (masking); verified per mechanism by the certify suite"
+    numerical_checks:
+      - kind: certify
+        ref: standard.causality_no_future_grad
+      - kind: certify
+        ref: tropical.causality_no_future_grad
+      - kind: certify
+        ref: ultrametric.causality_no_future_grad
+    used_by: [model_guided_research-5ki.1, model_guided_research-7b0.8]
+    depends_on: []

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+import yaml
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
@@ -3990,6 +3991,406 @@ def doctor(
     if n_fail > 0:
         raise typer.Exit(code=2)
     if n_warn > 0:
+        raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# mgr theorems — the THEOREM REGISTRY (bead model_guided_research-vnl.1)
+#
+# The mathematical twin of the (future) hypothesis registry (hij.1): every
+# load-bearing mathematical claim in the project lives in
+# hypotheses/theorems.yaml with a stable id, precise statement, proof status
+# (conjecture | proved-on-paper | lean-checked), source-note anchor, numerical
+# check pointers (certify check names / pytest node ids / demo checks), and
+# its consumers. `validate` enforces the schema and pointer integrity; the
+# fast tier runs always, `--deep` additionally resolves pytest refs against a
+# live `pytest --collect-only`.
+#
+# SERIALIZATION DECISION (binding for hij.1, which lands second and inherits):
+# YAML via PyYAML safe_load — registry entries carry multi-sentence prose
+# statements, and YAML block scalars keep those hand-editable in review.
+# ---------------------------------------------------------------------------
+
+_THEOREM_STATUSES: tuple[str, ...] = ("conjecture", "proved-on-paper", "lean-checked")
+_THEOREM_CHECK_KINDS: tuple[str, ...] = ("certify", "pytest", "demo")
+_THEOREM_ID_RE = r"^(thm|conj)-[a-z0-9][a-z0-9-]*$"
+
+# Canonical literal check names from _run_certify_checks (mechanism.check).
+# Kept in sync with the certify implementation by a source-scan test in
+# tests/test_theorem_registry.py — if you add an add_check call, add it here.
+_CERTIFY_NAMED_CHECKS: frozenset[str] = frozenset(
+    {
+        "braid.payload_multiset_invariance",
+        "braid.restricted_law_violates_ybe",
+        "braid.ybe_law_holds",
+        "fractal.router_branch_simplex",
+        "gauge.rotation_additivity_cumsum_law",
+        "gauge.rotation_inverse_roundtrip",
+        "gauge.rotation_pairwise_norm_preservation",
+        "octonion.o_times_conj_is_norm_squared",
+        "octonion.omul_alternativity",
+        "octonion.omul_nonassociativity_witness",
+        "octonion.omul_norm_multiplicative",
+        "quaternion.qconj_antihomomorphism",
+        "quaternion.qmul_associativity",
+        "quaternion.qmul_norm_multiplicative",
+        "quaternion.rotor_norm_preservation",
+        "reversible.custom_autograd_grad_parity",
+        "reversible.forward_inverse_roundtrip",
+        "simplicial.mass_conservation_two_hop",
+        "standard.causal_mask_structure",
+        "standard.rmsnorm_unit_rms",
+        "standard.rope_pairwise_norm_preservation",
+        "standard.softmax_row_stochastic",
+        "surreal.layer_linearity",
+        "surreal.row_norm_equals_exp_scale",
+        "surreal.scale_shift_equivariance",
+        "tropical.lipschitz_1_sup_norm_q",
+        "tropical.lipschitz_1_sup_norm_v",
+        "tropical.margin_matches_bruteforce",
+        "tropical.score_center_pure_gauge_shift",
+        "ultrametric.strong_triangle_inequality_lcp",
+    }
+)
+
+
+def _certify_known_check_names() -> frozenset[str]:
+    """All resolvable certify check names: literals + per-mechanism causality."""
+    causality = {f"{m}.causality_no_future_grad" for m in _CERTIFY_MECHANISMS}
+    return _CERTIFY_NAMED_CHECKS | causality
+
+
+def _theorems_registry_path() -> Path:
+    return Path(__file__).resolve().parent / "hypotheses" / "theorems.yaml"
+
+
+def _load_theorem_registry(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    """Load the registry YAML. Returns (data, load_errors)."""
+    if not path.exists():
+        return None, [f"registry file not found: {path}"]
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except yaml.YAMLError as exc:
+        return None, [f"YAML parse error: {exc}"]
+    if not isinstance(data, dict):
+        return None, ["registry root must be a mapping with schema_version + theorems"]
+    return data, []
+
+
+def _anchor_in_note(note_path: Path, anchor: str) -> bool:
+    """anchor is a case-insensitive substring of some markdown heading line."""
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    needle = anchor.lower()
+    return any(line.lstrip().startswith("#") and needle in line.lower() for line in text.splitlines())
+
+
+def _pytest_ref_resolves(ref: str, collected: list[str]) -> bool:
+    """A ref resolves if it names a collected node id or a prefix of one
+    (class refs and parametrized tests resolve via their children)."""
+    return any(cid == ref or cid.startswith(ref + "::") or cid.startswith(ref + "[") for cid in collected)
+
+
+def _collect_pytest_node_ids(repo_root: Path, scope_files: list[str]) -> tuple[list[str], str | None]:
+    """Run pytest --collect-only -q over the referenced files; return node ids."""
+    cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", *scope_files]
+    try:
+        result = subprocess.run(  # nosec B603 - fixed argv, no shell
+            cmd, cwd=repo_root, capture_output=True, text=True, timeout=180
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [], f"pytest collection failed to run: {exc}"
+    ids = [line.strip() for line in result.stdout.splitlines() if "::" in line]
+    if not ids:
+        tail = (result.stdout + result.stderr).strip().splitlines()[-3:]
+        return [], f"pytest collected no node ids (exit {result.returncode}): {' | '.join(tail)}"
+    return ids, None
+
+
+def _validate_theorem_registry(
+    data: dict[str, Any] | None,
+    load_errors: list[str],
+    repo_root: Path,
+    *,
+    collected_pytest_ids: list[str] | None = None,
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    """Validate the registry. Returns (errors, warnings, summary).
+
+    Static tier (always): schema shape, id uniqueness/format, status enum,
+    source-note path+anchor existence (path may be the literal "pending"),
+    certify pointer resolution against the canonical check-name list,
+    pytest pointer FORMAT, depends_on referential integrity, lean-checked
+    proof-file existence. Deep tier (collected_pytest_ids provided): pytest
+    pointer resolution against the live collection.
+    """
+    import re as _re
+
+    errors: list[str] = list(load_errors)
+    warnings: list[str] = []
+    summary: dict[str, Any] = {"entries": 0, "by_status": {}, "pending_notes": 0, "checks": {"certify": 0, "pytest": 0, "demo": 0}}
+    if data is None:
+        return errors, warnings, summary
+
+    if not isinstance(data.get("schema_version"), int):
+        errors.append("schema_version must be an integer")
+    theorems = data.get("theorems")
+    if not isinstance(theorems, list) or not theorems:
+        errors.append("theorems must be a non-empty list")
+        return errors, warnings, summary
+
+    known_checks = _certify_known_check_names()
+    id_re = _re.compile(_THEOREM_ID_RE)
+    seen_ids: set[str] = set()
+    all_ids = {t.get("id") for t in theorems if isinstance(t, dict)}
+    summary["entries"] = len(theorems)
+
+    for idx, t in enumerate(theorems):
+        where = f"theorems[{idx}]"
+        if not isinstance(t, dict):
+            errors.append(f"{where}: entry must be a mapping")
+            continue
+        tid = t.get("id")
+        where = f"{tid or where}"
+        if not isinstance(tid, str) or not id_re.match(tid):
+            errors.append(f"{where}: id missing or not matching {_THEOREM_ID_RE}")
+        elif tid in seen_ids:
+            errors.append(f"{where}: duplicate id")
+        else:
+            seen_ids.add(tid)
+
+        status = t.get("status")
+        if status not in _THEOREM_STATUSES:
+            errors.append(f"{where}: status {status!r} not in {_THEOREM_STATUSES}")
+        else:
+            summary["by_status"][status] = summary["by_status"].get(status, 0) + 1
+            if isinstance(tid, str):
+                if tid.startswith("conj-") and status != "conjecture":
+                    warnings.append(f"{where}: id has conj- prefix but status is {status} (rename on promotion)")
+                if tid.startswith("thm-") and status == "conjecture":
+                    warnings.append(f"{where}: id has thm- prefix but status is conjecture")
+
+        if not isinstance(t.get("statement"), str) or not t["statement"].strip():
+            errors.append(f"{where}: statement must be a non-empty string")
+        if not isinstance(t.get("mechanisms"), list):
+            errors.append(f"{where}: mechanisms must be a list")
+        if not isinstance(t.get("proof_location"), str) or not t["proof_location"].strip():
+            errors.append(f"{where}: proof_location must be a non-empty string")
+
+        note = t.get("source_note")
+        if not isinstance(note, dict) or "path" not in note or "anchor" not in note:
+            errors.append(f"{where}: source_note must be a mapping with path and anchor keys")
+        else:
+            npath, anchor = note["path"], note["anchor"]
+            if npath == "pending":
+                summary["pending_notes"] += 1
+            elif not isinstance(npath, str):
+                errors.append(f"{where}: source_note.path must be a string or 'pending'")
+            else:
+                note_file = repo_root / npath
+                if not note_file.exists():
+                    errors.append(f"{where}: source_note.path does not exist: {npath}")
+                elif anchor is not None:
+                    if not isinstance(anchor, str) or not anchor.strip():
+                        errors.append(f"{where}: source_note.anchor must be null or a non-empty string")
+                    elif not _anchor_in_note(note_file, anchor):
+                        errors.append(f"{where}: anchor {anchor!r} not found in any heading of {npath}")
+
+        if status == "lean-checked":
+            ploc = t.get("proof_location", "")
+            lean_tokens = [tok for tok in str(ploc).replace(",", " ").split() if "proofs/" in tok]
+            if not lean_tokens:
+                errors.append(f"{where}: lean-checked requires proof_location naming a proofs/ file")
+            else:
+                lean_file = lean_tokens[0].split("::")[0].rstrip(";:")
+                if not (repo_root / lean_file).exists():
+                    errors.append(f"{where}: lean-checked proof file does not exist: {lean_file}")
+
+        checks = t.get("numerical_checks")
+        if not isinstance(checks, list):
+            errors.append(f"{where}: numerical_checks must be a list (may be empty)")
+            checks = []
+        for c in checks:
+            if not isinstance(c, dict) or "kind" not in c or "ref" not in c:
+                errors.append(f"{where}: each numerical_check needs kind and ref")
+                continue
+            kind, ref = c["kind"], c["ref"]
+            if kind not in _THEOREM_CHECK_KINDS:
+                errors.append(f"{where}: check kind {kind!r} not in {_THEOREM_CHECK_KINDS}")
+                continue
+            summary["checks"][kind] = summary["checks"].get(kind, 0) + 1
+            if kind == "certify":
+                if ref not in known_checks:
+                    errors.append(f"{where}: certify check {ref!r} is not a known check name")
+            elif kind == "pytest":
+                if not (isinstance(ref, str) and ref.startswith("tests/")):
+                    errors.append(f"{where}: pytest ref must start with tests/: {ref!r}")
+                elif collected_pytest_ids is not None and not _pytest_ref_resolves(ref, collected_pytest_ids):
+                    errors.append(f"{where}: pytest ref does not resolve against live collection: {ref}")
+
+        for dep in t.get("depends_on", []) or []:
+            if dep not in all_ids:
+                errors.append(f"{where}: depends_on references unknown theorem id {dep!r}")
+        used_by = t.get("used_by")
+        if not isinstance(used_by, list):
+            errors.append(f"{where}: used_by must be a list (may be empty)")
+
+    return errors, warnings, summary
+
+
+_STATUS_STYLE = {"conjecture": "yellow", "proved-on-paper": "cyan", "lean-checked": "green"}
+
+theorems_app = typer.Typer(
+    help="Theorem registry — the project's mathematical claims with proof status and check pointers.",
+    rich_markup_mode="rich",
+)
+app.add_typer(theorems_app, name="theorems")
+
+
+def _theorems_load_or_exit() -> dict[str, Any]:
+    data, load_errors = _load_theorem_registry(_theorems_registry_path())
+    if data is None:
+        for e in load_errors:
+            console.print(f"[bold red]{e}[/bold red]")
+        raise typer.Exit(code=1)
+    return data
+
+
+@theorems_app.command("list")
+def theorems_list(
+    status: Annotated[str | None, typer.Option(help="Filter by status: conjecture | proved-on-paper | lean-checked")] = None,
+    mechanism: Annotated[str | None, typer.Option(help="Filter by mechanism (e.g. tropical)")] = None,
+    json_out: Annotated[bool, typer.Option("--json", help="Emit JSON instead of a table")] = False,
+) -> None:
+    """List registered theorems with status, mechanisms, and check counts."""
+    data = _theorems_load_or_exit()
+    rows = data.get("theorems", [])
+    if status:
+        rows = [t for t in rows if t.get("status") == status]
+    if mechanism:
+        rows = [t for t in rows if mechanism in (t.get("mechanisms") or [])]
+    if json_out:
+        console.print_json(json.dumps({"schema_version": data.get("schema_version"), "theorems": rows}))
+        return
+    table = Table(title=f"Theorem registry — {len(rows)} entr{'y' if len(rows) == 1 else 'ies'}", box=box.SIMPLE_HEAVY)
+    table.add_column("id", style="bold")
+    table.add_column("status")
+    table.add_column("mechanisms")
+    table.add_column("checks", justify="right")
+    table.add_column("source note")
+    for t in rows:
+        st = t.get("status", "?")
+        note = t.get("source_note") or {}
+        npath = note.get("path", "?")
+        src = "[dim]pending[/dim]" if npath == "pending" else Path(str(npath)).name
+        table.add_row(
+            str(t.get("id")),
+            f"[{_STATUS_STYLE.get(st, 'white')}]{st}[/{_STATUS_STYLE.get(st, 'white')}]",
+            ", ".join(t.get("mechanisms") or []),
+            str(len(t.get("numerical_checks") or [])),
+            src,
+        )
+    console.print(table)
+    by_status: dict[str, int] = {}
+    for t in rows:
+        by_status[t.get("status", "?")] = by_status.get(t.get("status", "?"), 0) + 1
+    console.print(
+        Panel(
+            " · ".join(f"[{_STATUS_STYLE.get(k, 'white')}]{k}: {v}[/{_STATUS_STYLE.get(k, 'white')}]" for k, v in sorted(by_status.items()))
+            or "no entries",
+            border_style="blue",
+        )
+    )
+
+
+@theorems_app.command("show")
+def theorems_show(
+    theorem_id: Annotated[str, typer.Argument(help="Theorem id, e.g. thm-route-stability")],
+    json_out: Annotated[bool, typer.Option("--json", help="Emit JSON")] = False,
+) -> None:
+    """Show one theorem entry in full."""
+    data = _theorems_load_or_exit()
+    match = next((t for t in data.get("theorems", []) if t.get("id") == theorem_id), None)
+    if match is None:
+        console.print(f"[bold red]No theorem with id {theorem_id!r}.[/bold red] Try: mgr theorems list")
+        raise typer.Exit(code=1)
+    if json_out:
+        console.print_json(json.dumps(match))
+        return
+    st = match.get("status", "?")
+    note = match.get("source_note") or {}
+    checks = match.get("numerical_checks") or []
+    lines = [
+        f"[bold]{match.get('statement', '').strip()}[/bold]",
+        "",
+        f"status: [{_STATUS_STYLE.get(st, 'white')}]{st}[/{_STATUS_STYLE.get(st, 'white')}]",
+        f"mechanisms: {', '.join(match.get('mechanisms') or []) or '—'}",
+        f"source note: {note.get('path')}" + (f"  (anchor: {note.get('anchor')})" if note.get("anchor") else ""),
+        f"proof: {match.get('proof_location')}",
+        "checks: " + (", ".join(f"{c.get('kind')}:{c.get('ref')}" for c in checks) or "—"),
+        f"used by: {', '.join(match.get('used_by') or []) or '—'}",
+        f"depends on: {', '.join(match.get('depends_on') or []) or '—'}",
+    ]
+    console.print(Panel("\n".join(lines), title=f"[bold]{theorem_id}[/bold]", border_style=_STATUS_STYLE.get(st, "white")))
+
+
+@theorems_app.command("validate")
+def theorems_validate(
+    deep: Annotated[bool, typer.Option("--deep", help="Also resolve pytest refs against a live pytest --collect-only")] = False,
+    json_out: Annotated[bool, typer.Option("--json", help="Emit JSON report")] = False,
+) -> None:
+    """Validate the registry: schema, anchors, pointer integrity. Exit 1 on errors."""
+    repo_root = Path(__file__).resolve().parent
+    data, load_errors = _load_theorem_registry(_theorems_registry_path())
+    collected: list[str] | None = None
+    collect_problem: str | None = None
+    if deep and data is not None:
+        ref_files = sorted(
+            {
+                str(c["ref"]).split("::")[0]
+                for t in data.get("theorems", [])
+                if isinstance(t, dict)
+                for c in (t.get("numerical_checks") or [])
+                if isinstance(c, dict) and c.get("kind") == "pytest" and isinstance(c.get("ref"), str)
+            }
+        )
+        if ref_files:
+            collected, collect_problem = _collect_pytest_node_ids(repo_root, ref_files)
+            if collect_problem:
+                collected = None
+    errors, warnings, summary = _validate_theorem_registry(data, load_errors, repo_root, collected_pytest_ids=collected)
+    if collect_problem:
+        errors.append(f"--deep: {collect_problem}")
+    if json_out:
+        console.print_json(json.dumps({"errors": errors, "warnings": warnings, "summary": summary, "deep": deep}))
+    else:
+        if errors:
+            etable = Table(title=f"[red]{len(errors)} error(s)[/red]", box=box.SIMPLE)
+            etable.add_column("error", style="red")
+            for e in errors:
+                etable.add_row(e)
+            console.print(etable)
+        if warnings:
+            wtable = Table(title=f"[yellow]{len(warnings)} warning(s)[/yellow]", box=box.SIMPLE)
+            wtable.add_column("warning", style="yellow")
+            for w in warnings:
+                wtable.add_row(w)
+            console.print(wtable)
+        color = "red" if errors else ("yellow" if warnings else "green")
+        tier = "deep (pytest collection resolved)" if deep and collected is not None else "static"
+        console.print(
+            Panel(
+                f"[bold {color}]{summary['entries']} entries · "
+                f"{summary['by_status']} · {summary['pending_notes']} pending notes · "
+                f"checks {summary['checks']} · tier: {tier} · "
+                f"{len(errors)} errors / {len(warnings)} warnings[/bold {color}]",
+                title="[bold]mgr theorems validate[/bold]",
+                border_style=color,
+            )
+        )
+    if errors:
         raise typer.Exit(code=1)
 
 
