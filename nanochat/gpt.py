@@ -504,20 +504,29 @@ class GPT(nn.Module):
             self._ca_init_rule_number = None
         # zero out classifier weights
         torch.nn.init.zeros_(self.lm_head.weight)
+
+        def _zero_proj_weight(module: nn.Module) -> None:
+            # SurrealLayer projections have no .weight Parameter (w is recomposed
+            # from weight_s/weight_v every forward, and exp(s)*normalize(v) cannot
+            # represent zero with stable gradients) - keep their construction init.
+            weight = getattr(module, "weight", None)
+            if isinstance(weight, torch.Tensor):
+                torch.nn.init.zeros_(weight)
+
         # zero out c_proj weights in all blocks (where present)
         for block in self.transformer.h:
             if hasattr(block, "mlp") and hasattr(block.mlp, "c_proj"):
-                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+                _zero_proj_weight(block.mlp.c_proj)
             if hasattr(block, "attn") and hasattr(block.attn, "c_proj"):
-                torch.nn.init.zeros_(block.attn.c_proj.weight)
+                _zero_proj_weight(block.attn.c_proj)
             if hasattr(block, "special_block"):
                 sb = block.special_block
                 if hasattr(sb, "c_proj"):
-                    torch.nn.init.zeros_(sb.c_proj.weight)
+                    _zero_proj_weight(sb.c_proj)
                 if hasattr(sb, "f_block") and hasattr(sb.f_block, "c_proj"):
-                    torch.nn.init.zeros_(sb.f_block.c_proj.weight)
+                    _zero_proj_weight(sb.f_block.c_proj)
                 if hasattr(sb, "g_block") and hasattr(sb.g_block, "c_proj"):
-                    torch.nn.init.zeros_(sb.g_block.c_proj.weight)
+                    _zero_proj_weight(sb.g_block.c_proj)
         # init the rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
