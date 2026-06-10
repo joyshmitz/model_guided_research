@@ -4286,7 +4286,20 @@ def _eval_score_doc(
     max_new = len(tok.encode(" " + expected)) + 2
     if len(prompt_ids) + max_new >= model.rotary_seq_len:
         return None
-    pieces = list(model.generate(prompt_ids, max_tokens=max_new, temperature=temperature, seed=seed))
+    # Stop at the document separator: training corpora pack docs with BOS/EOT
+    # between them, so a model that has learned the format emits the answer
+    # IMMEDIATELY followed by <|endoftext|> - and decode() glues that marker
+    # onto the answer with no whitespace, which would fail a correct answer
+    # under whitespace canonicalization (found by the first real campaign, kbj2).
+    stop_id = None
+    get_bos = getattr(tok, "get_bos_token_id", None)
+    if callable(get_bos):
+        stop_id = get_bos()
+    pieces: list[int] = []
+    for piece in model.generate(prompt_ids, max_tokens=max_new, temperature=temperature, seed=seed):
+        if stop_id is not None and piece == stop_id:
+            break
+        pieces.append(piece)
     got = tok.decode(pieces)
     got_words = got.split()
     correct = got_words[: len(expected_words)] == expected_words

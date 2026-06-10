@@ -99,6 +99,42 @@ def test_parser_multiword_answer_requires_full_match():
     assert _score(" c a b", doc, task="copyops")[0] is False
 
 
+def test_parser_stops_at_document_separator():
+    """Regression for the kbj2 campaign finding: models trained on BOS-packed
+    docs emit the answer immediately followed by <|endoftext|>, and decode()
+    glues that marker onto the answer with no whitespace - 'lt<|endoftext|>TASK'
+    must not fail a correct 'lt'."""
+
+    class _StopTok(_StubTok):
+        BOS = 0xE000  # sentinel id the stub model can emit
+
+        def get_bos_token_id(self):
+            return self.BOS
+
+    class _StopModel(_StubModel):
+        def generate(self, tokens, max_tokens, temperature=0.0, seed=0):
+            yielded = 0
+            for c in self.reply:
+                if yielded >= max_tokens:
+                    return
+                yield ord(c)
+                yielded += 1
+            while yielded < max_tokens:  # answer, then separator, then next-doc text
+                yield _StopTok.BOS
+                yielded += 1
+
+    from cli import _eval_score_doc
+
+    spec = TASKS["arith"]
+    out = _eval_score_doc(
+        _StopModel(" lt"), _StopTok(), spec, "TASK arith CMP 1.00e-02 2.00e+03 OUT lt",
+        device=torch.device("cpu"), temperature=0.0, seed=0,
+    )
+    correct, expected, got = out
+    assert correct is True, f"answer followed by the separator must score correct: got={got!r}"
+    assert chr(_StopTok.BOS) not in got, "the separator must be truncated from the decoded answer"
+
+
 def test_parser_skips_prompts_exceeding_rotary_cache():
     from cli import _eval_score_doc
 
