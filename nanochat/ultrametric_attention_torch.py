@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from nanochat.model_utils import apply_rotary_emb, causal_attn_mask, norm, repeat_kv_heads
+from nanochat.model_utils import AttentionCore, causal_attn_mask
 
 
 @dataclass
@@ -146,18 +146,9 @@ class _PackedPrefixTrie:
         return num / den.clamp_min(1e-9)
 
 
-class UltrametricCausalSelfAttention(nn.Module):
+class UltrametricCausalSelfAttention(AttentionCore):
     def __init__(self, config, layer_idx):
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        super().__init__(config, layer_idx)
 
         # Ultrametric hyperparameters + mode selection.
         self.K = int(getattr(config, "ultrametric_K", 8))
@@ -247,33 +238,19 @@ class UltrametricCausalSelfAttention(nn.Module):
                 y[b, h] = state.tries[b][h].query(q_digits[b, h, 0], alpha=self.alpha)
         return y.to(dtype=out_dtype).unsqueeze(2)
 
-    def forward(self, x, cos_sin, kv_cache):
-        B, T, C = x.size()
-
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-
-        if kv_cache is not None:
-            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-
-        if self.n_kv_head != self.n_head:
-            k, v = repeat_kv_heads(k, v, n_head=self.n_head)
+    def attend(self, q, k, v, *, kv_cache, pos0):
+        B = q.size(0)
         Tq = q.size(2)
         Tk = k.size(2)
         mode = str(self.ultrametric_mode).strip().lower()
         if mode == "trie" and kv_cache is not None and q.device.type == "cpu":
+            # The trie ingests new keys on EVERY cached forward (prefill
+            # chunks included) so single-token decode can read it; only the
+            # Tq == 1 read path short-circuits the kernel computation.
             state = self._get_trie_state(kv_cache, B=int(B), H=int(k.size(1)), device=q.device)
             self._update_trie_from_kv(state, k, v)
             if Tq == 1:
-                y = self._trie_decode(state, q, out_dtype=v.dtype)  # (B, H, 1, D)
-                y = y.transpose(1, 2).contiguous().view(B, T, -1)
-                return self.c_proj(y)
+                return self._trie_decode(state, q, out_dtype=v.dtype)  # (B, H, 1, D)
 
         # LCP-kernel ultrametric attention (continuous relaxation).
         #
@@ -296,6 +273,9 @@ class UltrametricCausalSelfAttention(nn.Module):
         prefix_prob = torch.cumprod(match_prob, dim=-1)
         lcp = prefix_prob.sum(dim=-1)  # (B, H, Tq, Tk) in [0, K]
 
+        # Masking is multiplicative (weights live in the kernel's [0, inf)
+        # similarity scale, not a log scale), so the default attend's
+        # -inf/softmax pipeline does not apply here.
         causal_mask = causal_attn_mask(Tq, Tk, device=q.device)  # (Tq, Tk)
 
         weights = torch.exp(lcp.to(torch.float32) * self._log_alpha)
@@ -303,11 +283,7 @@ class UltrametricCausalSelfAttention(nn.Module):
         denom = weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         attn = (weights / denom).to(dtype=v.dtype)
 
-        y = attn @ v
-
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
-        y = self.c_proj(y)
-        return y
+        return attn @ v
 
 
 def perf_sanity_ultrametric_trie_decode(
