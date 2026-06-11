@@ -3443,6 +3443,45 @@ def _run_certify_checks(
             detail="Q1: sum_j A_ij + leftover_i = 1 exactly (stochastic gauge; live module forward)",
         )
 
+        def _heuristic_mass_partition() -> float:
+            # The heuristic (soft/restricted) modes are additive accumulations
+            # with no mass partition: their Q1 defect must be measurably
+            # NONZERO - the other half of the charge fingerprint, in the same
+            # artifact the conservation claim is adjudicated from (xas7).
+            from nanochat.gpt import GPT, GPTConfig
+
+            torch.manual_seed(seed + 8)
+            cfg = GPTConfig(
+                n_layer=1,
+                n_head=2,
+                n_kv_head=2,
+                n_embd=32,
+                sequence_len=24,
+                vocab_size=64,
+                attention_type="braid",
+                braid_crossing_law="restricted",
+            )
+            model = GPT(cfg)
+            model.eval()
+            with torch.no_grad():
+                model(torch.randint(0, 64, (1, 24)))
+            worst = 0.0
+            for module in model.modules():
+                charges = getattr(module, "last_braid_charges", None)
+                if isinstance(charges, dict) and isinstance(charges.get("q1_mass_defect"), float):
+                    worst = max(worst, charges["q1_mass_defect"])
+            return worst
+
+        add_check(
+            "braid",
+            "heuristic_mass_partition_violated",
+            "classical",
+            _heuristic_mass_partition,
+            tolerance=1e-3,
+            comparator="ge",
+            detail="separation witness: additive heuristic accumulation has NO mass partition (Q1 defect >> 0)",
+        )
+
     # ----- simplicial: mass conservation through 1-hop and 2-hop paths -----
     if "simplicial" in mechanisms:
 
@@ -5018,6 +5057,32 @@ def probe_charges(
     if skipped:
         console.print(f"[yellow]{skipped} docs skipped (prompt longer than the rotary cache)[/yellow]")
 
+    # Dissociation observable (the preregistered hyp-rmatrix-charge-decodability
+    # contract): abelian over-chance ratio vs the BEST non-solvable over-chance
+    # ratio (clamped below at 1.0 so below-chance probe noise cannot inflate
+    # the dissociation). decodable-everywhere and decodable-nowhere both push
+    # the ratio toward 1 - only the predicted dissociation pattern clears 2.0.
+    def _over_chance(cat: str) -> float | None:
+        rec = results.get(cat)
+        if not isinstance(rec, dict) or "chance" not in rec:
+            return None
+        best = max(rec["linear"]["test_acc"], rec["mlp"]["test_acc"])
+        return best / rec["chance"] if rec["chance"] > 0 else None
+
+    dissociation: dict[str, Any] | None = None
+    abelian = _over_chance("z60")
+    nonsolvable_vals = [v for v in (_over_chance("s5"), _over_chance("a5")) if v is not None]
+    if abelian is not None and nonsolvable_vals:
+        nonsolvable = max(nonsolvable_vals)
+        dissociation = {
+            "abelian_over_chance": abelian,
+            "nonsolvable_over_chance": nonsolvable,
+            "ratio": abelian / max(nonsolvable, 1.0),
+            "basis": "max(linear, mlp) test_acc / chance; ratio denominator clamped at 1.0",
+        }
+
+    from nanochat.report import build_provenance
+
     resolved_run_id = run_id or time.strftime("%Y%m%d_%H%M%S")
     run_dir = artifacts_dir / "probes" / "charges" / resolved_run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -5027,7 +5092,17 @@ def probe_charges(
         "meta": {
             "run_id": resolved_run_id,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "checkpoint": {"dir": str(checkpoint), "step": resolved_step},
+            # evaltasks-style checkpoint block: the verdict engine's arm
+            # matching, variant selectors, and budget cohorts read these
+            "checkpoint": {
+                "dir": str(checkpoint),
+                "step": resolved_step,
+                "attention_type": model_cfg.get("attention_type"),
+                "braid_crossing_law": model_cfg.get("braid_crossing_law"),
+                "n_params": sum(p.numel() for p in model.parameters()),
+                "budget": ckpt_meta.get("budget"),
+                "lineage": ckpt_meta.get("lineage"),
+            },
             "task": task,
             "examples": examples,
             "seed": seed,
@@ -5036,7 +5111,14 @@ def probe_charges(
             "feature_basis": "per-head <v, t(theta_k) v>/<v, v> at the final braid layer",
             "git": _get_git_info(),
         },
+        "provenance": build_provenance(
+            {
+                "model_config": ckpt_meta.get("model_config"),
+                "probe": {"task": task, "examples": examples, "seed": seed, "dials": dial_overrides or None},
+            }
+        ),
         "categories": results,
+        "dissociation": dissociation,
         "skipped_too_long": skipped,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
@@ -5410,6 +5492,7 @@ _THEOREM_ID_RE = r"^(thm|conj)-[a-z0-9][a-z0-9-]*$"
 # tests/test_theorem_registry.py — if you add an add_check call, add it here.
 _CERTIFY_NAMED_CHECKS: frozenset[str] = frozenset(
     {
+        "braid.heuristic_mass_partition_violated",
         "braid.payload_multiset_invariance",
         "braid.restricted_law_violates_ybe",
         "braid.rmatrix_braid_relation_holds",
@@ -5832,7 +5915,7 @@ _HYP_MECHANISMS = frozenset(
         "ordinal",
     }
 )
-_HYP_METRIC_SCHEMAS = ("evaltasks", "train", "certify", "bench")
+_HYP_METRIC_SCHEMAS = ("evaltasks", "train", "certify", "bench", "chargeprobe")
 _HYP_COMPARATORS = (">=", "<=")
 _HYP_THRESHOLD_KINDS = ("absolute_delta", "ratio")
 
@@ -5902,6 +5985,17 @@ def _validate_hypothesis_prediction(pred: Any, where: str, errors: list[str], wa
                         f"{where}: evaltasks metric_path names unknown task {segs[1]!r} "
                         f"(known: {', '.join(sorted(_diag_tasks))})"
                     )
+        elif schema == "certify":
+            segs = dotted.split(".")
+            if len(segs) != 3 or segs[2] != "measured":
+                errors.append(f"{where}: certify metric_path must be '<mechanism>.<check>.measured'")
+            elif f"{segs[0]}.{segs[1]}" not in _certify_known_check_names():
+                errors.append(f"{where}: certify metric_path names unknown check {segs[0]}.{segs[1]!r}")
+        elif schema == "chargeprobe":
+            if not (dotted.startswith("categories.") or dotted.startswith("dissociation.")):
+                errors.append(
+                    f"{where}: chargeprobe metric_path must start with 'categories.' or 'dissociation.'"
+                )
     if pred.get("comparator") not in _HYP_COMPARATORS:
         errors.append(f"{where}: prediction.comparator must be one of {_HYP_COMPARATORS}")
     if pred.get("threshold_kind") not in _HYP_THRESHOLD_KINDS:
@@ -5926,8 +6020,14 @@ def _validate_hypothesis_prediction(pred: Any, where: str, errors: list[str], wa
                 errors.append(f"{where}: {label}[{k!r}] must be a scalar (matched by equality), got {type(v).__name__}")
 
     baseline = pred.get("baseline")
-    if not isinstance(baseline, dict):
-        errors.append(f"{where}: prediction.baseline must be a mapping")
+    if baseline is None and "baseline" in pred:
+        # ci-v3 single-arm prediction: an explicit `baseline: null` makes the
+        # claim a threshold on the candidate arm alone - absolute thresholds
+        # only (a ratio without a denominator arm is meaningless).
+        if pred.get("threshold_kind") == "ratio":
+            errors.append(f"{where}: single-arm predictions (baseline: null) require threshold_kind absolute_delta")
+    elif not isinstance(baseline, dict):
+        errors.append(f"{where}: prediction.baseline must be a mapping, or explicitly null for single-arm claims")
     else:
         if baseline.get("mechanism") not in _HYP_MECHANISMS:
             errors.append(f"{where}: baseline.mechanism {baseline.get('mechanism')!r} unknown")
@@ -6418,7 +6518,24 @@ def hypotheses_add(
 # evidence yields BLOCKED with a machine-readable reason, never a soft verdict.
 # =============================================================================
 
-_ADJ_POLICY_VERSION = "ci-v2"
+_ADJ_POLICY_VERSION = "ci-v3"
+# ci-v3 (bead xas7) EXTENDS ci-v2 by appending capabilities; every two-arm
+# verdict is computed exactly as under ci-v2 (same observation units, same
+# Welch t / bootstrap CIs, same floor gate, same budget cohorts):
+#   - certify artifacts (kind: "certify", integer schema_version 1) are
+#     readable evidence: metric paths "certify:<mechanism>.<check>.measured"
+#     resolve against the checks list; taint derives from the recorded git
+#     dirty flag (certify predates the provenance block); budget cohorts do
+#     not apply (mathematical invariants are budget-free by construction).
+#   - chargeprobe artifacts (mgr.chargeprobe.v1) are readable evidence with
+#     evaltasks-style arm matching via meta.checkpoint.
+#   - single-arm predictions (baseline: null): the claim is a THRESHOLD on
+#     the candidate arm alone (absolute_delta only) - one-sample t CI95
+#     (Student t, df = n-1; zero spread -> point CI); SUPPORTED iff the CI
+#     lies entirely on the predicted side, REFUTED iff entirely on the
+#     failing side. No floor gate (there is no baseline to power-check);
+#     within-run trend claims (e.g. train:results.route_coverage_delta > 0)
+#     are this shape.
 # ci-v2 statistical policy (recorded in every verdict so a future policy
 # change cannot silently reinterpret history). ci-v1 verdicts remain in the
 # ledger stamped ci-v1; ci-v2 supersedes by APPENDING, never rewriting.
@@ -6506,10 +6623,20 @@ def _adj_collect_artifacts(roots: list[Path]) -> list[dict[str, Any]]:
                 schema = "evaltasks"
             elif sv == "mgr.telemetry.v1":
                 schema = "train"
+            elif sv == "mgr.chargeprobe.v1":
+                schema = "chargeprobe"
+            elif sv == 1 and data.get("kind") == "certify":
+                schema = "certify"
             else:
                 continue
-            prov = data.get("provenance")
-            tainted = (not isinstance(prov, dict)) or bool(prov.get("tainted", True))
+            if schema == "certify":
+                # certify predates the provenance block; the evidence-producing
+                # recipe is the committed code + seed, so taint = dirty tree
+                git = data.get("git")
+                tainted = (not isinstance(git, dict)) or bool(git.get("dirty", True))
+            else:
+                prov = data.get("provenance")
+                tainted = (not isinstance(prov, dict)) or bool(prov.get("tainted", True))
             index.append({"path": str(path), "schema": schema, "data": data, "tainted": tainted})
     return index
 
@@ -6526,7 +6653,7 @@ def _adj_variant_matches(art: dict[str, Any], variant: dict[str, Any] | None) ->
     if not variant:
         return True
     data = art["data"]
-    if art["schema"] == "evaltasks":
+    if art["schema"] in ("evaltasks", "chargeprobe"):
         sources: list[dict[str, Any]] = [((data.get("meta") or {}).get("checkpoint") or {})]
     else:
         sources = [data.get("hparams") or {}, data.get("config") or {}]
@@ -6546,7 +6673,16 @@ def _adj_artifact_matches_arm(art: dict[str, Any], mechanism: str, variant: dict
     baseline (attention standard, scheduler none, optimizer non-hoss); an
     optional variant selector further restricts within the mechanism."""
     data = art["data"]
-    if art["schema"] == "evaltasks":
+    if art["schema"] == "certify":
+        # certify runs are per-mechanism invariant suites, not trained models:
+        # the artifact witnesses a mechanism iff it carries that mechanism's
+        # check records (variant selectors do not apply - the law is encoded
+        # in the check NAME, e.g. braid.rmatrix_*).
+        checks = data.get("checks")
+        return isinstance(checks, list) and any(
+            isinstance(c, dict) and c.get("mechanism") == mechanism for c in checks
+        )
+    if art["schema"] in ("evaltasks", "chargeprobe"):
         attn = ((data.get("meta") or {}).get("checkpoint") or {}).get("attention_type")
         return attn == (mechanism if mechanism in _ADJ_ATTENTION_MECHS else "standard") and _adj_variant_matches(
             art, variant
@@ -6565,7 +6701,7 @@ def _adj_artifact_matches_arm(art: dict[str, Any], mechanism: str, variant: dict
 
 def _adj_planned_flops(art: dict[str, Any]) -> float | None:
     data = art["data"]
-    if art["schema"] == "evaltasks":
+    if art["schema"] in ("evaltasks", "chargeprobe"):
         budget = ((data.get("meta") or {}).get("checkpoint") or {}).get("budget") or {}
     else:
         budget = data.get("budget") or {}
@@ -6590,22 +6726,35 @@ def _adj_dedupe_evaltasks(arts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     best: dict[Any, tuple[tuple[str, str, str], dict[str, Any]]] = {}
     out: list[dict[str, Any]] = []
     for a in arts:
-        if a["schema"] != "evaltasks":
+        if a["schema"] not in ("evaltasks", "chargeprobe", "certify"):
             out.append(a)
             continue
         meta = a["data"].get("meta") or {}
-        ckpt = meta.get("checkpoint") or {}
-        lineage = ckpt.get("lineage") or {}
-        run_id = lineage.get("run_id")
-        if not isinstance(run_id, str) or not run_id:
-            out.append(a)  # no lineage -> cannot dedupe; keep as-is
-            continue
-        key = (run_id, ckpt.get("step"))
-        rank = (
-            str(a["data"].get("schema_version", "")),  # "...v2" > "...v1"
-            str(meta.get("generated_at", "")),
-            str(a["path"]),
-        )
+        if a["schema"] == "certify":
+            # re-runs of the same certify seed are byte-replays, never extra
+            # evidence; distinct seeds ARE replications and all survive
+            key: Any = ("certify", a["data"].get("seed"), a["data"].get("device"), a["data"].get("dtype"))
+            rank = ("", str(a["data"].get("run_id", "")), str(a["path"]))
+        else:
+            ckpt = meta.get("checkpoint") or {}
+            lineage = ckpt.get("lineage") or {}
+            run_id = lineage.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                if a["schema"] == "chargeprobe":
+                    # probe artifacts key on (checkpoint dir, step, task, seed)
+                    key = ("chargeprobe", ckpt.get("dir"), ckpt.get("step"), meta.get("task"), meta.get("seed"))
+                else:
+                    out.append(a)  # no lineage -> cannot dedupe; keep as-is
+                    continue
+            else:
+                key = (a["schema"], run_id, ckpt.get("step"), meta.get("task"), meta.get("seed")) if a[
+                    "schema"
+                ] == "chargeprobe" else (run_id, ckpt.get("step"))
+            rank = (
+                str(a["data"].get("schema_version", "")),  # "...v2" > "...v1"
+                str(meta.get("generated_at", "")),
+                str(a["path"]),
+            )
         prev = best.get(key)
         if prev is None or rank > prev[0]:
             best[key] = (rank, a)
@@ -6617,7 +6766,22 @@ def _adj_observations(art: dict[str, Any], dotted: str) -> list[float] | None:
     """ci-v2 observation units. evaltasks: ONE observation per artifact - the
     `.mean` value, which already averages that checkpoint's eval seeds (eval
     seeds are repeated measurements, not replications). train: per_seed values
-    when present (those ARE training seeds), else the single value."""
+    when present (those ARE training seeds), else the single value.
+    certify (ci-v3): "<mechanism>.<check>.<field>" resolves against the checks
+    list - one observation per certify run (runs at distinct seeds replicate).
+    chargeprobe (ci-v3): plain dotted walk into the summary."""
+    if art["schema"] == "certify":
+        segs = dotted.split(".")
+        if len(segs) != 3:
+            return None
+        mech, check, field = segs
+        for c in art["data"].get("checks") or []:
+            if isinstance(c, dict) and c.get("mechanism") == mech and c.get("check") == check:
+                value = c.get(field)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return [float(value)]
+                return None
+        return None
     value = _adj_walk_path(art["data"], dotted)
     if art["schema"] != "evaltasks" and dotted.endswith(".mean"):
         parent = _adj_walk_path(art["data"], dotted.rsplit(".", 1)[0])
@@ -6676,6 +6840,23 @@ def _adj_ci(cand: list[float], base: list[float], threshold_kind: str) -> tuple[
     return effect, float(lo), float(hi)
 
 
+def _adj_ci_single(obs: list[float]) -> tuple[float, float, float]:
+    """(mean, ci_low, ci_high) for a single-arm prediction (ci-v3): one-sample
+    Student t CI95 (df = n-1); zero spread -> a degenerate point CI."""
+    import statistics as stats_mod
+
+    effect = stats_mod.mean(obs)
+    n = len(obs)
+    var = stats_mod.variance(obs) if n > 1 else 0.0
+    se = (var / n) ** 0.5
+    if se == 0.0:
+        return effect, effect, effect
+    from scipy import stats as _scipy_stats
+
+    crit = float(_scipy_stats.t.ppf(0.975, n - 1))
+    return effect, effect - crit * se, effect + crit * se
+
+
 def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]]) -> dict[str, Any]:
     """One hypothesis -> a verdict record (verdict in supported/refuted/
     inconclusive) or a refusal (verdict 'blocked' + reason_code)."""
@@ -6685,6 +6866,9 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
         return {"id": hid, "verdict": "blocked", "reason_code": "prediction_not_operationalized",
                 "reason": _ADJ_BLOCK_REASONS["prediction_not_operationalized"]}
     schema, _, dotted = str(pred.get("metric_path", "")).partition(":")
+    # ci-v3 single-arm predictions: an explicit `baseline: null` makes the
+    # claim a threshold on the candidate arm alone (no contrast, no floor gate)
+    single_arm = "baseline" in pred and pred.get("baseline") is None
     baseline_mech = (pred.get("baseline") or {}).get("mechanism", "standard")
     min_seeds = int(pred.get("min_seeds", 3))
     comparator = pred.get("comparator")
@@ -6711,7 +6895,9 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
     # adjudicate; the overall verdict is the worst case across arms.
     for mech in hyp.get("mechanisms") or []:
         cand_all = [a for a in pool if _adj_artifact_matches_arm(a, mech, cand_variant)]
-        base_all = [a for a in pool if _adj_artifact_matches_arm(a, baseline_mech, base_variant)]
+        base_all = (
+            [] if single_arm else [a for a in pool if _adj_artifact_matches_arm(a, baseline_mech, base_variant)]
+        )
         saw_tainted = saw_tainted or any(a["tainted"] for a in cand_all + base_all)
         cand = _adj_dedupe_evaltasks([a for a in cand_all if not a["tainted"]])
         base = _adj_dedupe_evaltasks([a for a in base_all if not a["tainted"]])
@@ -6719,7 +6905,7 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
             code = "tainted_evidence" if cand_all else "no_candidate_artifacts"
             return {"id": hid, "verdict": "blocked", "reason_code": code, "mechanism": mech,
                     "reason": _ADJ_BLOCK_REASONS[code]}
-        if not base:
+        if not base and not single_arm:
             code = "tainted_evidence" if base_all else "no_baseline_artifacts"
             return {"id": hid, "verdict": "blocked", "reason_code": code, "mechanism": mech,
                     "reason": _ADJ_BLOCK_REASONS[code]}
@@ -6727,39 +6913,54 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
         # honest: an arith-trained model's eval cannot witness a hier claim)
         cand_m = [a for a in cand if _adj_observations(a, dotted)]
         base_m = [a for a in base if _adj_observations(a, dotted)]
-        if not cand_m or not base_m:
+        if not cand_m or (not base_m and not single_arm):
             return {"id": hid, "verdict": "blocked", "reason_code": "metric_missing", "mechanism": mech,
                     "reason": _ADJ_BLOCK_REASONS["metric_missing"]}
         # budget cohorts: every artifact must prove its planned FLOPs; the
-        # verdict uses the LARGEST cohort where both arms reach min_seeds
-        cand_f = [(a, f) for a in cand_m if (f := _adj_planned_flops(a)) is not None]
-        base_f = [(a, f) for a in base_m if (f := _adj_planned_flops(a)) is not None]
-        if not cand_f or not base_f:
-            return {"id": hid, "verdict": "blocked", "reason_code": "budget_mismatch", "mechanism": mech,
-                    "reason": _ADJ_BLOCK_REASONS["budget_mismatch"]}
-        anchors = sorted({f for _, f in cand_f + base_f}, reverse=True)
-        chosen: tuple[float, list[dict[str, Any]], list[dict[str, Any]]] | None = None
-        both_arms_seen = False
-        for anchor in anchors:
-            lo_bound = anchor * (1.0 - _ADJ_BUDGET_RTOL)
-            cc = [a for a, f in cand_f if lo_bound <= f <= anchor]
-            bb = [a for a, f in base_f if lo_bound <= f <= anchor]
-            if not cc or not bb:
-                continue
-            both_arms_seen = True
-            n_c = sum(len(_adj_observations(a, dotted) or []) for a in cc)
-            n_b = sum(len(_adj_observations(a, dotted) or []) for a in bb)
-            if min(n_c, n_b) >= need:
-                chosen = (anchor, cc, bb)
-                break
-        if chosen is None:
-            code = "insufficient_seeds" if both_arms_seen else "budget_mismatch"
-            return {"id": hid, "verdict": "blocked", "reason_code": code, "mechanism": mech,
-                    "reason": _ADJ_BLOCK_REASONS[code]}
-        anchor, cc, bb = chosen
+        # verdict uses the LARGEST cohort where both arms reach min_seeds.
+        # certify artifacts are budget-exempt (ci-v3): mathematical invariant
+        # suites have no training budget; all qualifying runs form one cohort.
+        anchor: float | None
+        cc: list[dict[str, Any]]
+        bb: list[dict[str, Any]]
+        if schema == "certify":
+            n_c = sum(len(_adj_observations(a, dotted) or []) for a in cand_m)
+            if n_c < need:
+                return {"id": hid, "verdict": "blocked", "reason_code": "insufficient_seeds", "mechanism": mech,
+                        "reason": _ADJ_BLOCK_REASONS["insufficient_seeds"]}
+            anchor, cc, bb = None, cand_m, []
+        else:
+            cand_f = [(a, f) for a in cand_m if (f := _adj_planned_flops(a)) is not None]
+            base_f = [(a, f) for a in base_m if (f := _adj_planned_flops(a)) is not None]
+            if not cand_f or (not base_f and not single_arm):
+                return {"id": hid, "verdict": "blocked", "reason_code": "budget_mismatch", "mechanism": mech,
+                        "reason": _ADJ_BLOCK_REASONS["budget_mismatch"]}
+            anchors = sorted({f for _, f in cand_f + base_f}, reverse=True)
+            chosen: tuple[float, list[dict[str, Any]], list[dict[str, Any]]] | None = None
+            both_arms_seen = False
+            for cohort_anchor in anchors:
+                lo_bound = cohort_anchor * (1.0 - _ADJ_BUDGET_RTOL)
+                cc_try = [a for a, f in cand_f if lo_bound <= f <= cohort_anchor]
+                bb_try = [a for a, f in base_f if lo_bound <= f <= cohort_anchor]
+                if not cc_try or (not bb_try and not single_arm):
+                    continue
+                both_arms_seen = True
+                n_c = sum(len(_adj_observations(a, dotted) or []) for a in cc_try)
+                n_b = sum(len(_adj_observations(a, dotted) or []) for a in bb_try)
+                if n_c >= need and (single_arm or n_b >= need):
+                    chosen = (cohort_anchor, cc_try, bb_try)
+                    break
+            if chosen is None:
+                code = "insufficient_seeds" if both_arms_seen else "budget_mismatch"
+                return {"id": hid, "verdict": "blocked", "reason_code": code, "mechanism": mech,
+                        "reason": _ADJ_BLOCK_REASONS[code]}
+            anchor, cc, bb = chosen
         cand_obs = [v for a in cc for v in (_adj_observations(a, dotted) or [])]
         base_obs = [v for a in bb for v in (_adj_observations(a, dotted) or [])]
-        effect, lo, hi = _adj_ci(cand_obs, base_obs, threshold_kind)
+        if single_arm:
+            effect, lo, hi = _adj_ci_single(cand_obs)
+        else:
+            effect, lo, hi = _adj_ci(cand_obs, base_obs, threshold_kind)
         if comparator == ">=":
             arm_verdict = "supported" if lo >= threshold else ("refuted" if hi < threshold else "inconclusive")
         else:  # "<="
@@ -6771,17 +6972,19 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
             "n_baseline": len(base_obs),
             "budget_flops": anchor,
         }
-        # ---- floor validity gate (ci-v2) ----
+        if single_arm:
+            arm["single_arm"] = True
+        # ---- floor validity gate (ci-v2; no baseline -> no gate) ----
         floor: float | None = None
         floor_src: str | None = None
-        prior_dotted = _adj_prior_path(dotted)
+        prior_dotted = _adj_prior_path(dotted) if not single_arm else None
         if prior_dotted is not None:
             priors = [_adj_walk_path(a["data"], prior_dotted) for a in bb]
             vals = [float(p) for p in priors if isinstance(p, (int, float)) and not isinstance(p, bool)]
             if vals and len(vals) == len(bb):
                 floor = sum(vals) / len(vals)
                 floor_src = "recorded_answer_prior"
-        if floor is None:
+        if floor is None and not single_arm:
             reg = validity.get("baseline_floor")
             if isinstance(reg, (int, float)) and not isinstance(reg, bool):
                 floor = float(reg)

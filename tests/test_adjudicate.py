@@ -125,7 +125,7 @@ def test_supported_when_ci_clears_threshold(tmp_path):
     arm = v["arms"]["ultrametric"]
     assert arm["ci95"][0] >= 0.05 and abs(arm["effect"] - 0.30) < 0.02
     assert arm["n_candidate"] == 3 and arm["n_baseline"] == 3  # one obs per trained model
-    assert v["policy_version"] == "ci-v2"
+    assert v["policy_version"] == "ci-v3"
 
 
 def test_refuted_when_ci_clears_opposite_side(tmp_path):
@@ -444,8 +444,8 @@ def test_ledger_append_preserves_comments_and_is_append_only(tmp_path, monkeypat
     assert entry["status"] == "supported"
     assert len(entry["verdict_history"]) == 1
     first = entry["verdict_history"][0]
-    assert first["verdict"] == "supported" and first["adjudicator"] == "engine:ci-v2"
-    assert first["policy_version"] == "ci-v2" and first["artifacts"]
+    assert first["verdict"] == "supported" and first["adjudicator"] == "engine:ci-v3"
+    assert first["policy_version"] == "ci-v3" and first["artifacts"]
 
     # second adjudication APPENDS; the first entry is untouched
     result = runner.invoke(cli.app, [
@@ -576,3 +576,176 @@ def test_variant_selector_distinguishes_semiring_beta_arms(tmp_path):
     hyp_plain["prediction"]["baseline"] = {"mechanism": "tropical", "equal_flops": True}
     v = cli._adjudicate_hypothesis(hyp_plain, _index(tmp_path))
     assert v["arms"]["tropical"]["n_candidate"] == 9
+
+
+# ---------------------------------------------------------------------------
+# ci-v3 (bead xas7): certify + chargeprobe schemas, single-arm predictions
+
+
+def _certify_artifact(root: Path, name: str, *, seed: int = 0, measured: float = 1e-6,
+                      heuristic_measured: float = 1.2, dirty: bool = False) -> None:
+    run = root / name
+    run.mkdir(parents=True, exist_ok=True)
+    (run / "summary.json").write_text(json.dumps({
+        "schema_version": 1,
+        "kind": "certify",
+        "run_id": name,
+        "seed": seed,
+        "device": "cpu",
+        "dtype": "fp32",
+        "git": {"commit": "deadbeef", "dirty": dirty},
+        "mechanisms": ["braid"],
+        "checks": [
+            {"mechanism": "braid", "check": "rmatrix_mass_partition_charge_conserved",
+             "family": "classical", "status": "pass", "measured": measured,
+             "tolerance": 1e-5, "comparator": "le", "duration_ms": 1.0, "detail": ""},
+            {"mechanism": "braid", "check": "heuristic_mass_partition_violated",
+             "family": "classical", "status": "pass", "measured": heuristic_measured,
+             "tolerance": 1e-3, "comparator": "ge", "duration_ms": 1.0, "detail": ""},
+        ],
+        "counts": {"pass": 2, "fail": 0, "error": 0},
+    }))
+
+
+def _chargeprobe_artifact(root: Path, name: str, *, ratio: float, seed: int = 0,
+                          run_id: str | None = None, target_flops: float = 1e14,
+                          crossing_law: str = "rmatrix") -> None:
+    run = root / name
+    run.mkdir(parents=True, exist_ok=True)
+    (run / "summary.json").write_text(json.dumps({
+        "schema_version": "mgr.chargeprobe.v1",
+        "kind": "probe-charges",
+        "meta": {
+            "run_id": name,
+            "generated_at": "2026-06-11T20:00:00Z",
+            "checkpoint": {"dir": f"ck/{name}", "step": 100, "attention_type": "braid",
+                            "braid_crossing_law": crossing_law, "n_params": 1000,
+                            "budget": {"max_steps": 100, "target_flops": target_flops,
+                                        "flops_per_step_est": 1e12},
+                            "lineage": {"run_id": run_id or name, "parent_run_ids": []}},
+            "task": "group",
+            "seed": seed,
+        },
+        "provenance": CLEAN_PROV,
+        "categories": {"z60": {"chance": 0.017, "linear": {"test_acc": 0.2}, "mlp": {"test_acc": 0.25}}},
+        "dissociation": {"abelian_over_chance": 3.0 * ratio / 3.0 * 3.0, "nonsolvable_over_chance": 1.0,
+                          "ratio": ratio},
+    }))
+
+
+def test_single_arm_certify_supported_budget_exempt(tmp_path):
+    """3 distinct-seed certify runs adjudicate a single-arm threshold claim;
+    certify artifacts carry no training budget (cohort-exempt by design)."""
+    for s in range(3):
+        _certify_artifact(tmp_path, f"cert{s}", seed=s, measured=1e-6 + s * 1e-8)
+    hyp = _hyp(
+        {"metric_path": "certify:braid.rmatrix_mass_partition_charge_conserved.measured",
+         "comparator": "<=", "threshold_kind": "absolute_delta", "threshold": 1e-5,
+         "baseline": None},
+        mechanisms=["braid"],
+    )
+    v = cli._adjudicate_hypothesis(hyp, _index(tmp_path))
+    assert v["verdict"] == "supported", v
+    arm = v["arms"]["braid"]
+    assert arm["single_arm"] is True
+    assert arm["budget_flops"] is None
+    assert arm["n_candidate"] == 3 and arm["n_baseline"] == 0
+    assert v["policy_version"] == "ci-v3"
+
+
+def test_single_arm_certify_refuted_and_seed_dedupe(tmp_path):
+    """Same-seed certify re-runs are byte-replays (deduped, never extra
+    evidence); a measured value above threshold refutes."""
+    for s in range(3):
+        _certify_artifact(tmp_path, f"bad{s}", seed=s, measured=2e-3)
+    hyp = _hyp(
+        {"metric_path": "certify:braid.rmatrix_mass_partition_charge_conserved.measured",
+         "comparator": "<=", "threshold_kind": "absolute_delta", "threshold": 1e-5,
+         "baseline": None},
+        mechanisms=["braid"],
+    )
+    v = cli._adjudicate_hypothesis(hyp, _index(tmp_path))
+    assert v["verdict"] == "refuted", v
+
+    # dedupe: three artifacts sharing one seed collapse to a single observation
+    dup_root = tmp_path / "dup"
+    for i in range(3):
+        _certify_artifact(dup_root, f"dup{i}", seed=7, measured=1e-6)
+    v = cli._adjudicate_hypothesis(hyp | {"id": "hyp-dup"}, _index(dup_root))
+    assert v["verdict"] == "blocked" and v["reason_code"] == "insufficient_seeds", v
+
+
+def test_certify_taint_derives_from_git_dirty(tmp_path):
+    """certify predates the provenance block: a dirty tree taints the run."""
+    for s in range(3):
+        _certify_artifact(tmp_path, f"dirty{s}", seed=s, measured=1e-6, dirty=True)
+    hyp = _hyp(
+        {"metric_path": "certify:braid.rmatrix_mass_partition_charge_conserved.measured",
+         "comparator": "<=", "threshold_kind": "absolute_delta", "threshold": 1e-5,
+         "baseline": None},
+        mechanisms=["braid"],
+    )
+    v = cli._adjudicate_hypothesis(hyp, _index(tmp_path))
+    assert v["verdict"] == "blocked" and v["reason_code"] == "tainted_evidence", v
+
+
+def test_single_arm_chargeprobe_dissociation_with_variant_and_cohorts(tmp_path):
+    """chargeprobe artifacts adjudicate via meta.checkpoint (arm matching,
+    variant selector, budget cohorts) like evaltasks; the dissociation ratio
+    is the registered observable."""
+    for s in range(3):
+        _chargeprobe_artifact(tmp_path, f"probe{s}", ratio=4.0 + 0.1 * s, seed=s)
+    # a non-rmatrix probe and a small-budget probe must both be excluded
+    _chargeprobe_artifact(tmp_path, "probe-soft", ratio=50.0, seed=9, crossing_law="restricted")
+    _chargeprobe_artifact(tmp_path, "probe-small", ratio=50.0, seed=10, target_flops=1e9)
+    hyp = _hyp(
+        {"metric_path": "chargeprobe:dissociation.ratio",
+         "comparator": ">=", "threshold_kind": "absolute_delta", "threshold": 2.0,
+         "baseline": None, "candidate_variant": {"braid_crossing_law": "rmatrix"}},
+        mechanisms=["braid"],
+    )
+    v = cli._adjudicate_hypothesis(hyp, _index(tmp_path))
+    assert v["verdict"] == "supported", v
+    arm = v["arms"]["braid"]
+    assert arm["n_candidate"] == 3  # soft-law and small-budget probes excluded
+    assert arm["budget_flops"] == 1e14
+    assert abs(arm["effect"] - 4.1) < 1e-9
+
+
+def test_single_arm_train_trend_route_coverage_delta(tmp_path):
+    """The y4r8 within-run trend: route_coverage_delta > 0 adjudicates as a
+    single-arm train-schema prediction."""
+    for i, delta in enumerate([0.21, 0.18, 0.25]):
+        run = tmp_path / f"trend{i}"
+        run.mkdir(parents=True)
+        (run / "summary.json").write_text(json.dumps({
+            "schema_version": "mgr.telemetry.v1",
+            "config": {"attention_type": "tropical", "optimizer_type": "adamw"},
+            "hparams": {"scheduler_type": "none"},
+            "budget": {"max_steps": 100, "target_flops": 1e9, "flops_per_step_est": 1e7},
+            "provenance": CLEAN_PROV,
+            "results": {"route_coverage_first": 0.0, "route_coverage_final": delta,
+                         "route_coverage_delta": delta},
+        }))
+    hyp = _hyp(
+        {"metric_path": "train:results.route_coverage_delta",
+         "comparator": ">=", "threshold_kind": "absolute_delta", "threshold": 0.05,
+         "baseline": None},
+        mechanisms=["tropical"],
+    )
+    v = cli._adjudicate_hypothesis(hyp, _index(tmp_path))
+    assert v["verdict"] == "supported", v
+    assert v["arms"]["tropical"]["single_arm"] is True
+
+
+def test_two_arm_verdicts_unchanged_under_ci_v3(tmp_path):
+    """ci-v3 is append-only policy: a classic two-arm adjudication produces
+    the same arms record as under ci-v2 (only the stamp changes)."""
+    _arm_artifacts(tmp_path, "cand", "ultrametric", [0.50, 0.52, 0.54], answer_prior=0.01)
+    _arm_artifacts(tmp_path, "base", "standard", [0.30, 0.31, 0.32], answer_prior=0.01)
+    v = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path))
+    assert v["verdict"] == "supported"
+    arm = v["arms"]["ultrametric"]
+    assert "single_arm" not in arm
+    assert arm["n_candidate"] == 3 and arm["n_baseline"] == 3
+    assert v["policy_version"] == "ci-v3"

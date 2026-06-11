@@ -920,20 +920,26 @@ hypotheses:
       provenance: "EPIC THEORY-II u55.3; theory note section 4 (operational charges)"
     date_registered: "2026-06-11"
     theorem_refs: [thm-rmatrix-mass-partition, thm-rmatrix-inversion-protected-memory]
-    prediction: null
-    operationalization_note: >-
-      The verdict engine has no certify-schema metric paths yet, so this entry
-      cannot be machine-adjudicated; the claim is enforced continuously instead
-      by the always-on suite - certify checks
-      braid.rmatrix_mass_partition_charge_conserved /
-      braid.rmatrix_braid_relation_holds and the layer-stack drift test
-      tests/test_mathematical_properties.py::TestIntegrableRMatrix::
-      test_charge_drift_through_layer_stack_separates_laws assert BOTH halves
-      (rmatrix ~0 AND heuristic nonzero), and the live telemetry
-      (braid_q1_mass_defect_max / braid_q2_braid_residual_max in metrics.jsonl)
-      witnesses it per training step. Promote to a prediction when the engine
-      learns the certify schema.
-    status: blocked
+    prediction:
+      metric_path: "certify:braid.rmatrix_mass_partition_charge_conserved.measured"
+      comparator: "<="
+      threshold_kind: absolute_delta
+      threshold: 1.0e-5
+      baseline: null
+      min_seeds: 3
+      scale_caveats: >-
+        OPERATIONALIZED under ci-v3 (xas7): single-arm certify prediction -
+        the conservation half adjudicates on the measured Q1 defect across
+        >= 3 certify runs at distinct seeds (budget-exempt: invariants have
+        no training budget). The SEPARATION half (heuristic modes measurably
+        nonzero) is witnessed inside the same artifacts by the ge-comparator
+        checks braid.heuristic_mass_partition_violated and
+        braid.restricted_law_violates_ybe, which fail the whole certify run
+        if the heuristic laws ever stop violating - a supported verdict here
+        cannot coexist with a collapsed separation. The layer-stack drift
+        test and the live metrics telemetry remain the per-commit / per-step
+        enforcement.
+    status: open
     evidence: []
     verdict_history: []
 
@@ -958,16 +964,25 @@ hypotheses:
       provenance: "EPIC THEORY-II u55.3 polish round 3 (referee: the missing success criterion); theory note section 4 (charge decodability)"
     date_registered: "2026-06-11"
     theorem_refs: [thm-rmatrix-mass-partition]
-    prediction: null
-    operationalization_note: >-
-      The probe harness exists (mgr probe-charges, artifact schema
-      mgr.chargeprobe.v1 with per-category linear/MLP test accuracies and
-      decodable_at_2x_chance flags) but the verdict engine does not read that
-      schema yet. Protocol when promoted: probe a trained rmatrix checkpoint
-      (>= 3 seeds) on the group task; supported iff z60 decodable_at_2x_chance
-      is true across seeds AND s5 max(test_acc) stays below 2x chance;
-      decodable-everywhere or nowhere both refute the dissociation as
-      registered (nowhere additionally triggers the redesign note above).
-    status: blocked
+    prediction:
+      metric_path: "chargeprobe:dissociation.ratio"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 2.0
+      baseline: null
+      candidate_variant: {braid_crossing_law: "rmatrix"}
+      min_seeds: 3
+      scale_caveats: >-
+        OPERATIONALIZED under ci-v3 (xas7): single-arm chargeprobe prediction
+        on the dissociation observable - abelian (z60) over-chance ratio
+        divided by the best non-solvable (s5/a5) over-chance ratio (denominator
+        clamped at 1.0). Decodable-everywhere and decodable-nowhere both push
+        the ratio toward 1 and REFUTE as registered; only the predicted
+        representation-theoretic dissociation clears 2.0. Requires probes of
+        >= 3 distinct-seed trained rmatrix checkpoints (budget cohorts apply
+        via the recorded checkpoint budget); a refuted-nowhere outcome
+        additionally activates the higher-rank R-matrix redesign note in the
+        statement.
+    status: open
     evidence: []
     verdict_history: []
