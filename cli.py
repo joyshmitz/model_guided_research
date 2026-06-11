@@ -4405,6 +4405,13 @@ _EVAL_TASKS_SCHEMA_VERSION = "mgr.evaltasks.v2"
 # on all docs. This is the length-generalization observable the preregistered
 # word-problem hypotheses (hyp-rmatrix-*) adjudicate against; null when the
 # task has no difficulty axis or too few scored docs.
+# 2026-06-11 (fresh-eyes review, additive within v2): meta.checkpoint gains
+# model_config - the checkpoint's full recorded GPTConfig - so variant
+# selectors (rgyl) can distinguish within-mechanism arms (braid_crossing_law,
+# ultrametric_mode, ...) on evaltasks evidence. Artifacts predating the field
+# simply cannot match a variant-selected arm (the selector requires the
+# recorded knob), which fails loudly as no_candidate_artifacts rather than
+# silently pooling arms.
 
 
 def _eval_split_examples(
@@ -4812,6 +4819,12 @@ def eval_tasks(
                 "n_params": n_params,
                 "budget": ckpt_meta.get("budget"),
                 "lineage": ckpt_meta.get("lineage"),
+                # the full recorded model config (additive in v2): variant
+                # selectors (rgyl) resolve config knobs - braid_crossing_law,
+                # ultrametric_mode, ... - against evaltasks evidence; without
+                # this, any within-mechanism arm distinction is invisible to
+                # the verdict engine and its hypotheses block at adjudication
+                "model_config": ckpt_meta.get("model_config"),
             },
             "device": str(device),
             "seeds": seed_list,
@@ -6660,7 +6673,10 @@ _ADJ_POLICY_VERSION = "ci-v3"
 #     Satterthwaite df (fix #2: at the n=3 clustering produces, the normal
 #     1.96 understates the interval; t(df~4) ~ 2.78). Zero spread in both
 #     arms -> a degenerate point CI at the effect.
-#   - ratio: effect = mean(C) / mean(B); percentile bootstrap CI95
+#   - ratio: effect = mean(C) / mean(B), compared against the threshold IN
+#     RATIO SPACE (for negative-valued metrics like length_slope, dividing by
+#     B flips inequalities - the registry header documents the convention);
+#     percentile bootstrap CI95
 #     (10_000 resamples, numpy default_rng(1234) - deterministic).
 #   - SUPPORTED: the CI95 lies entirely on the predicted side of the
 #     threshold. REFUTED: entirely on the failing side (the registered
@@ -6763,7 +6779,12 @@ def _adj_variant_matches(art: dict[str, Any], variant: dict[str, Any] | None) ->
         return True
     data = art["data"]
     if art["schema"] in ("evaltasks", "chargeprobe"):
-        sources: list[dict[str, Any]] = [((data.get("meta") or {}).get("checkpoint") or {})]
+        ckpt = (data.get("meta") or {}).get("checkpoint") or {}
+        # knobs live either on the checkpoint block itself (step, attention
+        # type, probe extras) or in its recorded model_config (every GPTConfig
+        # knob - braid_crossing_law, ultrametric_mode, ...)
+        model_cfg = ckpt.get("model_config")
+        sources: list[dict[str, Any]] = [ckpt, model_cfg if isinstance(model_cfg, dict) else {}]
     else:
         sources = [data.get("hparams") or {}, data.get("config") or {}]
     for key, wanted in variant.items():

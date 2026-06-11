@@ -750,3 +750,72 @@ def test_two_arm_verdicts_unchanged_under_ci_v3(tmp_path):
     assert "single_arm" not in arm
     assert arm["n_candidate"] == 3 and arm["n_baseline"] == 3
     assert v["policy_version"] == "ci-v3"
+
+
+def test_evaltasks_variant_selector_resolves_via_model_config(tmp_path):
+    """Variant selectors on evaltasks evidence read the checkpoint's recorded
+    model_config (fresh-eyes fix): a braid_crossing_law selector must pick the
+    rmatrix arm out of mixed braid artifacts - and must NOT match artifacts
+    that predate the model_config field (loud no_candidate_artifacts, never
+    silent arm pooling)."""
+
+    def braid_eval(name, *, law, slope, with_model_config=True):
+        path = _evaltasks_artifact(tmp_path, name, mechanism="braid", per_seed=[0.5, 0.5, 0.5])
+        data = json.loads(path.read_text())
+        data["tasks"]["group"] = {
+            "length_slope": {"held_out": {"slope": slope, "ci95": [slope - 0.001, slope + 0.001],
+                                            "intercept": 1.0, "n_docs": 50, "basis": "test"},
+                              "by_category": {"s5": {"slope": slope, "ci95": [slope - 0.001, slope + 0.001],
+                                                       "intercept": 1.0, "n_docs": 20, "basis": "test"}}},
+        }
+        if with_model_config:
+            data["meta"]["checkpoint"]["model_config"] = {"attention_type": "braid", "braid_crossing_law": law}
+        path.write_text(json.dumps(data))
+
+    for i in range(3):
+        braid_eval(f"rmx{i}", law="rmatrix", slope=-0.002)
+        braid_eval(f"soft{i}", law="restricted", slope=-0.02)
+    _arm_artifacts(tmp_path, "std", "standard", [0.5, 0.5, 0.5])
+    for p in sorted(tmp_path.glob("std*/summary.json")):
+        data = json.loads(p.read_text())
+        data["tasks"]["group"] = {
+            "length_slope": {"held_out": {"slope": -0.01, "ci95": [-0.011, -0.009],
+                                            "intercept": 1.0, "n_docs": 50, "basis": "test"},
+                              "by_category": {"s5": {"slope": -0.01, "ci95": [-0.011, -0.009],
+                                                       "intercept": 1.0, "n_docs": 20, "basis": "test"}}},
+        }
+        p.write_text(json.dumps(data))
+
+    # ratio-space semantics: both slopes negative, "2x flatter" is M/B <= 0.5
+    # (the registered convention; ">=" would invert under the negative baseline)
+    hyp = _hyp(
+        {"metric_path": "evaltasks:tasks.group.length_slope.by_category.s5.slope",
+         "comparator": "<=", "threshold_kind": "ratio", "threshold": 0.5,
+         "candidate_variant": {"braid_crossing_law": "rmatrix"}},
+        mechanisms=["braid"],
+    )
+    v = cli._adjudicate_hypothesis(hyp, _index(tmp_path))
+    assert v["verdict"] == "supported", v
+    arm = v["arms"]["braid"]
+    assert arm["n_candidate"] == 3  # restricted-law artifacts excluded
+    assert abs(arm["effect"] - 0.2) < 0.01  # -0.002 / -0.01: 5x flatter
+    assert all("rmx" in p or "std" in p for p in v["artifacts"]), v["artifacts"]
+
+    # the inverted form must NOT support a 5x-flatter candidate (the bug the
+    # fresh-eyes review caught in the originally drafted registrations)
+    hyp_bad = _hyp(
+        {"metric_path": "evaltasks:tasks.group.length_slope.by_category.s5.slope",
+         "comparator": ">=", "threshold_kind": "ratio", "threshold": 0.5,
+         "candidate_variant": {"braid_crossing_law": "rmatrix"}},
+        mechanisms=["braid"],
+    )
+    hyp_bad["id"] = "hyp-inverted"
+    v_bad = cli._adjudicate_hypothesis(hyp_bad, _index(tmp_path))
+    assert v_bad["verdict"] == "refuted", v_bad
+
+    # artifacts WITHOUT model_config cannot satisfy the selector
+    legacy_root = tmp_path / "legacy"
+    for i in range(3):
+        _evaltasks_artifact(legacy_root, f"old{i}", mechanism="braid", per_seed=[0.5])
+    v2 = cli._adjudicate_hypothesis(hyp, _index(legacy_root))
+    assert v2["verdict"] == "blocked" and v2["reason_code"] == "no_candidate_artifacts", v2

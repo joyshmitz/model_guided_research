@@ -33,8 +33,15 @@
 #   and B = metric(baseline.mechanism) at the SAME FLOPs budget:
 #     ">=" + absolute_delta : claim holds iff M >= B + threshold
 #     "<=" + absolute_delta : claim holds iff M <= B - threshold
-#     ">=" + ratio          : claim holds iff M >= threshold * B
-#     "<=" + ratio          : claim holds iff M <= threshold * B
+#     ">=" + ratio          : claim holds iff M/B >= threshold
+#     "<=" + ratio          : claim holds iff M/B <= threshold
+#   RATIO claims are in RATIO SPACE (the engine compares mean(C)/mean(B)
+#   against the threshold directly). For positive-valued metrics this equals
+#   the "M vs threshold*B" reading; for NEGATIVE-valued metrics (e.g.
+#   length_slope) dividing by B flips the inequality, so register the
+#   comparator in ratio space - "2x flatter negative slope" is "<=" 0.5,
+#   never ">=" 0.5 (the latter would refute flat candidates and support
+#   steep ones).
 #   min_seeds: the verdict needs at least this many TRAINING RUNS per arm
 #   (ci-v2 counts one observation per trained model, never per eval seed);
 #   the CI convention (mean +/- CI95 must clear the threshold) is adjudicated
@@ -863,22 +870,30 @@ hypotheses:
     theorem_refs: [thm-ybe-transfer-commutativity, thm-rmatrix-inversion-protected-memory]
     prediction:
       metric_path: "evaltasks:tasks.group.length_slope.by_category.s5.slope"
-      comparator: ">="
+      comparator: "<="
       threshold_kind: ratio
       threshold: 0.5
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
       scale_caveats: >-
-        Slopes are negative (accuracy decays with length): M >= 0.5*B means the
-        rmatrix arm keeps at most half the baseline decay rate. The engine's
-        answer-prior floor gate does not fire on slope paths, so the verdict is
-        meaningful ONLY if the baseline's in-range exact match clears the group
-        answer prior - a flat-at-chance baseline has slope ~0 and the
-        comparison is vacuous; adjudication must check that precondition by
-        hand (or via hyp-group-nonsolvable-barrier's baseline curves) until the
-        engine learns slope-path floors. The candidate arm is selected by
-        variant {braid_crossing_law: rmatrix} against the standard-mechanism
-        baseline.
+        RATIO-SPACE SEMANTICS (fresh-eyes fix, pre-evidence): the engine
+        compares effect = mean(C)/mean(B) against the threshold directly.
+        Both slopes are negative (accuracy decays with length), so the ratio
+        is positive and "2x flatter" reads M/B <= 0.5 - comparator "<=". (The
+        originally drafted ">=" encoded "M >= 0.5*B", which INVERTS under
+        division by the negative baseline - it would have refuted flat
+        candidates and supported steep ones.) Sign caveat: a non-negative
+        rmatrix slope against a decaying baseline gives ratio <= 0 <= 0.5,
+        and SUPPORTED is the correct reading (flat-or-better beats
+        2x-flatter). The engine's answer-prior floor gate does not fire on
+        slope paths, so the verdict is meaningful ONLY if the baseline's
+        in-range exact match clears the group answer prior - a flat-at-chance
+        baseline has slope ~0 and the comparison is vacuous; adjudication
+        must check that precondition by hand (or via
+        hyp-group-nonsolvable-barrier's baseline curves) until the engine
+        learns slope-path floors. The candidate arm is selected by variant
+        {braid_crossing_law: rmatrix}; evaltasks artifacts must record
+        meta.checkpoint.model_config for the selector to resolve.
       candidate_variant: {braid_crossing_law: "rmatrix"}
     status: open
     evidence: []
@@ -900,19 +915,22 @@ hypotheses:
     theorem_refs: [thm-ybe-transfer-commutativity]
     prediction:
       metric_path: "evaltasks:tasks.group.length_slope.by_category.z60.slope"
-      comparator: "<="
+      comparator: ">="
       threshold_kind: ratio
       threshold: 0.5
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
       scale_caveats: >-
-        Mirror of hyp-rmatrix-s5-length-slope on the abelian control: M <=
-        0.5*B (slopes negative) asserts the rmatrix z60 slope stays at least
-        half as steep as baseline, i.e. the flattening there is LESS than the
-        2x demanded on s5. Same floor-precondition caveat and the same
-        candidate_variant selector; the pair must be adjudicated together -
-        supporting s5 while refuting this entry is the predicted pattern,
-        supporting both means the advantage is not mechanism-specific.
+        Mirror of hyp-rmatrix-s5-length-slope in RATIO SPACE (fresh-eyes fix,
+        pre-evidence): effect = mean(C)/mean(B) with both slopes negative, so
+        "retains at least half the baseline decay" reads M/B >= 0.5 -
+        comparator ">=". (The originally drafted "<=" encoded "M <= 0.5*B",
+        which inverts under division by the negative baseline.) Same
+        floor-precondition caveat and candidate_variant selector as the s5
+        entry (evaltasks artifacts must record meta.checkpoint.model_config);
+        the pair must be adjudicated together - supporting s5 while refuting
+        this entry is the predicted pattern, supporting both means the
+        advantage is not mechanism-specific.
       candidate_variant: {braid_crossing_law: "rmatrix"}
     status: open
     evidence: []
