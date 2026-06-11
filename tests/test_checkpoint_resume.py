@@ -482,3 +482,31 @@ def test_ordinal_scheduler_state_dict_round_trip():
     assert restored.get_last_lr() == ref_lrs
     assert (restored.A, restored.B, restored.C) == (ref.A, ref.B, ref.C)
     assert restored.best_loss == ref.best_loss and restored.ema_loss == ref.ema_loss
+
+
+def test_metrics_stream_append_preserves_history_across_resume(tmp_path):
+    """A resumed run must APPEND to metrics.jsonl, never truncate it: a resume
+    previously erased the parent process's entire step history (found by the
+    rz8.8 e2e resume scenario). The splice is marked by a resume_header record
+    carrying the resuming process's provenance."""
+    from nanochat.report import MetricsStream, read_metrics_jsonl
+
+    path = tmp_path / "metrics.jsonl"
+    prov = {"schema_version": "mgr.metrics.v1", "git_sha": "aaa", "git_dirty": False,
+            "config_hash": "h1", "data_snapshot_hash": None, "tainted": False}
+    first = MetricsStream(path, provenance=prov, flush_every=1)
+    for step in range(3):
+        first.write({"type": "step", "step": step, "loss": 1.0})
+    first.close()
+
+    resumed = MetricsStream(path, provenance={**prov, "config_hash": "h2"}, flush_every=1, append=True)
+    for step in range(3, 6):
+        resumed.write({"type": "step", "step": step, "loss": 0.9})
+    resumed.close()
+
+    header, records, problems = read_metrics_jsonl(path)
+    assert header is not None and not problems, problems
+    steps = [r["step"] for r in records if r.get("type") == "step"]
+    assert steps == [0, 1, 2, 3, 4, 5], "pre-kill history must survive the resume"
+    splices = [r for r in records if r.get("type") == "resume_header"]
+    assert len(splices) == 1 and splices[0]["config_hash"] == "h2", "splice must carry the resumer's provenance"

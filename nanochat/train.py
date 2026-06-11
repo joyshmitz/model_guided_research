@@ -829,7 +829,12 @@ def train(args) -> None:
     metrics_stream: MetricsStream | None = None
     if ddp_rank == 0:
         run_dir.mkdir(parents=True, exist_ok=True)
-        metrics_stream = MetricsStream(run_dir / "metrics.jsonl", provenance=provenance)
+        # append on resume: truncating would erase the parent process's step
+        # history (rz8.8 e2e finding); the splice is marked by a
+        # "resume_header" record with this process's provenance
+        metrics_stream = MetricsStream(
+            run_dir / "metrics.jsonl", provenance=provenance, append=resume_meta is not None
+        )
 
     def _grad_norm() -> float:
         # Called in the log block AFTER opt.step() and BEFORE the next
