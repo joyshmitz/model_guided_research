@@ -679,6 +679,16 @@ def train(args) -> None:
                 # per step (see the semiring_schedule hook in the training loop).
                 parsed = _parse_semiring_beta_spec(semiring_beta_arg)
                 config.semiring_beta = float(parsed[1])
+                if parsed[0] in ("coverage", "ordinal") and getattr(args, "resume_from", None) is not None:
+                    # the controller/ladder state is NOT in the checkpoint yet:
+                    # resuming would silently restart the beta trajectory and
+                    # break the bitwise-resume guarantee. Refuse loudly until
+                    # the state round-trips (follow-up bead).
+                    raise ValueError(
+                        f"--semiring-beta {parsed[0]}:... cannot resume yet: the schedule controller's "
+                        "state is not checkpointed, so a resumed run would restart its beta trajectory. "
+                        "Use linear/exp (stateless in step) for resumable runs."
+                    )
                 if parsed[0] == "coverage" and len(parsed) == 4:
                     if not config.tropical_record_margins:
                         raise ValueError(

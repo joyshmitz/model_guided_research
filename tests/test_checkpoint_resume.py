@@ -688,3 +688,22 @@ def test_ordinal_beta_mode_e2e_holds_absent_transitions(monkeypatch, tmp_path):
             saw_ordinal = saw_ordinal or "ordinal" in rec
     assert len(betas) >= 10 and all(b == 2.0 for b in betas), betas[:5]
     assert saw_ordinal, "ordinal scheduler telemetry must accompany the beta stream"
+
+
+def test_stateful_beta_modes_refuse_resume(monkeypatch, tmp_path):
+    """Fresh-eyes audit finding: controller/ladder state is not checkpointed,
+    so resuming a coverage/ordinal beta run would silently restart the beta
+    trajectory and break the bitwise-resume guarantee. Until the state
+    round-trips, resume must be refused LOUDLY for those modes."""
+    _run_train(monkeypatch, tmp_path, "stateful-parent", checkpoint_interval=6,
+               attention_type="tropical", semiring_beta="linear:1:8")  # stateless: resumable
+    for spec, extra in (("coverage:1:8:0.5", {"tropical_record_margins": None}),
+                        ("ordinal:1:8", {"scheduler_type": "ordinal"})):
+        args = _train_args(
+            tmp_path, f"stateful-resume-{spec.split(':')[0]}",
+            attention_type="tropical", semiring_beta=spec,
+            resume_from=str(_ckpt_dir(tmp_path, "stateful-parent")), resume_step=5,
+            **extra,
+        )
+        with pytest.raises(ValueError, match="cannot resume yet"):
+            train_mod.train(args)
