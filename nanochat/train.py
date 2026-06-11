@@ -1052,6 +1052,12 @@ def train(args) -> None:
 
     losses: list[float] = []
     val_losses: list[tuple[int, float]] = []  # (step, val_loss) pairs
+    # Tie-locus trend trackers (bead y4r8): first/last certificate coverage
+    # seen during training, promoted into the summary so the registered
+    # hyp-tie-locus-density-decreases observable is adjudicable from the
+    # train artifact alone (metrics.jsonl streams are not engine-readable).
+    route_coverage_first: float | None = None
+    route_coverage_last: float | None = None
     step_times_s: list[float] = []
     last_log_step = -1
 
@@ -1319,6 +1325,9 @@ def train(args) -> None:
                         coverage = _collect_tropical_route_coverage(raw_model)
                         if coverage is not None:
                             record["route_coverage"] = coverage
+                            if route_coverage_first is None:
+                                route_coverage_first = coverage
+                            route_coverage_last = coverage
                     if model_type == "gpt" and getattr(config, "attention_type", None) == "braid":
                         # D2 schema gains the conserved-charge telemetry (u55.3):
                         # Q1 mass-partition defect and Q2 braid-consistency residual
@@ -1470,6 +1479,17 @@ def train(args) -> None:
         tropical = _collect_tropical_margin_stats(raw_model)
         if tropical is not None:
             results["tropical_margins"] = tropical
+        # Tie-locus trend aggregates (bead y4r8): the last forward's coverage
+        # buffer is the true final reading even when the metrics stream is off.
+        final_cov = _collect_tropical_route_coverage(raw_model)
+        if final_cov is not None:
+            route_coverage_last = final_cov
+            if route_coverage_first is None:
+                route_coverage_first = final_cov
+        if route_coverage_first is not None and route_coverage_last is not None:
+            results["route_coverage_first"] = route_coverage_first
+            results["route_coverage_final"] = route_coverage_last
+            results["route_coverage_delta"] = route_coverage_last - route_coverage_first
     attn_entropy = _collect_attn_entropy_stats(raw_model)
     if attn_entropy is not None:
         results["attention_entropy"] = attn_entropy

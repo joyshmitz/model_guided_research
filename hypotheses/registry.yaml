@@ -810,18 +810,17 @@ hypotheses:
     theorem_refs: [thm-tropicalization-of-attention, thm-route-stability]
     prediction: null
     operationalization_note: >-
-      The per-step observable already streams: route_coverage (fraction of
-      routes whose margin clears the route-stability threshold, 8gk.1
-      telemetry) is 1 minus the tie-locus proximity density for tropical runs
-      with annealing enabled. Blocked on an AGGREGATE the verdict engine can
-      read: the train summary.json (mgr.telemetry.v1) records no
-      first-vs-last route_coverage trend, and the engine does not read
-      metrics.jsonl streams. Promote by adding route_coverage_first /
-      route_coverage_final aggregates to the train summary, then predict
-      final > first (per run, >= 3 seeds) plus an absolute final tie fraction
-      <= 0.05. The Haar baseline 1/(p+1) from the theory note calibrates
-      "small" for the hard-digit ultrametric variant when its tie counter
-      lands.
+      PARTIALLY UNBLOCKED (y4r8, 2026-06-11): the train summary now records
+      results.route_coverage_first / route_coverage_final /
+      route_coverage_delta for tropical runs with margins + annealing
+      enabled, so the trend is adjudicable from the artifact alone.
+      Remaining blocker: the verdict engine only evaluates
+      candidate-vs-baseline contrasts and has no within-run trend predicate
+      (the prediction to register once it does: route_coverage_delta > 0 per
+      run, >= 3 seeds, plus final tie fraction 1 - coverage <= 0.05) -
+      engine work folded into bead xas7's scope. The Haar baseline 1/(p+1)
+      from the theory note calibrates "small" for the hard-digit ultrametric
+      variant when its tie counter lands.
     status: blocked
     evidence: []
     verdict_history: []
