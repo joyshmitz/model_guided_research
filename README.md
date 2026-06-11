@@ -776,6 +776,19 @@ mgr bench-fixed-flops \
 
 # Practical utility suite (writes artifacts if --artifacts-dir set)
 mgr eval --artifacts-dir artifacts --run-id util_suite
+
+# Regression gate: compare two run artifacts and FAIL (exit 1) on regressions.
+# Per-metric thresholds (defaults): --loss-abs 0.01, --loss-rel 0.01,
+# --throughput-rel 0.05, --tflops-rel 0.05, --memory-rel 0.05. The gate is
+# opt-in (--fail-on-regression); omit it for exploratory comparisons. Suite
+# summaries take --baseline-variant/--candidate-variant (e.g. attention_type).
+# Writes summary.json + run.md (+ html) under artifacts/regressions/<run-id>/.
+mgr regressions \
+    --baseline artifacts/bench/fixed_flops/nanochat/flops_suite_cpu --baseline-variant standard \
+    --candidate artifacts/bench/fixed_flops/nanochat/flops_suite_cpu --candidate-variant tropical \
+    --fail-on-regression
+# The nightly e2e harness (scripts/e2e_pipeline.py --scenario regression-gate)
+# proves the gate passes self-vs-self and trips on a degraded fixture.
 ```
 
 ### Testing & Validation
