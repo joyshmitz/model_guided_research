@@ -41,6 +41,7 @@ from nanochat.gpt_synaptic import GPTSynaptic, GPTSynapticConfig
 from nanochat.ordinal_scheduler import OrdinalLRScheduler
 from nanochat.report import MetricsStream, build_provenance, get_git_info, get_gpu_info, get_system_info
 from nanochat.synaptic import SynapticConfig
+from nanochat.tropical_attention_torch import set_semiring_beta
 
 console = Console()
 
@@ -148,6 +149,51 @@ def _load_synaptic_config(path: Path) -> SynapticConfig:
     for key, value in raw.items():
         setattr(cfg, key, value)
     return cfg
+
+
+def _parse_semiring_beta_spec(spec: str) -> tuple[str, float, float]:
+    """--semiring-beta spec -> (mode, b0, b1): a plain float is ('const', b, b);
+    'linear:B0:B1' / 'exp:B0:B1' anneal beta from B0 to B1 over the run (the
+    dequantization-annealing schedules of bead 8gk.1)."""
+    s = str(spec).strip()
+    if ":" in s:
+        mode, _, rest = s.partition(":")
+        mode = mode.strip().lower()
+        b0_s, _, b1_s = rest.partition(":")
+        if mode not in ("linear", "exp"):
+            raise ValueError(f"--semiring-beta schedule mode must be linear | exp, got {mode!r}")
+        b0, b1 = float(b0_s), float(b1_s)
+        if not (b0 > 0 and b1 > 0):
+            raise ValueError(f"--semiring-beta schedule endpoints must be > 0, got {b0}, {b1}")
+        return mode, b0, b1
+    b = float(s)
+    if not (b > 0):
+        raise ValueError(f"--semiring-beta must be > 0, got {b}")
+    return "const", b, b
+
+
+def _semiring_beta_at(schedule: tuple[str, float, float], step: int, max_steps: int) -> float:
+    mode, b0, b1 = schedule
+    frac = min(max(step / max(max_steps - 1, 1), 0.0), 1.0)
+    if mode == "linear":
+        return b0 + (b1 - b0) * frac
+    if mode == "exp":
+        return float(b0 * (b1 / b0) ** frac)
+    return b0  # "const"
+
+
+def _collect_tropical_route_coverage(model: torch.nn.Module) -> float | None:
+    """Mean certificate coverage across tropical attention layers (8gk.1):
+    the fraction of routes whose tropical margin clears the route-stability
+    threshold at the current beta. None when no layer has a finite reading."""
+    vals: list[float] = []
+    for module in model.modules():
+        cov = getattr(module, "tropical_route_coverage", None)
+        if torch.is_tensor(cov) and cov.numel() == 1:
+            f = float(cov.item())
+            if math.isfinite(f):
+                vals.append(f)
+    return (sum(vals) / len(vals)) if vals else None
 
 
 def _collect_tropical_margin_stats(model: torch.nn.Module) -> dict[str, Any] | None:
@@ -308,6 +354,12 @@ def _validate_train_args(args, *, ddp_rank: int, device: torch.device) -> None:
         errors.append(f"--ffn-beta must be > 0 when set (got {ffn_beta}); omit it for the exact tropical endpoint.")
     if ffn_beta is not None and ffn_type == "standard":
         warnings.append("--ffn-beta has no effect with --ffn-type standard.")
+    semiring_beta = getattr(args, "semiring_beta", None)
+    if semiring_beta is not None:
+        try:
+            _parse_semiring_beta_spec(semiring_beta)
+        except ValueError as exc:
+            errors.append(str(exc))
 
     if bool(getattr(args, "use_flex_attention", False)) and not hasattr(torch.nn.attention, "flex_attention"):
         errors.append("--use-flex-attention requires torch>=2.5 (missing torch.nn.attention.flex_attention).")
@@ -431,6 +483,10 @@ def train(args) -> None:
                 f"components=model/optim/sched/dataloader/rng"
             )
 
+    # Dequantization-annealing schedule (8gk.1): set while wiring the tropical
+    # config below; consumed once per step in the training loop.
+    semiring_schedule: tuple[str, float, float] | None = None
+
     if model_type == "gpt":
         config = GPTConfig()
         config.n_layer = args.n_layer
@@ -519,11 +575,13 @@ def train(args) -> None:
         tropical_score_center = getattr(args, "tropical_score_center", None)
         tropical_record_margins = getattr(args, "tropical_record_margins", None)
         tropical_log_margins = bool(getattr(args, "tropical_log_margins", False))
+        semiring_beta_arg = getattr(args, "semiring_beta", None)
         if config.attention_type != "tropical":
             if (
                 tropical_gauge_fix is not None
                 or tropical_score_center is not None
                 or tropical_record_margins is not None
+                or semiring_beta_arg is not None
             ) and ddp_rank == 0:
                 print0("[tropical] Ignoring tropical flags because --attention-type is not tropical.")
             if tropical_log_margins and ddp_rank == 0:
@@ -537,6 +595,14 @@ def train(args) -> None:
                 config.tropical_record_margins = bool(tropical_record_margins)
             if tropical_log_margins:
                 config.tropical_record_margins = True
+            if semiring_beta_arg is not None:
+                # Dequantization annealing (8gk.1): constant beta lands in the
+                # config; schedules start at b0 and update live modules per
+                # step (see the semiring_schedule hook in the training loop).
+                mode, b0, b1 = _parse_semiring_beta_spec(semiring_beta_arg)
+                config.semiring_beta = b0
+                if mode != "const":
+                    semiring_schedule = (mode, b0, b1)
     else:
         if args.optimizer_type == "hoss":
             raise ValueError("--optimizer-type hoss is not supported for --model-type synaptic (no HVP closure).")
@@ -987,6 +1053,16 @@ def train(args) -> None:
             for opt in optimizers:
                 opt.zero_grad(set_to_none=True)
 
+            current_semiring_beta: float | None
+            if semiring_schedule is not None:
+                # dequantization annealing (8gk.1): one scalar with algebraic
+                # meaning, updated on the live modules - never model state
+                current_semiring_beta = _semiring_beta_at(semiring_schedule, step, max_steps)
+                set_semiring_beta(raw_model, current_semiring_beta)
+            else:
+                config_beta = getattr(config, "semiring_beta", None)
+                current_semiring_beta = float(config_beta) if config_beta is not None else None
+
             step_t0 = time.perf_counter()
 
             def closure(inputs=inputs, targets=targets):
@@ -1191,6 +1267,17 @@ def train(args) -> None:
                             record["tropical_gamma_min"] = trop_stats.get("gamma_min")
                             record["tropical_gamma_mean"] = trop_stats.get("gamma_mean")
                             record["tropical_gamma_head_mean"] = trop_stats.get("head_mean")
+                    if (
+                        model_type == "gpt"
+                        and getattr(config, "attention_type", None) == "tropical"
+                        and current_semiring_beta is not None
+                    ):
+                        # D2 schema gains the annealing telemetry (8gk.1):
+                        # the smoothing level and the certificate coverage
+                        record["semiring_beta"] = float(current_semiring_beta)
+                        coverage = _collect_tropical_route_coverage(raw_model)
+                        if coverage is not None:
+                            record["route_coverage"] = coverage
                     metrics_stream.write(record)
 
             # Periodic validation evaluation
@@ -1601,6 +1688,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--tropical-log-margins",
         action="store_true",
         help="Tropical attention only: include gamma summary + per-head means in the training log (implies --tropical-record-margins).",
+    )
+    parser.add_argument(
+        "--semiring-beta",
+        type=str,
+        default=None,
+        help=(
+            "Tropical attention only (8gk.1 dequantization annealing): Maslov smoothing level. "
+            "A float fixes beta; 'linear:B0:B1' or 'exp:B0:B1' anneals beta from B0 to B1 over the run "
+            "(beta -> infinity is the exact tropical endpoint; omit the flag for exact tropical). "
+            "With --tropical-record-margins, logs semiring_beta + certificate route_coverage per step."
+        ),
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument(

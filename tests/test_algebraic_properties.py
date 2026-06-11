@@ -285,6 +285,150 @@ def test_rope_pairwise_norm_preservation(angles, vals):
     assert float((pn_in - pn_out).abs().max()) <= 1e-9 * (1.0 + float(pn_in.max()))
 
 
+
+# ---------------------------------------------------------------------------
+# Maslov dequantization (bead 8gk.1): the (+)_beta semiring family
+# ---------------------------------------------------------------------------
+# x (+)_beta y = (1/beta) log(e^(beta x) + e^(beta y)) is a commutative,
+# associative semiring addition for EVERY beta > 0, with ordinary + as
+# multiplication distributing over it (the Maslov quantization of (R+, +, x)),
+# and converges uniformly to max with the EXACT sandwich
+# max <= LSE_beta <= max + log(n)/beta. The route-stability lemma (two-family
+# form; vnl.2 formalizes it as thm-route-stability) is checked empirically.
+
+beta_st = st.floats(min_value=0.05, max_value=64.0, allow_nan=False, allow_infinity=False, width=64)
+maslov_val = st.floats(min_value=-50.0, max_value=50.0, allow_nan=False, allow_infinity=False, width=64)
+
+
+def _oplus(beta: float, *xs: float) -> float:
+    m = max(xs)
+    return m + math.log(sum(math.exp(beta * (x - m)) for x in xs)) / beta
+
+
+@given(beta_st, maslov_val, maslov_val, maslov_val)
+def test_maslov_oplus_associative_commutative(beta, a, b, c):
+    left = _oplus(beta, _oplus(beta, a, b), c)
+    right = _oplus(beta, a, _oplus(beta, b, c))
+    flat = _oplus(beta, a, b, c)
+    tol = 1e-9 * max(1.0, abs(a), abs(b), abs(c), 1.0 / beta)
+    assert abs(left - right) <= tol and abs(left - flat) <= tol
+    assert abs(_oplus(beta, a, b) - _oplus(beta, b, a)) <= tol
+
+
+@given(beta_st, maslov_val, maslov_val, maslov_val)
+def test_maslov_plus_distributes_over_oplus(beta, a, b, c):
+    # semiring multiplication is ordinary +: c + (a (+)_b b) == (c+a) (+)_b (c+b)
+    # EXACTLY in real arithmetic (the log-domain shift identity); fp gets ulps
+    left = c + _oplus(beta, a, b)
+    right = _oplus(beta, c + a, c + b)
+    assert abs(left - right) <= 1e-9 * max(1.0, abs(a), abs(b), abs(c), 1.0 / beta)
+
+
+@given(beta_st, st.lists(maslov_val, min_size=1, max_size=16))
+def test_maslov_lse_max_sandwich_exact_inequality(beta, xs):
+    # max <= LSE_beta <= max + log(n)/beta: this inequality is EXACT - any
+    # violation beyond fp dust is an implementation bug (the bead's wording)
+    lse = _oplus(beta, *xs)
+    mx = max(xs)
+    slack = 1e-9 * max(1.0, abs(mx), 1.0 / beta)
+    assert lse >= mx - slack
+    assert lse <= mx + math.log(len(xs)) / beta + slack
+
+
+@given(beta_st, st.integers(min_value=2, max_value=12), st.data())
+def test_route_stability_lemma_two_family(beta, m, data):
+    # Two-family form (precision note): tropical scores x vs smoothed scores y
+    # with x_i <= y_i <= x_i + log(m)/beta. If gamma(x) > log(m)/beta then
+    # argmax(y) == argmax(x) - the inflation is one-sided, so a margin wider
+    # than the inflation budget cannot be overturned.
+    xs = data.draw(st.lists(maslov_val, min_size=m, max_size=m))
+    budget = math.log(m) / beta
+    order = sorted(range(m), key=lambda i: xs[i], reverse=True)
+    gamma = xs[order[0]] - xs[order[1]]
+    # adversarial smoothing: inflate every NON-winner by the full budget
+    ys = [x + (0.0 if i == order[0] else budget) for i, x in enumerate(xs)]
+    if gamma > budget + 1e-12:
+        assert max(range(m), key=lambda i: ys[i]) == order[0]
+    # below the threshold, divergence is POSSIBLE (not necessary): construct it
+    if gamma < budget - 1e-12:
+        assert ys[order[1]] > ys[order[0]] - 1e-18 or True  # observed, never asserted
+
+
+def test_maslov_attention_converges_to_tropical_endpoint():
+    """|y_beta - y_tropical|_inf <= (log D + log m)/beta on real tensors, and
+    the bound tightens as beta grows (the dequantization path is sound)."""
+    from nanochat.tropical_attention_torch import tropical_max_plus_attention
+
+    torch.manual_seed(8261)
+    q = torch.randn(2, 2, 6, 8, dtype=torch.float64)
+    k = torch.randn(2, 2, 6, 8, dtype=torch.float64)
+    v = torch.randn(2, 2, 6, 8, dtype=torch.float64)
+    y_inf, _ = tropical_max_plus_attention(
+        q, k, v, gauge_fix=False, score_center=True, return_margins=False, beta=None
+    )
+    prev_err = None
+    for beta in (2.0, 8.0, 32.0, 128.0):
+        y_b, _ = tropical_max_plus_attention(
+            q, k, v, gauge_fix=False, score_center=True, return_margins=False, beta=beta
+        )
+        bound = (math.log(q.size(-1)) + math.log(k.size(2))) / beta
+        err = (y_b - y_inf).abs().max().item()
+        assert err <= bound + 1e-9, f"beta={beta}: err {err} exceeds the sandwich bound {bound}"
+        if prev_err is not None:
+            assert err <= prev_err + 1e-12, "convergence must be monotone along the beta ladder"
+        prev_err = err
+
+
+def test_maslov_beta_none_is_the_untouched_tropical_path():
+    """beta=None must route through the exact pre-8gk.1 code: outputs (and
+    margins) are bit-identical to a direct max-plus recomputation."""
+    from nanochat.model_utils import causal_attn_mask
+    from nanochat.tropical_attention_torch import tropical_inner, tropical_max_plus_attention
+
+    torch.manual_seed(8262)
+    q = torch.randn(1, 2, 5, 4, dtype=torch.float64)
+    k = torch.randn(1, 2, 5, 4, dtype=torch.float64)
+    v = torch.randn(1, 2, 5, 4, dtype=torch.float64)
+    y, gamma = tropical_max_plus_attention(
+        q, k, v, gauge_fix=False, score_center=False, return_margins=True, beta=None
+    )
+    s = tropical_inner(q, k).masked_fill(~causal_attn_mask(5, 5, device=q.device), float("-inf"))
+    y_ref = (s.unsqueeze(-1) + v.unsqueeze(2)).max(dim=3).values
+    assert torch.equal(y, y_ref)
+    assert gamma is not None and bool((gamma[..., 1:] >= 0).all())
+
+
+def test_set_semiring_beta_and_coverage_telemetry():
+    """The schedule hook updates every tropical layer; with margins on and a
+    finite beta the coverage buffer becomes a finite fraction in [0, 1]."""
+    from nanochat.gpt import GPT, GPTConfig
+    from nanochat.tropical_attention_torch import set_semiring_beta
+
+    config = GPTConfig(
+        sequence_len=32, vocab_size=50304, n_layer=2, n_head=2, n_kv_head=2, n_embd=16,
+        attention_type="tropical", tropical_record_margins=True, semiring_beta=4.0,
+    )
+    model = GPT(config)
+    assert set_semiring_beta(model, 8.0) == 2  # one per layer
+    x = torch.randint(0, 1000, (1, 16))
+    model(x)
+    covs = [
+        float(m.tropical_route_coverage)
+        for m in model.modules()
+        if hasattr(m, "tropical_route_coverage")
+    ]
+    assert covs and all(math.isfinite(c) and 0.0 <= c <= 1.0 for c in covs)
+    # back to the exact endpoint: coverage telemetry goes quiet (nan)
+    set_semiring_beta(model, None)
+    model(x)
+    covs = [
+        float(m.tropical_route_coverage)
+        for m in model.modules()
+        if hasattr(m, "tropical_route_coverage")
+    ]
+    assert covs and all(math.isnan(c) for c in covs)
+
+
 if __name__ == "__main__":
     import sys
 

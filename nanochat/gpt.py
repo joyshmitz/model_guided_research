@@ -167,6 +167,11 @@ class GPTConfig:
     tropical_gauge_fix: bool = True
     tropical_score_center: bool = True
     tropical_record_margins: bool = False
+    # Maslov smoothing for tropical ATTENTION (8gk.1): None = exact tropical
+    # endpoint (bitwise-identical to the pre-8gk.1 path); finite beta>0
+    # selects the (+)_beta semiring family. Annealing schedules update live
+    # modules per step via set_semiring_beta; this is the initial value.
+    semiring_beta: float | None = None
     # FFN structure (bead 8gk.8): the semiring design axis extended past attention.
     # "standard" = ReLU^2 MLP; "tropical" = pure max-plus stack (1-Lipschitz,
     # closes the certified chain's MLP hole); "tropical-rational" = difference
@@ -401,6 +406,11 @@ class GPT(nn.Module):
         ffn_beta = getattr(self.config, "ffn_beta", None)
         if ffn_beta is not None and not (float(ffn_beta) > 0):
             raise ValueError(f"ffn_beta must be None or > 0, got {ffn_beta!r}")
+        semiring_beta = getattr(self.config, "semiring_beta", None)
+        if semiring_beta is not None and not (float(semiring_beta) > 0):
+            raise ValueError(f"semiring_beta must be None or > 0, got {semiring_beta!r}")
+        if semiring_beta is not None and getattr(self.config, "attention_type", "standard") != "tropical":
+            raise ValueError("semiring_beta applies to the tropical attention path only (8gk.1)")
 
         ca_rule = getattr(self.config, "ca_init_rule", None)
         if isinstance(ca_rule, str):

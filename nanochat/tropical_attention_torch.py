@@ -186,9 +186,24 @@ def tropical_max_plus_attention(
     gauge_fix: bool,
     score_center: bool,
     return_margins: bool,
+    beta: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
-    Pure max-plus (tropical) attention with optional gauge-fixing and margin certificates.
+    Pure max-plus (tropical) attention with optional gauge-fixing and margin
+    certificates - and, with finite `beta`, its Maslov dequantization (bead
+    8gk.1): every max is replaced by the (+)_beta semiring addition
+    x (+)_beta y = (1/beta) log(e^(beta x) + e^(beta y)), and the value
+    aggregation is NORMALIZED by semiring division (an LSE subtraction):
+
+        y_d = (1/beta)[LSE_k beta(s_k + v_kd)] - (1/beta)[LSE_k beta s_k]
+
+    beta=None is the EXACT tropical endpoint (this code path is bitwise
+    identical to the pre-8gk.1 implementation); beta -> infinity converges to
+    it uniformly with rate log(arity)/beta (the LSE-max sandwich,
+    thm-lse-max-sandwich). Tropical attention WITH score centering is the
+    beta=infinity shadow of softmax normalization: the LSE normalizer above
+    degenerates to subtracting max_k s_k, which is exactly what score_center
+    does. Theory: markdown_documentation/maslov_dequantization_annealing.md.
 
     Shapes:
       q: (B, H, Tq, D)
@@ -197,7 +212,10 @@ def tropical_max_plus_attention(
 
     Returns:
       y: (B, H, Tq, D)
-      gamma: optional per-token, per-head runner-up margin (B, H, Tq) (>=0), or None if disabled.
+      gamma: optional per-token, per-head runner-up margin (B, H, Tq) (>=0),
+        or None if disabled. With finite beta the margins are computed from
+        the TROPICAL (hard) scores - the two-family route-stability lemma
+        compares smoothed routing against exactly these margins.
     """
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("tropical_max_plus_attention expects q/k/v of shape (B, H, T, D)")
@@ -207,6 +225,8 @@ def tropical_max_plus_attention(
         )
     if q.shape[0] != k.shape[0] or q.shape[1] != k.shape[1] or q.shape[3] != k.shape[3]:
         raise ValueError(f"tropical_max_plus_attention head shapes mismatch: q={q.shape}, k={k.shape}, v={v.shape}")
+    if beta is not None and not (beta > 0):
+        raise ValueError(f"beta must be None (exact tropical) or > 0, got {beta}")
 
     B, H, Tq, D = q.shape
     Tk = k.size(2)
@@ -216,35 +236,93 @@ def tropical_max_plus_attention(
         k = _tropical_center(k, dim=-1)
         v = _tropical_center(v, dim=-1)
 
-    # Similarity/logits: score(q,k) = max_d (q_d + k_d)  (max-plus dot product)
-    attn_scores = tropical_inner(q, k)  # (B, H, Tq, Tk)
-
     mask = causal_attn_mask(Tq, Tk, device=q.device)
-    attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
 
-    # Score-centering is a pure gauge change (per-query constant shift): it preserves argmax structure.
+    if beta is None:
+        # Similarity/logits: score(q,k) = max_d (q_d + k_d)  (max-plus dot product)
+        attn_scores = tropical_inner(q, k)  # (B, H, Tq, Tk)
+        attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
+
+        # Score-centering is a pure gauge change (per-query constant shift): it preserves argmax structure.
+        if score_center:
+            attn_scores = attn_scores - attn_scores.amax(dim=-1, keepdim=True)
+
+        # Value aggregation: y_d = max_k (score(q,k) + v_{k,d})  (tropical matmul)
+        logits = attn_scores.unsqueeze(-1) + v.unsqueeze(2)  # (B, H, Tq, Tk, D)
+        gamma: torch.Tensor | None
+        if return_margins:
+            if Tk >= 2:
+                top2 = torch.topk(logits, k=2, dim=3).values  # (B, H, Tq, 2, D)
+                y = top2[..., 0, :]
+                margin_d = top2[..., 0, :] - top2[..., 1, :]  # (B, H, Tq, D)
+                gamma = margin_d.amin(dim=-1)  # (B, H, Tq)
+            else:
+                y = torch.max(logits, dim=3).values
+                gamma = torch.full((B, H, Tq), float("inf"), device=y.device, dtype=y.dtype)
+        else:
+            y = torch.max(logits, dim=3).values
+            gamma = None
+
+        if gauge_fix:
+            y = _tropical_center(y, dim=-1)
+        return y, gamma
+
+    # ---- finite beta: the Maslov-smoothed family (8gk.1) ----
+    # Score stage: (+)_beta inner product over the head dim (inner arity D);
+    # -inf masking is exact in both semirings (e^{beta * -inf} = 0).
+    attn_scores = torch.logsumexp(beta * (q.unsqueeze(-2) + k.unsqueeze(-3)), dim=-1) / beta
+    attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
+    # At finite beta the per-query shift cancels EXACTLY in the normalized
+    # difference below; applying it anyway buys floating-point headroom and
+    # keeps the beta=inf shadow statement aligned.
     if score_center:
         attn_scores = attn_scores - attn_scores.amax(dim=-1, keepdim=True)
 
-    # Value aggregation: y_d = max_k (score(q,k) + v_{k,d})  (tropical matmul)
-    logits = attn_scores.unsqueeze(-1) + v.unsqueeze(2)  # (B, H, Tq, Tk, D)
-    gamma: torch.Tensor | None
+    z = beta * attn_scores  # (B, H, Tq, Tk)
+    norm = torch.logsumexp(z, dim=-1, keepdim=True)  # semiring mass of the scores
+    y = (torch.logsumexp(z.unsqueeze(-1) + beta * v.unsqueeze(2), dim=3) - norm) / beta
+
+    gamma = None
     if return_margins:
+        # Certificate margins come from the TROPICAL scores of the same
+        # q/k/v (the two-family lemma: smoothed routing is argmax-identical
+        # to tropical routing wherever gamma exceeds the smoothing budget).
+        hard_scores = tropical_inner(q, k).masked_fill(~mask, float("-inf"))
+        if score_center:
+            hard_scores = hard_scores - hard_scores.amax(dim=-1, keepdim=True)
+        hard_logits = hard_scores.unsqueeze(-1) + v.unsqueeze(2)
         if Tk >= 2:
-            top2 = torch.topk(logits, k=2, dim=3).values  # (B, H, Tq, 2, D)
-            y = top2[..., 0, :]
-            margin_d = top2[..., 0, :] - top2[..., 1, :]  # (B, H, Tq, D)
-            gamma = margin_d.amin(dim=-1)  # (B, H, Tq)
+            top2 = torch.topk(hard_logits, k=2, dim=3).values
+            gamma = (top2[..., 0, :] - top2[..., 1, :]).amin(dim=-1)
         else:
-            y = torch.max(logits, dim=3).values
             gamma = torch.full((B, H, Tq), float("inf"), device=y.device, dtype=y.dtype)
-    else:
-        y = torch.max(logits, dim=3).values
-        gamma = None
 
     if gauge_fix:
         y = _tropical_center(y, dim=-1)
     return y, gamma
+
+
+def route_stability_threshold(beta: float, head_dim: int, visible: torch.Tensor) -> torch.Tensor:
+    """The conservative compositional certificate threshold (8gk.1): a
+    tropical route with margin gamma survives Maslov smoothing at level beta
+    when gamma > (log D + log m)/beta - log(D)/beta bounds the one-sided
+    score-stage inflation (inner arity D = head_dim), log(m)/beta the value
+    aggregation sandwich (m = keys visible to the query). `visible` is the
+    per-query visible-key count tensor; returns the matching threshold tensor.
+    """
+    return (math.log(max(head_dim, 1)) + torch.log(visible.clamp_min(1).to(torch.float32))) / beta
+
+
+def set_semiring_beta(model: nn.Module, beta: float | None) -> int:
+    """Set the Maslov smoothing level on every tropical attention module (the
+    dequantization-annealing schedule's per-step hook; train.py owns the
+    schedule). Returns the number of modules updated."""
+    n = 0
+    for module in model.modules():
+        if isinstance(module, TropicalCausalSelfAttention):
+            module.semiring_beta = None if beta is None else float(beta)
+            n += 1
+    return n
 
 
 class TropicalCausalSelfAttention(AttentionCore):
@@ -253,6 +331,13 @@ class TropicalCausalSelfAttention(AttentionCore):
         self.tropical_gauge_fix = bool(getattr(config, "tropical_gauge_fix", True))
         self.tropical_score_center = bool(getattr(config, "tropical_score_center", True))
         self.tropical_record_margins = bool(getattr(config, "tropical_record_margins", False))
+        # Maslov smoothing level (8gk.1): None = exact tropical endpoint;
+        # finite values are set per-step by the dequantization-annealing
+        # schedule via set_semiring_beta (a plain attribute, never state)
+        beta = getattr(config, "semiring_beta", None)
+        self.semiring_beta: float | None = None if beta is None else float(beta)
+        if self.semiring_beta is not None and not (self.semiring_beta > 0):
+            raise ValueError(f"semiring_beta must be None or > 0, got {self.semiring_beta}")
         self.register_buffer(
             "tropical_gamma_head_mean",
             torch.full((self.n_head,), float("nan"), dtype=torch.float32),
@@ -268,6 +353,14 @@ class TropicalCausalSelfAttention(AttentionCore):
             torch.tensor(float("nan"), dtype=torch.float32),
             persistent=False,
         )
+        # fraction of (token, head) routes whose tropical margin exceeds the
+        # route-stability threshold at the CURRENT beta (nan when beta=None
+        # or margins are off) - the certificate-coverage telemetry (8gk.1)
+        self.register_buffer(
+            "tropical_route_coverage",
+            torch.tensor(float("nan"), dtype=torch.float32),
+            persistent=False,
+        )
 
     def attend(self, q, k, v, *, kv_cache, pos0):
         # Causal masking lives inside tropical_max_plus_attention (-inf is
@@ -280,7 +373,27 @@ class TropicalCausalSelfAttention(AttentionCore):
             gauge_fix=self.tropical_gauge_fix,
             score_center=self.tropical_score_center,
             return_margins=self.tropical_record_margins,
+            beta=self.semiring_beta,
         )
+        if gamma is not None and self.semiring_beta is not None:
+            with torch.no_grad():
+                # visible keys per query under the causal mask: rows pos0+1..
+                Tq, Tk = q.size(2), k.size(2)
+                visible = torch.arange(Tk - Tq + 1, Tk + 1, device=gamma.device)  # (Tq,)
+                threshold = route_stability_threshold(self.semiring_beta, q.size(-1), visible)
+                gamma_f = gamma.to(torch.float32)
+                finite = torch.isfinite(gamma_f)
+                covered = (gamma_f > threshold.view(1, 1, -1)) & finite
+                total = finite.sum()
+                coverage = covered.sum().to(torch.float32) / total.clamp_min(1).to(torch.float32)
+                self.tropical_route_coverage.copy_(
+                    coverage if int(total) > 0 else torch.tensor(float("nan"))
+                )
+        else:
+            # exact endpoint or margins off: no live reading - never leave a
+            # stale coverage value behind for the telemetry collector
+            with torch.no_grad():
+                self.tropical_route_coverage.fill_(float("nan"))
         if gamma is not None:
             gamma_f = gamma.to(dtype=torch.float32)
             with torch.no_grad():

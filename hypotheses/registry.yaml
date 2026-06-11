@@ -666,3 +666,17 @@ hypotheses:
     status: blocked
     evidence: []
     verdict_history: []
+
+  - id: hyp-maslov-anneal-loss-retention
+    statement: >-
+      Dequantization annealing (train tropical attention with a beta schedule to the tropical endpoint) retains at least 95 percent of the smooth-start model's quality at matched budget, and its certificate coverage far exceeds post-hoc snap (train soft, discretize at the end).
+    mechanisms: [tropical]
+    source:
+      kind: model
+      provenance: "8gk.1 theory note (markdown_documentation/maslov_dequantization_annealing.md section 4); the anneal-vs-snap contrast is the bead's preregistered experiment"
+    date_registered: "2026-06-11"
+    prediction: null
+    operationalization_note: "needs an arm selector for semiring_beta schedules: the verdict engine distinguishes arms by attention_type/scheduler/optimizer only, so annealed-vs-fixed-beta tropical runs are indistinguishable as evidence; extend arm detection (or the bench variant selector) before operationalizing thresholds"
+    status: blocked
+    evidence: []
+    verdict_history: []

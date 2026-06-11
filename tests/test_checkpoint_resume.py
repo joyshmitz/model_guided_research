@@ -510,3 +510,35 @@ def test_metrics_stream_append_preserves_history_across_resume(tmp_path):
     assert steps == [0, 1, 2, 3, 4, 5], "pre-kill history must survive the resume"
     splices = [r for r in records if r.get("type") == "resume_header"]
     assert len(splices) == 1 and splices[0]["config_hash"] == "h2", "splice must carry the resumer's provenance"
+
+
+def test_dequantization_annealing_schedule_telemetry(monkeypatch, tmp_path):
+    """8gk.1 e2e smoke: a tropical run with --semiring-beta linear:1:32 logs a
+    monotone beta ladder and certificate route_coverage per step, and the
+    schedule actually reaches its endpoint."""
+    import json as json_mod
+
+    monkeypatch.setattr(
+        train_mod, "tokenizing_distributed_data_loader_with_state", _fake_loader_factory()
+    )
+    monkeypatch.setattr(train_mod, "list_parquet_files", lambda data_dir=None: ["a.parquet", "b.parquet"])
+    args = _train_args(
+        tmp_path, "anneal-smoke",
+        attention_type="tropical",
+        semiring_beta="linear:1:32",
+        tropical_record_margins=None,  # store_true flag
+        log_interval="1",
+    )
+    train_mod.train(args)
+    metrics = tmp_path / "artifacts" / "baseline" / "nanochat" / "anneal-smoke" / "metrics.jsonl"
+    betas, coverages = [], []
+    for line in metrics.read_text().splitlines():
+        rec = json_mod.loads(line)
+        if "semiring_beta" in rec:
+            betas.append(rec["semiring_beta"])
+        if "route_coverage" in rec:
+            coverages.append(rec["route_coverage"])
+    assert len(betas) >= 10, f"expected per-step beta telemetry, got {len(betas)} records"
+    assert all(b2 >= b1 for b1, b2 in zip(betas, betas[1:], strict=False)), "beta must anneal monotonically"
+    assert abs(betas[0] - 1.0) < 1e-6 and abs(betas[-1] - 32.0) < 1e-6, (betas[0], betas[-1])
+    assert coverages and all(0.0 <= c <= 1.0 for c in coverages), "coverage must be a fraction when margins are on"
