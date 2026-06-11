@@ -636,3 +636,55 @@ def test_coverage_spec_requires_margins(monkeypatch, tmp_path):
     )
     with pytest.raises(ValueError, match="tropical-record-margins"):
         train_mod.train(args)
+
+
+def test_ordinal_beta_ladder_transitions_exact():
+    """9jzb ordinal mode: beta doubles (capped) exactly on (A, B) descents -
+    the ordinal scheduler's anneal/restart events - and holds otherwise."""
+    ladder = train_mod._OrdinalBetaLadder(1.0, 8.0)
+    assert ladder.step(2, 3) == 1.0      # first observation initializes, no event
+    assert ladder.step(2, 3) == 1.0      # no descent -> hold
+    assert ladder.step(2, 2) == 2.0      # anneal (B descent) -> double
+    assert ladder.step(2, 2) == 2.0      # hold
+    assert ladder.step(1, 3) == 4.0      # restart (A descent, B reset) -> double
+    assert ladder.step(1, 2) == 8.0      # anneal -> double, hits cap
+    assert ladder.step(1, 1) == 8.0      # capped at BMAX
+    assert train_mod._parse_semiring_beta_spec("ordinal:1:8") == ("ordinal", 1.0, 8.0)
+
+
+def test_ordinal_beta_mode_requires_ordinal_scheduler(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        train_mod, "tokenizing_distributed_data_loader_with_state", _fake_loader_factory()
+    )
+    monkeypatch.setattr(train_mod, "list_parquet_files", lambda data_dir=None: ["a.parquet", "b.parquet"])
+    args = _train_args(tmp_path, "ord-beta-no-sched", attention_type="tropical", semiring_beta="ordinal:1:8")
+    with pytest.raises(ValueError, match="scheduler-type ordinal"):
+        train_mod.train(args)
+
+
+def test_ordinal_beta_mode_e2e_holds_absent_transitions(monkeypatch, tmp_path):
+    """With default patience no ordinal event fires in 12 steps: beta must
+    hold at B0 the whole run (the transfinite clock, not the step clock)."""
+    import json as json_mod
+
+    monkeypatch.setattr(
+        train_mod, "tokenizing_distributed_data_loader_with_state", _fake_loader_factory()
+    )
+    monkeypatch.setattr(train_mod, "list_parquet_files", lambda data_dir=None: ["a.parquet", "b.parquet"])
+    args = _train_args(
+        tmp_path, "ord-beta-smoke",
+        attention_type="tropical",
+        semiring_beta="ordinal:2:16",
+        scheduler_type="ordinal",
+        log_interval="1",
+    )
+    train_mod.train(args)
+    metrics = tmp_path / "artifacts" / "baseline" / "nanochat" / "ord-beta-smoke" / "metrics.jsonl"
+    betas, saw_ordinal = [], False
+    for line in metrics.read_text().splitlines():
+        rec = json_mod.loads(line)
+        if "semiring_beta" in rec:
+            betas.append(rec["semiring_beta"])
+            saw_ordinal = saw_ordinal or "ordinal" in rec
+    assert len(betas) >= 10 and all(b == 2.0 for b in betas), betas[:5]
+    assert saw_ordinal, "ordinal scheduler telemetry must accompany the beta stream"
