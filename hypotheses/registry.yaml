@@ -939,9 +939,10 @@ hypotheses:
         cannot coexist with a collapsed separation. The layer-stack drift
         test and the live metrics telemetry remain the per-commit / per-step
         enforcement.
-    status: open
+    status: supported
     evidence: []
-    verdict_history: []
+    verdict_history:
+      - {date: "2026-06-11", verdict: supported, artifacts: ["artifacts/certs/nanochat/cert-braid-s0/summary.json", "artifacts/certs/nanochat/cert-braid-s1/summary.json", "artifacts/certs/nanochat/cert-braid-s2/summary.json"], adjudicator: "engine:ci-v3", policy_version: "ci-v3", arms: {"braid": {"budget_flops": null, "ci95": [9.5367431640625e-07, 9.5367431640625e-07], "effect": 9.5367431640625e-07, "n_baseline": 0, "n_candidate": 3, "single_arm": true, "verdict": "supported"}}}
 
   - id: hyp-rmatrix-charge-decodability
     statement: >-
