@@ -57,12 +57,34 @@ def log0(message):
         logger.info(message)
 
 
+def _atomic_torch_save(obj, path):
+    tmp_path = path + ".tmp"
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
+
+
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+    """Write a checkpoint with crash-safe ordering: every file lands via
+    tmp-write + atomic rename, and meta_<step>.json is written LAST - its
+    existence is the COMMIT POINT. find_last_step/resume discover checkpoints
+    through the meta file, so a SIGKILL mid-save can never expose a truncated,
+    half-written checkpoint as resumable (the rz8.8 e2e resume scenario hit
+    exactly that: a torn optim_*.pt picked up by --resume-from latest).
+    NOTE: under multi-rank DDP, non-zero ranks' optimizer shards can still be
+    in flight when rank 0 commits the meta; a cross-rank barrier before the
+    meta write is the future-proof fix when sharded training lands for real.
+    """
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    # Optimizer state is sharded across ranks, so each rank saves its own -
+    # and it must land BEFORE the meta commit point below.
+    if optimizer_data is not None:
+        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
+        _atomic_torch_save(optimizer_data, optimizer_path)
+        logger.info(f"Saved optimizer state to: {optimizer_path}")
     if rank == 0:
-        os.makedirs(checkpoint_dir, exist_ok=True)
         # Save the model state parameters
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-        torch.save(model_data, model_path)
+        _atomic_torch_save(model_data, model_path)
         logger.info(f"Saved model parameters to: {model_path}")
         # Ensure meta_data exists and mark synaptic models
         meta_data = meta_data or {}
@@ -77,16 +99,13 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
             ]
             if synaptic_keys:
                 meta_data["synapses"] = True
-        # Save the metadata dict as json
+        # Save the metadata dict as json - LAST, atomically: the commit point
         meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-        with open(meta_path, "w", encoding="utf-8") as f:
+        tmp_meta = meta_path + ".tmp"
+        with open(tmp_meta, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
+        os.replace(tmp_meta, meta_path)
         logger.info(f"Saved metadata to: {meta_path}")
-    # Note that optimizer state is sharded across ranks, so each rank must save its own.
-    if optimizer_data is not None:
-        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        torch.save(optimizer_data, optimizer_path)
-        logger.info(f"Saved optimizer state to: {optimizer_path}")
 
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):

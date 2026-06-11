@@ -1,0 +1,48 @@
+name: E2E Pipeline (nightly)
+
+# The full research-loop integration scenarios (bead rz8.8): too slow for
+# per-PR CI, run nightly + on demand. scripts/e2e_pipeline.py is the same
+# entrypoint used locally - see its module docstring for the scenarios.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 7 * * *"  # nightly, off the top of the hour
+
+env:
+  PYTHON_VERSION: "3.13"
+  UV_CACHE_DIR: /tmp/.uv-cache
+
+jobs:
+  e2e:
+    name: e2e research-loop scenarios
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Run all e2e scenarios
+        run: uv run python scripts/e2e_pipeline.py --scenario all --workdir "$RUNNER_TEMP/e2e" --resume-kill-seed 1337
+
+      - name: Upload e2e reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-reports
+          path: |
+            ${{ runner.temp }}/e2e/reports/
+            ${{ runner.temp }}/e2e/logs/
+          retention-days: 14

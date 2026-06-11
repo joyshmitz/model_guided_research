@@ -150,9 +150,20 @@ python -m nanochat.train \
     --batch-size 8 \
     --learning-rate 6e-4 \
     --optimizer-type adamw \
-    --attention-type tropical
+    --attention-type tropical \
+    --checkpoint-interval 200 \
+    --run-id quicktour
 
-# 3. Compare HOSS optimizer with quaternion attention
+# 3. Sample from the trained checkpoint (streaming; add --compare DIR for
+#    side-by-side mechanism panels). Expectation: research-scale models
+#    produce barely-coherent text - judge mechanisms RELATIVELY at matched
+#    budgets, never by absolute prose quality.
+mgr sample \
+    --checkpoint artifacts/baseline/nanochat/quicktour/checkpoints \
+    --prompt "TASK arith CMP 1.00e-02 2.00e+03 OUT" \
+    --max-tokens 16
+
+# 4. Compare HOSS optimizer with quaternion attention
 python -m nanochat.train \
     --batch-size 8 \
     --learning-rate 1e-3 \
@@ -160,7 +171,7 @@ python -m nanochat.train \
     --attention-type quaternion \
     --scheduler-type ordinal
 
-# 4. Run comprehensive test suite
+# 5. Run comprehensive test suite
 python tests/test_practical_utility.py
 ```
 

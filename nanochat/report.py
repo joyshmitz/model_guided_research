@@ -149,16 +149,24 @@ class MetricsStream:
     attributable artifact; step records buffer in memory and flush every
     `flush_every` records, at val evaluations, and on close() — the caller
     closes inside try/finally so KeyboardInterrupt still lands the buffer.
+
+    A RESUMED run must pass append=True: the stream then appends to the
+    existing file instead of truncating it (a resume previously erased the
+    parent process's entire step history — found by the rz8.8 e2e resume
+    scenario), and marks the splice with a "resume_header" record carrying
+    the resuming process's provenance, so each segment of the trajectory
+    stays attributable to its commit.
     """
 
-    def __init__(self, path: Any, *, provenance: dict[str, Any], flush_every: int = 50):
+    def __init__(self, path: Any, *, provenance: dict[str, Any], flush_every: int = 50, append: bool = False):
         import json as json_mod
 
         self._json = json_mod
         self._flush_every = max(1, int(flush_every))
         self._buffer: list[str] = []
-        self._fh = open(path, "w", encoding="utf-8")  # noqa: SIM115 - lifetime managed by close()
-        header = {"type": "header", **provenance}
+        mode = "a" if append else "w"
+        self._fh = open(path, mode, encoding="utf-8")  # noqa: SIM115 - lifetime managed by close()
+        header = {"type": "resume_header" if append else "header", **provenance}
         self._fh.write(self._json.dumps(header, sort_keys=True) + "\n")
         self._fh.flush()
 
