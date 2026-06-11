@@ -180,6 +180,58 @@ def test_nanochat_braid_discrete_mode_records_schedule_and_matches_kv_cache():
     require(order.shape[-1] == ids.size(1), "Expected schedule to cover all causal keys for the last token")
 
 
+def test_nanochat_braid_rmatrix_kv_cache_parity_and_charges():
+    """R-matrix braid law (u55.3): KV-cache decode parity + conserved-charge telemetry.
+
+    The integrable law must satisfy the house decode contract AND report a
+    mass-partition defect (Q1) at fp32 noise level and a braid-consistency
+    residual (Q2) at fp64 noise level - the two-charge fingerprint that
+    separates integrable from heuristic mixing.
+    """
+    import torch
+
+    from nanochat.engine import KVCache
+    from nanochat.gpt import GPT, GPTConfig
+
+    torch.manual_seed(0)
+    config = GPTConfig(
+        sequence_len=16,
+        vocab_size=128,
+        n_layer=2,
+        n_head=4,
+        n_kv_head=2,  # exercise GQA paths
+        n_embd=64,
+        attention_type="braid",
+        braid_crossing_law="rmatrix",
+        braid_verify=True,
+    )
+    model = GPT(config).train(False)
+
+    ids = torch.randint(0, config.vocab_size, (1, 8), dtype=torch.long)
+    with torch.inference_mode():
+        full_last = model(ids)[:, -1, :].float()
+
+        kv_cache = KVCache(
+            batch_size=1,
+            num_heads=config.n_kv_head,
+            seq_len=ids.size(1),
+            head_dim=config.n_embd // config.n_head,
+            num_layers=config.n_layer,
+        )
+        _ = model(ids[:, :-1], kv_cache=kv_cache)
+        cached_last = model(ids[:, -1:], kv_cache=kv_cache)[:, -1, :].float()
+
+    torch.testing.assert_close(cached_last, full_last, rtol=1e-3, atol=1e-2)
+
+    attn0 = model.transformer["h"][0].attn
+    charges = getattr(attn0, "last_braid_charges", None)
+    require(isinstance(charges, dict), "Expected rmatrix attention to record last_braid_charges")
+    require(charges["crossing_law"] == "rmatrix", "Expected the rmatrix law fingerprint")
+    require(float(charges["q1_mass_defect"]) < 1e-5, f"Q1 mass defect too large: {charges['q1_mass_defect']}")
+    require(float(charges["q2_braid_residual"]) < 1e-10, f"Q2 braid residual too large: {charges['q2_braid_residual']}")
+    require(isinstance(charges["eta"], list) and len(charges["eta"]) == config.n_head, "Expected per-head eta")
+
+
 def test_nanochat_standard_attention_entropy_records_per_head_stats():
     """Standard attention should optionally record a finite per-head entropy summary."""
     import torch

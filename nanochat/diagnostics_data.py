@@ -109,6 +109,12 @@ class TaskSpec:
     answer_marker: str | None = None
     difficulty_axis: str | None = None
     difficulty: Callable[[str], float] | None = None
+    # Optional per-doc category extractor (bead u55.3): tasks that mix sub-
+    # populations with different theoretical status (the group task mixes
+    # non-solvable S5/A5 with solvable Z60/S3 controls) expose the label so the
+    # eval harness can fit per-category extrapolation slopes - the preregistered
+    # mechanism-specificity predictions adjudicate on exactly that breakdown.
+    category: Callable[[str], str | None] | None = None
 
     def split_prompt(self, doc: str) -> tuple[str, str] | None:
         """(prompt-including-marker, expected answer) or None for LM-only docs."""
@@ -707,6 +713,13 @@ def check_group(text: str) -> bool | None:
     return parts[oi + 1] == f"e{_GROUP_ELEMENT_INDEX[group][result]}"
 
 
+def _category_group(text: str) -> str | None:
+    parts = text.split()
+    if parts[:2] != ["TASK", "group"] or len(parts) < 4 or parts[2] != "G":
+        return None
+    return parts[3]
+
+
 def _gen_group(size: int, seed: int, dials: dict[str, float]) -> dict[str, list[str]]:
     base_len = int(dials["length"])
     groups = ["s5", "a5", "z60", "s3"]
@@ -1070,6 +1083,7 @@ TASKS: dict[str, TaskSpec] = {
             answer_marker="OUT",
             difficulty_axis="word_length",
             difficulty=_difficulty_span("SEQ", "OUT"),
+            category=_category_group,
         ),
         TaskSpec(
             name="bag",

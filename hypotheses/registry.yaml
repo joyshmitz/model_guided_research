@@ -602,9 +602,12 @@ hypotheses:
     theorem_refs: [thm-ybe-transfer-commutativity]
     prediction: null
     operationalization_note: >-
-      the discriminating contrast (integrable/R-matrix attention vs the zoo)
-      needs u55.3 to land its mechanism; until then the group task only
-      establishes the baseline curves.
+      u55.3 landed the rmatrix mechanism (2026-06-11), so the discriminating
+      contrast is now runnable; the mechanism-level slope predictions live in
+      hyp-rmatrix-s5-length-slope / hyp-rmatrix-solvable-control-specificity.
+      This entry remains the zoo-wide universal claim, which still needs the
+      full baseline-curves campaign (every mechanism's S5/A5 vs Z60/S3 curves)
+      before it can be operationalized as a single prediction.
     status: blocked
     evidence: []
     verdict_history: []
@@ -747,5 +750,225 @@ hypotheses:
       min_seeds: 5
       scale_caveats: "E1 rung; the observed ratio ~0.55 leaves wide margin; if supported, hyp-placebo-no-winner will trip on surreal BY DESIGN and the 2x-budget root-cause run is mandatory before publication-grade claims"
     status: open
+    evidence: []
+    verdict_history: []
+
+  # ---------------------------------------------------------------------------
+  # The valuation dictionary (bead 8gk.2). The mathematical content is in
+  # hypotheses/theorems.yaml (thm-valued-attention-structure,
+  # thm-tropicalization-of-attention, thm-balltree-exact-attention); these two
+  # entries are the EMPIRICAL predictions the dictionary makes about training
+  # and serving, registered before any campaign.
+  # ---------------------------------------------------------------------------
+  - id: hyp-balltree-valued-attention-speedup
+    statement: >-
+      Ball-tree valued attention (the exact O(K)-per-query LCP-shell algorithm
+      of thm-balltree-exact-attention, hard-digit mode) matches kernel-mode
+      ultrametric attention quality on hierarchical retrieval (the hier task)
+      while delivering at least a 4x wall-clock advantage at context length
+      T = 4096 - because the two compute the SAME function (exactness is a
+      partition identity), the quality match is a correctness check and the
+      speedup is the entire claim.
+    mechanisms: [ultrametric]
+    source:
+      kind: model
+      provenance: "EPIC THEORY-I 8gk.2 (the algorithmic payoff); theory note the_valuation_dictionary.md section 4; demo-level prototype + measured timing table in ultrametric_worlds_and_p_adic_computation.py (run_valued_attention_section)"
+    date_registered: "2026-06-11"
+    theorem_refs: [thm-balltree-exact-attention, thm-lcp-is-padic-valuation]
+    prediction: null
+    operationalization_note: >-
+      Blocked on the torch serving/training port of the ball-tree path (the E3
+      follow-on): the demo prototype proves exactness (== vs brute force) and
+      measures the per-query advantage at N up to 4096 on CPU, but the
+      preregistered claim compares mgr eval-tasks hier quality + a schema'd
+      wall-clock benchmark of the TORCH kernel-mode vs ball-tree paths at
+      T = 4096, which requires (a) a trie/ball-tree decode+train path in
+      nanochat/ultrametric_attention_torch.py beyond the current CPU
+      decode-only trie, and (b) a versioned perf artifact for wall-clock
+      (the same blocker as hyp-ultrametric-trie-decode-speedup). Protocol when
+      promoted: >= 3 seeds per arm, hier exact-match parity within CI (the
+      arms compute the same function in hard-digit mode - any gap is a bug,
+      not a finding), wall-clock ratio >= 4.0 at T = 4096.
+    status: blocked
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-tie-locus-density-decreases
+    statement: >-
+      The tie-locus density - the fraction of attention routing decisions
+      sitting on the cancellation locus / tropical variety (margins within the
+      route-stability threshold of switching) - is small throughout training
+      and DECREASES as training progresses: the model learns to avoid its own
+      decision boundaries. This is the novel observable the valuation
+      dictionary makes measurable: the tie locus is exactly where the
+      tropicalization theorem's genericity fails and routes switch.
+    mechanisms: [tropical, ultrametric]
+    source:
+      kind: model
+      provenance: "EPIC THEORY-I 8gk.2 (registry predictions); theory note the_valuation_dictionary.md section 3 (the cancellation locus is the tropical variety; Haar-random baseline 1/(p+1) for binary sums)"
+    date_registered: "2026-06-11"
+    theorem_refs: [thm-tropicalization-of-attention, thm-route-stability]
+    prediction: null
+    operationalization_note: >-
+      The per-step observable already streams: route_coverage (fraction of
+      routes whose margin clears the route-stability threshold, 8gk.1
+      telemetry) is 1 minus the tie-locus proximity density for tropical runs
+      with annealing enabled. Blocked on an AGGREGATE the verdict engine can
+      read: the train summary.json (mgr.telemetry.v1) records no
+      first-vs-last route_coverage trend, and the engine does not read
+      metrics.jsonl streams. Promote by adding route_coverage_first /
+      route_coverage_final aggregates to the train summary, then predict
+      final > first (per run, >= 3 seeds) plus an absolute final tie fraction
+      <= 0.05. The Haar baseline 1/(p+1) from the theory note calibrates
+      "small" for the hard-digit ultrametric variant when its tie counter
+      lands.
+    status: blocked
+    evidence: []
+    verdict_history: []
+
+  # ---------------------------------------------------------------------------
+  # Integrable attention (braid rmatrix law) - bead u55.3. Registered BEFORE any
+  # word-problem training campaign. Protocol shared by the slope entries:
+  # held-out lengths 2x-8x train (the group task's built-in split), >=3 seeds
+  # per arm at equal FLOPs, greedy decode, doc-level OLS slope of held-out
+  # exact-match vs word length (evaltasks length_slope, additive-in-v2 field,
+  # per-group breakdown via the task's category extractor).
+  # ---------------------------------------------------------------------------
+  - id: hyp-rmatrix-s5-length-slope
+    statement: >-
+      On S5 word problems (non-solvable; NC1-complete state tracking), R-matrix
+      braid attention shows a length-generalization slope at least 2x flatter
+      than standard attention at equal FLOPs: integrable monodromy mixing
+      matches the task's sequential-composition structure, so accuracy decays
+      with held-out word length at no more than half the baseline rate. No
+      expressivity-separation claim is made (both mechanisms sit inside the
+      TC0-type upper bounds); this is a learnability/extrapolation-slope claim.
+    mechanisms: [braid]
+    source:
+      kind: model
+      provenance: "EPIC THEORY-II u55.3 (preregistered leapfrog test); theory note markdown_documentation/integrable_attention_rmatrix.md section 6"
+    date_registered: "2026-06-11"
+    theorem_refs: [thm-ybe-transfer-commutativity, thm-rmatrix-inversion-protected-memory]
+    prediction:
+      metric_path: "evaltasks:tasks.group.length_slope.by_category.s5.slope"
+      comparator: ">="
+      threshold_kind: ratio
+      threshold: 0.5
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: >-
+        Slopes are negative (accuracy decays with length): M >= 0.5*B means the
+        rmatrix arm keeps at most half the baseline decay rate. The engine's
+        answer-prior floor gate does not fire on slope paths, so the verdict is
+        meaningful ONLY if the baseline's in-range exact match clears the group
+        answer prior - a flat-at-chance baseline has slope ~0 and the
+        comparison is vacuous; adjudication must check that precondition by
+        hand (or via hyp-group-nonsolvable-barrier's baseline curves) until the
+        engine learns slope-path floors. The candidate arm is selected by
+        variant {braid_crossing_law: rmatrix} against the standard-mechanism
+        baseline.
+      candidate_variant: {braid_crossing_law: "rmatrix"}
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-rmatrix-solvable-control-specificity
+    statement: >-
+      Mechanism specificity: on SOLVABLE-group controls the rmatrix advantage
+      must shrink substantially - on Z60 word problems the rmatrix arm retains
+      at least half of standard attention's accuracy-vs-length decay (no 2x
+      flattening). The S5 win must track non-solvability; if the slopes flatten
+      equally on the abelian control, the integrable-structure story is wrong
+      and the honest reading is a generic positional-kernel advantage.
+    mechanisms: [braid]
+    source:
+      kind: model
+      provenance: "EPIC THEORY-II u55.3 (the control half of the preregistered pair); theory note section 6"
+    date_registered: "2026-06-11"
+    theorem_refs: [thm-ybe-transfer-commutativity]
+    prediction:
+      metric_path: "evaltasks:tasks.group.length_slope.by_category.z60.slope"
+      comparator: "<="
+      threshold_kind: ratio
+      threshold: 0.5
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      scale_caveats: >-
+        Mirror of hyp-rmatrix-s5-length-slope on the abelian control: M <=
+        0.5*B (slopes negative) asserts the rmatrix z60 slope stays at least
+        half as steep as baseline, i.e. the flattening there is LESS than the
+        2x demanded on s5. Same floor-precondition caveat and the same
+        candidate_variant selector; the pair must be adjudicated together -
+        supporting s5 while refuting this entry is the predicted pattern,
+        supporting both means the advantage is not mechanism-specific.
+      candidate_variant: {braid_crossing_law: "rmatrix"}
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-rmatrix-charge-drift-separation
+    statement: >-
+      Conserved-charge drift through depth is ~0 for the rmatrix crossing law
+      (Q1 mass-partition defect < 1e-5 in fp32 forwards; Q2 braid-consistency
+      residual < 1e-10 in fp64) and measurably nonzero (> 1e-3) for the
+      existing heuristic crossing modes - the diagnostic separating integrable
+      from heuristic mixing. The constant swap-output 'ybe' law passes Q2 but
+      fails Q1: the two-charge fingerprint, not any single number, makes the
+      separation.
+    mechanisms: [braid]
+    source:
+      kind: model
+      provenance: "EPIC THEORY-II u55.3; theory note section 4 (operational charges)"
+    date_registered: "2026-06-11"
+    theorem_refs: [thm-rmatrix-mass-partition, thm-rmatrix-inversion-protected-memory]
+    prediction: null
+    operationalization_note: >-
+      The verdict engine has no certify-schema metric paths yet, so this entry
+      cannot be machine-adjudicated; the claim is enforced continuously instead
+      by the always-on suite - certify checks
+      braid.rmatrix_mass_partition_charge_conserved /
+      braid.rmatrix_braid_relation_holds and the layer-stack drift test
+      tests/test_mathematical_properties.py::TestIntegrableRMatrix::
+      test_charge_drift_through_layer_stack_separates_laws assert BOTH halves
+      (rmatrix ~0 AND heuristic nonzero), and the live telemetry
+      (braid_q1_mass_defect_max / braid_q2_braid_residual_max in metrics.jsonl)
+      witnesses it per training step. Promote to a prediction when the engine
+      learns the certify schema.
+    status: blocked
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-rmatrix-charge-decodability
+    statement: >-
+      The conserved charges are decodable to task state where representation
+      theory says they can be, and not where it says they cannot: probes
+      (linear, then small-MLP) from the final braid layer's charge observables
+      <v, t(theta_k) v>/<v, v> to the composed group element score well above
+      chance (> 2x the 1/|G| floor) on the abelian control Z60 - whose product
+      is a symmetric statistic, in the span of the U(1)-symmetric charge tower
+      - and at or near chance on the non-solvable S5/A5, whose order-sensitive
+      product is not. Conservation (hyp-rmatrix-charge-drift-separation) and
+      decodability are BOTH required for the protected-memory story; if
+      decodability fails everywhere, the honest conclusion is that the
+      integrable structure conserves the wrong quantities for this task, and
+      the redesign direction is a higher-rank R-matrix whose charge tower spans
+      the group algebra.
+    mechanisms: [braid]
+    source:
+      kind: model
+      provenance: "EPIC THEORY-II u55.3 polish round 3 (referee: the missing success criterion); theory note section 4 (charge decodability)"
+    date_registered: "2026-06-11"
+    theorem_refs: [thm-rmatrix-mass-partition]
+    prediction: null
+    operationalization_note: >-
+      The probe harness exists (mgr probe-charges, artifact schema
+      mgr.chargeprobe.v1 with per-category linear/MLP test accuracies and
+      decodable_at_2x_chance flags) but the verdict engine does not read that
+      schema yet. Protocol when promoted: probe a trained rmatrix checkpoint
+      (>= 3 seeds) on the group task; supported iff z60 decodable_at_2x_chance
+      is true across seeds AND s5 max(test_acc) stays below 2x chance;
+      decodable-everywhere or nowhere both refute the dissociation as
+      registered (nowhere additionally triggers the redesign note above).
+    status: blocked
     evidence: []
     verdict_history: []

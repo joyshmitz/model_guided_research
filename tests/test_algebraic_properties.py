@@ -232,6 +232,178 @@ def test_lcp_symmetry_and_self_exact(x, y):
 
 
 # ---------------------------------------------------------------------------
+# Valuation dictionary (bead 8gk.2): EXACT integer identities, no tolerances.
+# p-adic = tropical = dominance; theory note:
+# markdown_documentation/the_valuation_dictionary.md. Theorems exercised:
+# thm-valuation-arithmetic, thm-lcp-is-padic-valuation,
+# thm-tropicalization-of-attention, thm-balltree-exact-attention.
+# ---------------------------------------------------------------------------
+
+
+def _vp(n: int, p: int, cap: int) -> int:
+    if n == 0:
+        return cap
+    v = 0
+    while n % p == 0 and v < cap:
+        n //= p
+        v += 1
+    return v
+
+
+_primes = st.sampled_from((2, 3, 5))
+_pos_int = st.integers(min_value=1, max_value=10**9)
+_any_int = st.integers(min_value=0, max_value=10**9)
+
+
+@given(p=_primes, x=_pos_int, y=_pos_int)
+def test_valuation_homomorphism_products_exact(p, x, y):
+    # v(xy) = v(x) + v(y), ALWAYS (no genericity needed): count powers of p.
+    cap = 64
+    assert _vp(x * y, p, cap) == _vp(x, p, cap) + _vp(y, p, cap)
+
+
+@given(p=_primes, x=_pos_int, y=_pos_int)
+def test_valuation_min_rule_superadditive_and_generic_equality(p, x, y):
+    # v(x+y) >= min(v x, v y) always; EQUALITY whenever v(x) != v(y)
+    # (no leading-term cancellation is possible across different depths).
+    cap = 64
+    vx, vy = _vp(x, p, cap), _vp(y, p, cap)
+    vs = _vp(x + y, p, cap)
+    assert vs >= min(vx, vy)
+    if vx != vy:
+        assert vs == min(vx, vy)
+
+
+@given(p=_primes, m=st.integers(min_value=0, max_value=6), lead=st.integers(min_value=1, max_value=4))
+def test_valuation_min_rule_strict_on_constructed_cancellation(p, m, lead):
+    # Adversarial cancellation: v(x) = v(y) = m with leading digits summing to
+    # 0 mod p forces STRICT inequality - the corner locus, by construction.
+    a = lead % (p - 1) + 1  # leading digit in [1, p-1]
+    x = p**m * a
+    y = p**m * (p - a)  # a + (p - a) = p == 0 mod p
+    cap = 64
+    assert _vp(x, p, cap) == m and _vp(y, p, cap) == m
+    assert _vp(x + y, p, cap) > m
+
+
+@given(p=_primes, x=_any_int, y=_any_int)
+def test_lcp_equals_padic_valuation_of_difference(p, x, y):
+    # LCP(digits(x), digits(y)) = v_p(x - y) mod p^K, capped at K - the
+    # dictionary's line (a): digit similarity IS valuation of a difference.
+    K = 12
+    x, y = x % p**K, y % p**K
+
+    def digits(n: int) -> list[int]:
+        return [(n // p**i) % p for i in range(K)]
+
+    assert _lcp(digits(x), digits(y)) == _vp((x - y) % p**K, p, K)
+
+
+@given(
+    p=_primes,
+    q=st.lists(_any_int, min_size=4, max_size=4),
+    k=st.lists(_any_int, min_size=4, max_size=4),
+)
+def test_tropicalization_of_attention_with_exact_genericity_characterization(p, q, k):
+    # v(<q,k>) >= min_j (v q_j + v k_j) always, and the EXACT characterization:
+    # equality iff the leading terms of the argmin set do not cancel mod p.
+    # This tests the theorem's boundary, not just the inequality.
+    cap = 128
+    ip = sum(a * b for a, b in zip(q, k))
+    v_terms = [_vp(a, p, cap) + _vp(b, p, cap) for a, b in zip(q, k)]
+    m = min(v_terms)
+    if m >= cap:  # the minimal product is 0 => every product is 0 => ip == 0
+        assert ip == 0
+        return
+    v_ip = _vp(ip, p, cap)
+    assert v_ip >= m
+    lead_sum = sum(
+        ((a // p ** _vp(a, p, cap)) * (b // p ** _vp(b, p, cap))) % p
+        for (a, b), vt in zip(zip(q, k), v_terms)
+        if vt == m
+    ) % p
+    if lead_sum != 0:
+        assert v_ip == m
+    else:
+        assert v_ip > m
+
+
+def test_cancellation_locus_measure_binary_sums():
+    # P[v(x+y) > min] = 1/(p+1) for Haar-uniform Z_p (theory note section 3).
+    # Monte Carlo with a fixed seed; 5-sigma band around the exact value.
+    import random as _random
+
+    rng = _random.Random(0)
+    for p in (2, 3, 5):
+        n, strict = 60000, 0
+        K = 14
+        M = p**K
+        for _ in range(n):
+            x, y = rng.randrange(M), rng.randrange(M)
+            if _vp((x + y) % M, p, K) > min(_vp(x or M, p, K), _vp(y or M, p, K)):
+                strict += 1
+        exact = 1.0 / (p + 1)
+        sigma = (exact * (1 - exact) / n) ** 0.5
+        assert abs(strict / n - exact) < 5 * sigma, f"p={p}: {strict / n} vs {exact}"
+
+
+@given(
+    keys=st.lists(st.integers(min_value=0, max_value=2**12 - 1), min_size=3, max_size=24),
+    q=st.integers(min_value=0, max_value=2**12 - 1),
+    data=st.data(),
+)
+def test_balltree_attention_equals_bruteforce_exact(keys, q, data):
+    # The shell decomposition is a partition, not an approximation: with
+    # alpha = 2 and integer values every quantity is exact dyadic, so the
+    # ball-tree output must equal brute force with ==, no tolerance.
+    import numpy as np
+
+    from ultrametric_worlds_and_p_adic_computation import BallTreeValuedAttention
+
+    dim = 3
+    values = np.asarray(
+        [[data.draw(st.integers(min_value=-8, max_value=8)) for _ in range(dim)] for _ in keys],
+        dtype=np.float64,
+    )
+    bt = BallTreeValuedAttention(p=2, K=12, dim=dim, alpha=2.0)
+    for k_int, v in zip(keys, values):
+        bt.insert(int(k_int), v)
+    out_tree = bt.attend(int(q))
+    out_brute = bt.attend_bruteforce(int(q), [int(x) for x in keys], values)
+    assert out_tree is not None
+    assert np.array_equal(out_tree, out_brute)
+
+
+def test_valued_bilinear_shadows_agree_with_direct_formula():
+    # Cross-implementation agreement: the demo's three-shadow rendering vs the
+    # direct integer formulas (trie/digits vs valuation arithmetic vs leading
+    # term), exact on randomized cases with a fixed seed.
+    import numpy as np
+
+    from ultrametric_worlds_and_p_adic_computation import (
+        p_adic_encode,
+        valued_bilinear_shadows,
+        vp_int,
+    )
+
+    rng = np.random.default_rng(0)
+    p, K, dim = 3, 8, 4
+    for _ in range(200):
+        q_ints = [int(rng.integers(0, p**K)) for _ in range(dim)]
+        k_ints = [int(rng.integers(0, p**K)) for _ in range(dim)]
+        q_dig = np.stack([p_adic_encode(n, p, K) for n in q_ints])
+        k_dig = np.stack([p_adic_encode(n, p, K) for n in k_ints])
+        sh = valued_bilinear_shadows(q_dig, k_dig, p, K)
+        ip = sum(a * b for a, b in zip(q_ints, k_ints))
+        assert sh["inner_product"] == ip
+        assert sh["v_exact"] == vp_int(ip, p, 2 * K)
+        assert sh["v_tropical"] == min(
+            vp_int(a, p, 2 * K) + vp_int(b, p, 2 * K) for a, b in zip(q_ints, k_ints)
+        )
+        assert sh["generic"] == (sh["v_exact"] == sh["v_tropical"])
+
+
+# ---------------------------------------------------------------------------
 # Givens rotations (gauge transport): orthogonality, additivity
 # ---------------------------------------------------------------------------
 

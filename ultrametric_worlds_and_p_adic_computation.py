@@ -1100,9 +1100,17 @@ def demo():
     except Exception as err:
         print(f"[ultrametric] Demo failed: {err}")
 
-
-if __name__ == "__main__":
-    demo()
+    # Valued-attention section (bead 8gk.2): the dictionary's reference
+    # mechanism, the three-shadow table, and the exact ball-tree benchmark.
+    # (last_diagnostics is already declared global earlier in this function.)
+    try:
+        section = run_valued_attention_section()
+        try:
+            last_diagnostics["valued_attention"] = section
+        except (NameError, TypeError):
+            last_diagnostics = {"valued_attention": section}
+    except Exception as err:
+        print(f"[ultrametric] Valued-attention section failed: {err}")
 
 
 # --- Minimal p‑adic helpers for tests ---
@@ -1147,3 +1155,308 @@ def p_adic_multiply(a: np.ndarray, b: np.ndarray, p: int) -> np.ndarray:
     mod = p**k
     prod = (n1 * n2) % mod
     return p_adic_encode(prod, p, k)
+
+
+# ---------------------------------------------------------------------------
+# Valued attention (bead 8gk.2): the valuation dictionary made executable.
+#
+# One backbone, three shadows. Keys/queries are finite-precision elements of
+# Z_p (length-K digit vectors = integer representatives), carrying the genuine
+# p-adic valuation v_p. The dictionary, each line an exact integer theorem
+# (tests: tests/test_algebraic_properties.py, valuation-dictionary section;
+# note: markdown_documentation/the_valuation_dictionary.md):
+#
+#   (a) LCP IS VALUATION:        lcp(x, y) = v_p(x - y)  (mod p^K, capped at K)
+#   (b) TROPICAL IS THE SHADOW:  v_p(<q, k>) = min_j (v_p(q_j) + v_p(k_j))
+#       for valuation-generic inputs; the tie/cancellation locus where the
+#       inequality is strict has Haar measure 1/(p+1) per binary sum - it is
+#       the tropical variety, the corner locus where routes switch.
+#   (c) DOMINANCE IS VALUATION:  the leading term q^{v} c_v of the Hahn-series
+#       rendering is the dominance order the surreal demo probes.
+#
+# The existing ultrametric mechanism (digit similarity = v_p of a DIFFERENCE)
+# and the tropical mechanism (valuation ARITHMETIC of products/sums) are the
+# two projections of the one valued-attention structure (V, Gamma, v, sim).
+#
+# THE ALGORITHMIC PAYOFF: for the difference kernel, balls are trie nodes, so
+# attention sums aggregate exactly over LCP shells - the ball tree computes
+# EXACT attention in O(K) per query (correctness is a theorem, not an
+# approximation bound), directly answering E3's finding that the torch kernel
+# port is quadratic-with-better-constants.
+# ---------------------------------------------------------------------------
+
+
+def vp_int(n: int, p: int, cap: int) -> int:
+    """p-adic valuation of an integer, capped (v(0) := cap, the precision)."""
+    if n == 0:
+        return cap
+    v = 0
+    while n % p == 0 and v < cap:
+        n //= p
+        v += 1
+    return v
+
+
+def vp_digits(digits: np.ndarray, p: int) -> int:
+    """Valuation of a digit vector = index of the first nonzero digit (K if zero)."""
+    nz = np.nonzero(np.asarray(digits))[0]
+    return int(nz[0]) if len(nz) else len(digits)
+
+
+def lcp_depth(a: np.ndarray, b: np.ndarray) -> int:
+    """Longest common prefix of two digit vectors (LSB-first), = v_p(a - b)."""
+    neq = np.nonzero(np.asarray(a) != np.asarray(b))[0]
+    return int(neq[0]) if len(neq) else len(a)
+
+
+def valued_bilinear_shadows(q_digits: np.ndarray, k_digits: np.ndarray, p: int, K: int) -> dict:
+    """One bilinear score rendered in all three shadows (exact integers).
+
+    Returns the integer inner product, its exact valuation, the tropical
+    (min,+) shadow min_j (v q_j + v k_j), whether the tropicalization theorem's
+    genericity holds (exact == tropical), and the Hahn/leading-term rendering.
+    """
+    q_ints = [p_adic_decode(np.asarray(q_digits)[j], p) for j in range(len(q_digits))]
+    k_ints = [p_adic_decode(np.asarray(k_digits)[j], p) for j in range(len(k_digits))]
+    ip = sum(a * b for a, b in zip(q_ints, k_ints))  # exact over Z, no truncation
+    cap = 2 * K  # products of K-digit elements have valuation < 2K unless zero
+    v_exact = vp_int(ip, p, cap)
+    v_trop = min(
+        vp_int(a, p, cap) + vp_int(b, p, cap) for a, b in zip(q_ints, k_ints)
+    )
+    lead_coeff = (ip // p**v_exact) % p if ip != 0 else 0
+    return {
+        "inner_product": ip,
+        "v_exact": v_exact,
+        "v_tropical": v_trop,
+        "generic": v_exact == v_trop,
+        "leading_term": f"{lead_coeff}*p^{v_exact}" if ip != 0 else "0",
+    }
+
+
+class BallTreeValuedAttention:
+    """Exact sub-quadratic valued attention over the Bruhat-Tits trie.
+
+    Hard-digit difference kernel: weight(q, k) = alpha^{lcp(q, k)} with
+    alpha > 1. Balls of radius p^{-d} around q are trie nodes (residues mod
+    p^d), nested by the strong triangle inequality, so
+
+        out(q) = sum_j alpha^{lcp(q, k_j)} v_j
+               = sum_{d=0..K} alpha^d * (S_{>=d}(q) - S_{>=d+1}(q)),
+
+    where S_{>=d}(q) is the per-node value sum at q's depth-d ancestor - an
+    EXACT shell decomposition, O(K) per query after O(N K) build, with the
+    normalizer aggregated from per-node counts the same way. Streaming
+    insertion (insert key i after querying it) gives the exactly-causal
+    O(N K) attention path - the E3 sub-quadratic answer. With alpha = 2 and
+    integer values every quantity is an exact dyadic float: the brute-force
+    comparison asserts equality with ==, no tolerance.
+    """
+
+    def __init__(self, p: int, K: int, dim: int, alpha: float = 2.0):
+        self.p = int(p)
+        self.K = int(K)
+        self.dim = int(dim)
+        self.alpha = float(alpha)
+        self.pk = [self.p**d for d in range(self.K + 1)]
+        # per-depth: residue (key mod p^d) -> [value-sum vector, count]
+        self.node_sum: list[dict[int, np.ndarray]] = [{} for _ in range(self.K + 1)]
+        self.node_cnt: list[dict[int, int]] = [{} for _ in range(self.K + 1)]
+        self.n_keys = 0
+
+    def insert(self, key_int: int, value: np.ndarray) -> None:
+        value = np.asarray(value, dtype=np.float64)
+        for d in range(self.K + 1):
+            r = key_int % self.pk[d]
+            if r in self.node_sum[d]:
+                self.node_sum[d][r] = self.node_sum[d][r] + value
+                self.node_cnt[d][r] += 1
+            else:
+                self.node_sum[d][r] = value.copy()
+                self.node_cnt[d][r] = 1
+        self.n_keys += 1
+
+    def attend(self, q_int: int) -> np.ndarray | None:
+        """Exact alpha^lcp-weighted average over all inserted keys, O(K)."""
+        if self.n_keys == 0:
+            return None
+        num = np.zeros(self.dim, dtype=np.float64)
+        den = 0.0
+        for d in range(self.K + 1):
+            r = q_int % self.pk[d]
+            s_d = self.node_sum[d].get(r)
+            if s_d is None:
+                break  # deeper balls are empty subsets of this one
+            c_d = self.node_cnt[d][r]
+            if d < self.K:
+                r1 = q_int % self.pk[d + 1]
+                s_d1 = self.node_sum[d + 1].get(r1)
+                c_d1 = self.node_cnt[d + 1].get(r1, 0)
+            else:
+                s_d1, c_d1 = None, 0
+            shell_sum = s_d - (s_d1 if s_d1 is not None else 0.0)
+            shell_cnt = c_d - c_d1
+            if shell_cnt:
+                w = self.alpha**d
+                num += w * shell_sum
+                den += w * shell_cnt
+        return num / den
+
+    def attend_bruteforce(self, q_int: int, keys: list[int], values: np.ndarray) -> np.ndarray:
+        """O(N K) reference: identical arithmetic, summed per shell so the
+        dyadic-exactness contract (== with alpha = 2, integer values) holds."""
+        shells: dict[int, tuple[np.ndarray, int]] = {}
+        for k_int, v in zip(keys, values):
+            d = vp_int((q_int - k_int) % self.pk[self.K], self.p, self.K)
+            s, c = shells.get(d, (np.zeros(self.dim, dtype=np.float64), 0))
+            shells[d] = (s + v, c + 1)
+        num = np.zeros(self.dim, dtype=np.float64)
+        den = 0.0
+        for d, (s, c) in shells.items():
+            num += self.alpha**d * s
+            den += self.alpha**d * c
+        return num / den
+
+
+def run_valued_attention_section() -> dict:
+    """Valued attention reference + three-shadow table + ball-tree benchmark."""
+    rng = np.random.default_rng(8)
+    p, K, dim = 3, 8, 4
+    print("\n[Valued Attention - the dictionary made executable (8gk.2)]")
+
+    # --- (1) the three-shadow table: one attention computation, three lenses
+    n_keys = 6
+    q_dig = np.stack([p_adic_encode(int(rng.integers(0, p**K)), p, K) for _ in range(dim)])
+    rows = []
+    tie_count = 0
+    for j in range(n_keys):
+        k_dig = np.stack([p_adic_encode(int(rng.integers(0, p**K)), p, K) for _ in range(dim)])
+        sh = valued_bilinear_shadows(q_dig, k_dig, p, K)
+        if not sh["generic"]:
+            tie_count += 1
+        digits_str = "".join(str(int(d)) for d in p_adic_encode(sh["inner_product"] % p**K, p, K))
+        rows.append(
+            (
+                f"k{j}",
+                digits_str,
+                str(sh["v_exact"]),
+                str(sh["v_tropical"]),
+                "=" if sh["generic"] else "< (tie locus)",
+                sh["leading_term"],
+                f"{2.0 ** (-sh['v_exact']):.4f}",
+            )
+        )
+    try:
+        from rich.console import Console as _Console
+        from rich.table import Table as _Table
+
+        tab = _Table(
+            title=f"Three shadows of one attention computation (p={p}, K={K}): "
+            "digits (Q_p) | tropical (min,+) | leading exponent (Hahn/dominance)",
+            show_header=True,
+            header_style="bold magenta",
+        )
+        for col in ("key", "<q,k> digits (LSB->MSB)", "v_p exact", "(min,+) shadow", "generic?", "leading term", "score 2^-v"):
+            tab.add_column(col, justify="right")
+        for r in rows:
+            tab.add_row(*r)
+        _Console().print(tab)
+    except Exception as err:
+        print(f"[ultrametric] three-shadow table skipped: {err}")
+
+    # --- (2) the cancellation-locus measure: empirical vs the exact 1/(p+1)
+    n_mc = 20000
+    strict = 0
+    M = p ** (2 * K)
+    for _ in range(n_mc):
+        x = int(rng.integers(0, M))
+        y = int(rng.integers(0, M))
+        if vp_int((x + y) % M, p, 2 * K) > min(vp_int(x or M, p, 2 * K), vp_int(y or M, p, 2 * K)):
+            strict += 1
+    tie_rate = strict / n_mc
+    print(
+        f"cancellation locus: empirical {tie_rate:.4f} vs exact 1/(p+1) = {1 / (p + 1):.4f} "
+        f"(binary sums, Haar-uniform Z_p; the tropical variety has measure zero in the limit K -> inf per digit)"
+    )
+
+    # --- (3) ball-tree exact attention: == brute force, then the E3 timing hook
+    import time as _time
+
+    Kbt, pbt = 12, 2  # alpha = 2, integer values: every weight/sum is exact dyadic
+    bench_rows = []
+    exact_ok = True
+    for N in (256, 1024, 4096):
+        keys = [int(rng.integers(0, pbt**Kbt)) for _ in range(N)]
+        values = np.asarray(rng.integers(-8, 9, size=(N, dim)), dtype=np.float64)
+        bt = BallTreeValuedAttention(p=pbt, K=Kbt, dim=dim, alpha=2.0)
+        t0 = _time.perf_counter()
+        for k_int, v in zip(keys, values):
+            bt.insert(k_int, v)
+        t_build = _time.perf_counter() - t0
+        n_q = 64
+        q_ints = [int(rng.integers(0, pbt**Kbt)) for _ in range(n_q)]
+        t0 = _time.perf_counter()
+        outs_bt = [bt.attend(q) for q in q_ints]
+        t_bt = (_time.perf_counter() - t0) / n_q
+        t0 = _time.perf_counter()
+        outs_bf = [bt.attend_bruteforce(q, keys, values) for q in q_ints]
+        t_bf = (_time.perf_counter() - t0) / n_q
+        exact = all(np.array_equal(a, b) for a, b in zip(outs_bt, outs_bf))
+        exact_ok = exact_ok and exact
+        bench_rows.append(
+            {
+                "N": N,
+                "build_ms": 1000 * t_build,
+                "balltree_us_per_query": 1e6 * t_bt,
+                "brute_us_per_query": 1e6 * t_bf,
+                "speedup": t_bf / t_bt if t_bt > 0 else float("inf"),
+                "exact": exact,
+            }
+        )
+    try:
+        from rich.console import Console as _Console
+        from rich.table import Table as _Table
+
+        bt_tab = _Table(
+            title="Ball-tree exact attention vs brute force (hard digits, alpha=2: equality asserted with ==)",
+            show_header=True,
+            header_style="bold magenta",
+        )
+        for col in ("N", "build ms", "ball-tree us/q", "brute us/q", "speedup", "exact?"):
+            bt_tab.add_column(col, justify="right")
+        for r in bench_rows:
+            bt_tab.add_row(
+                str(r["N"]),
+                f"{r['build_ms']:.1f}",
+                f"{r['balltree_us_per_query']:.1f}",
+                f"{r['brute_us_per_query']:.1f}",
+                f"{r['speedup']:.1f}x",
+                str(r["exact"]),
+            )
+        _Console().print(bt_tab)
+    except Exception as err:
+        print(f"[ultrametric] ball-tree table skipped: {err}")
+    if not exact_ok:
+        print("[ultrametric] WARNING: ball-tree != brute force - the exactness theorem's implementation is broken")
+
+    section = {
+        "three_shadow_rows": [
+            {
+                "key": r[0],
+                "digits": r[1],
+                "v_exact": int(r[2]),
+                "v_tropical": int(r[3]),
+                "generic": r[4] == "=",
+                "leading_term": r[5],
+            }
+            for r in rows
+        ],
+        "tie_rate": {"empirical": tie_rate, "exact_binary": 1.0 / (p + 1), "n_mc": n_mc},
+        "balltree_bench": bench_rows,  # the E3 hook: exact sub-quadratic path timings
+        "balltree_exact": exact_ok,
+    }
+    return section
+
+
+if __name__ == "__main__":
+    demo()

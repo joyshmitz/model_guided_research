@@ -191,7 +191,7 @@ class GPTConfig:
     # Braid-specific options (see nanochat.braid_attention_torch).
     braid_mode: str = "soft"  # "soft" | "discrete"
     braid_tau: float = 0.0
-    braid_crossing_law: str = "restricted"  # "restricted" | "ybe"
+    braid_crossing_law: str = "restricted"  # "restricted" | "ybe" | "rmatrix" (integrable, u55.3)
     braid_record_schedule: bool = False
     braid_verify: bool = False
 
@@ -615,7 +615,7 @@ class GPT(nn.Module):
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
         if self.config.optimizer_type == "hoss":
             print("Using HOSS optimizer")
-            return [HOSS(self.parameters(), lr=matrix_lr)]
+            return [HOSS([p for p in self.parameters() if p.requires_grad], lr=matrix_lr)]
 
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -623,13 +623,24 @@ class GPT(nn.Module):
         # Muon's Newton-Schulz orthogonalization requires ndim >= 2, but some
         # mechanisms carry sub-2D block parameters (simplicial mix_1/mix_2
         # scalars, TropicalMLP bias vectors) - those route to AdamW at the
-        # matrix LR instead of crashing Muon.
-        block_params = list(self.transformer.h.parameters())
-        matrix_params = [p for p in block_params if p.ndim >= 2]
-        lowdim_block_params = [p for p in block_params if p.ndim < 2]
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        expected = len(block_params) + len(embedding_params) + len(lm_head_params)
+        # matrix LR instead of crashing Muon. Frozen parameters (e.g. the dead
+        # q/k projections of the purely-positional braid rmatrix law) never
+        # enter an optimizer, and 2D parameters whose geometry is a per-position
+        # scalar field rather than a matmul weight (the rmatrix rapidity table)
+        # route to AdamW: Newton-Schulz orthogonalization of a rapidity profile
+        # is meaningless.
+        named_block = [(n, p) for n, p in self.transformer.h.named_parameters() if p.requires_grad]
+
+        def _muon_exempt(name: str) -> bool:
+            return name.endswith("rmatrix_rho")
+
+        matrix_params = [p for n, p in named_block if p.ndim >= 2 and not _muon_exempt(n)]
+        lowdim_block_params = [p for n, p in named_block if p.ndim < 2 or _muon_exempt(n)]
+        embedding_params = [p for p in self.transformer.wte.parameters() if p.requires_grad]
+        lm_head_params = [p for p in self.lm_head.parameters() if p.requires_grad]
+        expected = len(list(self.transformer.h.parameters())) + len(list(self.transformer.wte.parameters())) + len(
+            list(self.lm_head.parameters())
+        )
         if len(list(self.parameters())) != expected:
             raise RuntimeError("Parameter count mismatch between blocks, embeddings, and lm_head")
         # Create the AdamW optimizer for the embedding and lm_head

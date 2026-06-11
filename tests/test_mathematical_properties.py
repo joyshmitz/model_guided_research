@@ -872,6 +872,228 @@ class TestKnotTheory:
             print("  ✅ Basic crossing properties verified instead")
 
 
+class TestIntegrableRMatrix:
+    """Integrable attention (bead u55.3): trigonometric R-matrix law, transfer
+    commutativity, charge conservation - the math IS the spec, fp64 throughout."""
+
+    def test_braid_relation_random_and_corners(self):
+        """Spectral braid relation for the trig law, incl. degenerate corners."""
+        import torch
+
+        from nanochat.braid_attention_torch import (
+            _braid_triple_residual,
+            rmatrix_braid_relation_residual,
+        )
+
+        err = rmatrix_braid_relation_residual(trials=512, seed=1)
+        require(err < 1e-10, f"braid relation residual {err:.3e}")
+
+        # corners: equal rapidities (u=v) and the eta -> 0+ rational limit
+        for eta_val, raps in ((1e-6, [0.2e-6, 0.2e-6, -0.1e-6]), (1.0, [0.3, 0.3, 0.3]), (2.0, [0.5, 0.1, 0.5])):
+            states = torch.randn((3, 2), dtype=torch.float64, generator=torch.Generator().manual_seed(2))
+            res = _braid_triple_residual(
+                states,
+                torch.tensor(raps, dtype=torch.float64),
+                torch.tensor(eta_val, dtype=torch.float64),
+            )
+            require(float(res) < 1e-10, f"corner eta={eta_val}: residual {float(res):.3e}")
+        print("  ✅ R-matrix braid relation: random + degenerate corners")
+
+    def test_restricted_law_fails_braid_relation(self):
+        """Separation witness: the heuristic law must NOT satisfy the relation."""
+        import torch
+
+        from nanochat.braid_attention_torch import BraidCausalSelfAttention as Braid
+
+        torch.manual_seed(3)
+        parts = [torch.randn(16, 4, dtype=torch.float64) for _ in range(3)]
+        law = Braid._crossing_update_restricted
+
+        def apply12(ax, ay, bx, by, cx, cy):
+            nax, nay, nbx, nby = law(ax, ay, bx, by)
+            return nax, nay, nbx, nby, cx, cy
+
+        def apply23(ax, ay, bx, by, cx, cy):
+            nbx, nby, ncx, ncy = law(bx, by, cx, cy)
+            return ax, ay, nbx, nby, ncx, ncy
+
+        six = (parts[0][:, 0], parts[0][:, 1], parts[1][:, 0], parts[1][:, 1], parts[2][:, 0], parts[2][:, 1])
+        lhs = apply12(*apply23(*apply12(*six)))
+        rhs = apply23(*apply12(*apply23(*six)))
+        err = float(torch.max(torch.abs(torch.stack(lhs, dim=-1) - torch.stack(rhs, dim=-1))))
+        require(err > 1e-3, f"restricted law unexpectedly satisfies the braid relation: {err:.3e}")
+        print(f"  ✅ separation witness: restricted-law residual {err:.3e} >> 0")
+
+    def test_inversion_relation_protected_memory(self):
+        """N(w) N(-w) = I: the mixing is exactly invertible (protected memory)."""
+        from nanochat.braid_attention_torch import rmatrix_inversion_residual
+
+        err = rmatrix_inversion_residual(trials=512, seed=4)
+        require(err < 1e-10, f"inversion residual {err:.3e}")
+        print("  ✅ inversion relation N(w)N(-w) = I")
+
+    def test_transfer_matrices_commute_and_perturbation_breaks_it(self):
+        """[T(u), T(v)] = 0 for the closed-form one-particle family; an
+        epsilon-perturbation of one Boltzmann weight breaks it (teeth)."""
+        import torch
+
+        from nanochat.braid_attention_torch import one_particle_transfer
+
+        torch.manual_seed(5)
+        T, eta = 24, 0.9
+        u = torch.cumsum(torch.rand(T, dtype=torch.float64) * 0.25 + 0.05, dim=0)
+        thetas = [float(u[-1]) + d for d in (0.7, 1.6, 2.9)]
+        ts = [one_particle_transfer(th, u, eta) for th in thetas]
+        for i in range(len(ts)):
+            for j in range(i + 1, len(ts)):
+                comm = ts[i] @ ts[j] - ts[j] @ ts[i]
+                rel = float(comm.norm() / (ts[i].norm() * ts[j].norm()))
+                require(rel < 1e-10, f"[T,T] rel {rel:.3e} at pair ({i},{j})")
+        bad = ts[0].clone()
+        bad[0, 1] = bad[0, 1] * 1.1 + 0.1
+        comm = bad @ ts[1] - ts[1] @ bad
+        rel = float(comm.norm() / (bad.norm() * ts[1].norm()))
+        require(rel > 1e-6, f"perturbed transfer unexpectedly commutes: {rel:.3e}")
+        print("  ✅ transfer family commutes; perturbation separates")
+
+    def test_transfer_closed_form_matches_dense_tensor_construction(self):
+        """The closed-form one-particle t(theta) equals the dense 2^T transfer
+        matrix restricted to the one-particle sector (small chain, exact)."""
+        import numpy as np
+        import torch
+
+        from nanochat.braid_attention_torch import one_particle_transfer
+
+        rng = np.random.default_rng(6)
+        T, eta = 5, 1.1
+        u = torch.tensor(np.cumsum(rng.uniform(0.05, 0.3, T)))
+
+        def dense_one_particle(theta: float) -> np.ndarray:
+            dim = 2**T
+            dim_a = 2 * dim
+            M = np.eye(dim_a)
+            for i in range(T):
+                w = theta - float(u[i])
+                b = np.sinh(w) / np.sinh(w + eta)
+                c = np.sinh(eta) / np.sinh(w + eta)
+                R = np.zeros((4, 4))
+                R[0, 0] = R[3, 3] = 1.0
+                R[1, 1] = R[2, 2] = b
+                R[1, 2] = R[2, 1] = c
+                L = np.zeros((dim_a, dim_a))
+                for ap in range(2):
+                    for a in range(2):
+                        for sp in range(2):
+                            for s in range(2):
+                                amp = R[ap * 2 + sp, a * 2 + s]
+                                if amp == 0.0:
+                                    continue
+                                op = np.zeros((2, 2))
+                                op[sp, s] = 1.0
+                                chain = np.eye(1)
+                                for site in range(T):
+                                    chain = np.kron(chain, op if site == i else np.eye(2))
+                                aux = np.zeros((2, 2))
+                                aux[ap, a] = 1.0
+                                L += np.kron(aux, chain) * amp
+                M = L @ M
+            M = M.reshape(2, dim, 2, dim)
+            t_full = M[0, :, 0, :] + M[1, :, 1, :]
+            idx = [2 ** (T - 1 - i) for i in range(T)]
+            return t_full[np.ix_(idx, idx)]
+
+        for theta in (2.4, 3.3):
+            dense = dense_one_particle(theta)
+            closed = one_particle_transfer(theta, u, eta).numpy()
+            err = float(np.max(np.abs(dense - closed)))
+            require(err < 1e-14, f"closed form vs dense: {err:.3e}")
+        print("  ✅ closed-form t(theta) == dense tensor construction")
+
+    def test_charge_drift_through_layer_stack_separates_laws(self):
+        """Q1/Q2 drift through an N-layer stack: rmatrix < 1e-5; the heuristic
+        modes measurably nonzero - both asserted (the bead's diagnostic)."""
+        import torch
+
+        from nanochat.braid_attention_torch import BraidCausalSelfAttention
+        from nanochat.gpt import GPT, GPTConfig
+
+        def run(law: str, mode: str = "soft") -> tuple[float, float]:
+            torch.manual_seed(7)
+            cfg = GPTConfig(
+                sequence_len=24,
+                vocab_size=64,
+                n_layer=4,
+                n_head=2,
+                n_kv_head=2,
+                n_embd=32,
+                attention_type="braid",
+                braid_mode=mode,
+                braid_crossing_law=law,
+            )
+            model = GPT(cfg).train(False)
+            with torch.inference_mode():
+                model(torch.randint(0, 64, (2, 24)))
+            q1 = 0.0
+            q2 = 0.0
+            for module in model.modules():
+                if isinstance(module, BraidCausalSelfAttention):
+                    charges = module.last_braid_charges
+                    require(isinstance(charges, dict), f"missing charges for law={law}")
+                    q1 = max(q1, float(charges["q1_mass_defect"]))
+                    q2 = max(q2, float(charges["q2_braid_residual"]))
+            return q1, q2
+
+        q1_r, q2_r = run("rmatrix")
+        require(q1_r < 1e-5, f"rmatrix Q1 drift {q1_r:.3e} (want < 1e-5)")
+        require(q2_r < 1e-10, f"rmatrix Q2 residual {q2_r:.3e} (want < 1e-10)")
+
+        q1_soft, q2_soft = run("restricted", mode="soft")
+        require(q1_soft > 1e-3, f"soft/restricted Q1 drift {q1_soft:.3e} should be measurably nonzero")
+        require(q2_soft > 1e-3, f"restricted Q2 residual {q2_soft:.3e} should be measurably nonzero")
+
+        # the constant ybe law passes Q2 (it satisfies R3) but still fails Q1:
+        # the two-charge fingerprint, not any single number, separates the modes.
+        q1_ybe, q2_ybe = run("ybe", mode="soft")
+        require(q1_ybe > 1e-3, f"ybe Q1 drift {q1_ybe:.3e} should be measurably nonzero")
+        require(q2_ybe < 1e-5, f"constant ybe law satisfies R3, got Q2 {q2_ybe:.3e}")
+        print(
+            f"  ✅ charge fingerprint: rmatrix ({q1_r:.1e},{q2_r:.1e}) vs "
+            f"restricted ({q1_soft:.1e},{q2_soft:.1e}) vs ybe ({q1_ybe:.1e},{q2_ybe:.1e})"
+        )
+
+    def test_stochastic_gauge_does_not_satisfy_lifted_braid_relation(self):
+        """Documented subtlety: per-crossing stochastic normalization breaks the
+        LIFTED braid relation (identity slots do not rescale) - which is why the
+        law is a-normalized and the gauge lives only in the value kernel."""
+        import torch
+
+        def gauged_sigma(st: torch.Tensor, rp: torch.Tensor, i: int, eta: float) -> tuple[torch.Tensor, torch.Tensor]:
+            w = rp[i] - rp[i + 1]
+            b = torch.sinh(torch.tensor(w, dtype=torch.float64))
+            c = torch.sinh(torch.tensor(eta, dtype=torch.float64))
+            bg, cg = b / (b + c), c / (b + c)
+            st = st.clone()
+            a, b_state = st[i].clone(), st[i + 1].clone()
+            st[i], st[i + 1] = cg * a + bg * b_state, bg * a + cg * b_state
+            rp = list(rp)
+            rp[i], rp[i + 1] = rp[i + 1], rp[i]
+            return st, rp
+
+        torch.manual_seed(8)
+        eta = 0.9
+        raps = [0.31, 0.11, -0.17]
+        states = torch.randn(3, 2, dtype=torch.float64)
+        st1, rp1 = states, list(raps)
+        for i in (0, 1, 0):
+            st1, rp1 = gauged_sigma(st1, rp1, i, eta)
+        st2, rp2 = states, list(raps)
+        for i in (1, 0, 1):
+            st2, rp2 = gauged_sigma(st2, rp2, i, eta)
+        err = float(torch.max(torch.abs(st1 - st2)))
+        require(err > 1e-3, f"stochastic-gauge law unexpectedly satisfies the braid relation: {err:.3e}")
+        print(f"  ✅ stochastic gauge fails the lifted relation ({err:.3e}) - a-normalized law is required")
+
+
 class TestSurrealNumbers:
     """Test surreal number scaling and field properties."""
 

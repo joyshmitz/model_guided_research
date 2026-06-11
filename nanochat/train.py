@@ -196,6 +196,47 @@ def _collect_tropical_route_coverage(model: torch.nn.Module) -> float | None:
     return (sum(vals) / len(vals)) if vals else None
 
 
+def _collect_braid_charge_stats(model: torch.nn.Module) -> dict[str, Any] | None:
+    """Collect the latest conserved-charge readings from braid attention layers
+    (bead u55.3): Q1 = mass-partition defect (exactly 0 for the rmatrix law, the
+    stochastic-gauge conservation theorem; measurably nonzero for the additive
+    heuristic modes) and Q2 = path-independence (braid relation) residual of the
+    layer's live crossing law. Per-head eta and rapidity spans ride along when
+    the law is rmatrix."""
+    q1: list[float] = []
+    q2: list[float] = []
+    etas: list[list[float]] = []
+    spans: list[list[float]] = []
+    law: str | None = None
+    for module in model.modules():
+        charges = getattr(module, "last_braid_charges", None)
+        if not isinstance(charges, dict):
+            continue
+        d1 = charges.get("q1_mass_defect")
+        d2 = charges.get("q2_braid_residual")
+        if isinstance(d1, float) and math.isfinite(d1):
+            q1.append(d1)
+        if isinstance(d2, float) and math.isfinite(d2):
+            q2.append(d2)
+        if isinstance(charges.get("eta"), list):
+            etas.append([float(x) for x in charges["eta"]])
+        if isinstance(charges.get("rapidity_span"), list):
+            spans.append([float(x) for x in charges["rapidity_span"]])
+        law = str(charges.get("crossing_law")) if charges.get("crossing_law") is not None else law
+    if not q1 and not q2:
+        return None
+    stats: dict[str, Any] = {
+        "crossing_law": law,
+        "q1_mass_defect_max": max(q1) if q1 else None,
+        "q2_braid_residual_max": max(q2) if q2 else None,
+    }
+    if etas:
+        stats["eta_per_layer"] = etas
+    if spans:
+        stats["rapidity_span_per_layer"] = spans
+    return stats
+
+
 def _collect_tropical_margin_stats(model: torch.nn.Module) -> dict[str, Any] | None:
     """Collect latest tropical margin stats from attention modules (if enabled)."""
     transformer = getattr(model, "transformer", None)
@@ -1278,6 +1319,19 @@ def train(args) -> None:
                         coverage = _collect_tropical_route_coverage(raw_model)
                         if coverage is not None:
                             record["route_coverage"] = coverage
+                    if model_type == "gpt" and getattr(config, "attention_type", None) == "braid":
+                        # D2 schema gains the conserved-charge telemetry (u55.3):
+                        # Q1 mass-partition defect and Q2 braid-consistency residual
+                        # separate integrable (rmatrix) from heuristic mixing live.
+                        braid_stats = _collect_braid_charge_stats(raw_model)
+                        if braid_stats is not None:
+                            record["braid_crossing_law"] = braid_stats.get("crossing_law")
+                            record["braid_q1_mass_defect_max"] = braid_stats.get("q1_mass_defect_max")
+                            record["braid_q2_braid_residual_max"] = braid_stats.get("q2_braid_residual_max")
+                            if "eta_per_layer" in braid_stats:
+                                record["braid_eta_per_layer"] = braid_stats["eta_per_layer"]
+                            if "rapidity_span_per_layer" in braid_stats:
+                                record["braid_rapidity_span_per_layer"] = braid_stats["rapidity_span_per_layer"]
                     metrics_stream.write(record)
 
             # Periodic validation evaluation
@@ -1647,8 +1701,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--braid-crossing-law",
         type=str,
         default=os.environ.get("NANOCHAT_BRAID_CROSSING_LAW", "restricted"),
-        choices=["restricted", "ybe"],
-        help="Braid attention only: restricted (fast, non-YBE) vs ybe (swap-output, YBE-valid; used for verification).",
+        choices=["restricted", "ybe", "rmatrix"],
+        help=(
+            "Braid attention only: restricted (fast, non-YBE) vs ybe (swap-output, YBE-valid) vs "
+            "rmatrix (trigonometric U_q(sl2) R-matrix with learned per-head deformation eta and "
+            "per-position rapidities; integrable mixing with conserved-charge telemetry, bead u55.3)."
+        ),
     )
     parser.add_argument(
         "--braid-record-schedule",

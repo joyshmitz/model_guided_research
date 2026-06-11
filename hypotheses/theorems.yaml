@@ -134,16 +134,54 @@ theorems:
       For a non-archimedean valuation v: v(xy) = v(x) + v(y) always, and
       v(x + y) >= min(v(x), v(y)) with equality whenever v(x) != v(y)
       (no leading-term cancellation). The valuation is a semiring
-      homomorphism onto (min,+) off the cancellation locus.
+      homomorphism onto (min,+) off the cancellation locus, which for binary
+      sums of Haar-uniform Z_p elements has measure exactly 1/(p+1).
     status: proved-on-paper
     mechanisms: [ultrametric, tropical]
     source_note:
-      path: pending
-      anchor: null
-    proof_location: "classical valuation theory; project assembly in bead 8gk.2"
-    numerical_checks: []
+      path: markdown_documentation/the_valuation_dictionary.md
+      anchor: "The instances"
+    proof_location: "the_valuation_dictionary.md sections 1(b) and 3 (incl. the 1/(p+1) measure computation)"
+    numerical_checks:
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_valuation_homomorphism_products_exact
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_valuation_min_rule_superadditive_and_generic_equality
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_valuation_min_rule_strict_on_constructed_cancellation
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_cancellation_locus_measure_binary_sums
     used_by: [model_guided_research-8gk.2]
     depends_on: []
+
+  - id: thm-valued-attention-structure
+    statement: >-
+      Definition + instance theorem (the dictionary): a VALUED ATTENTION
+      STRUCTURE is (V, Gamma, v, sim) with V the representation space, Gamma a
+      totally ordered value group, v a dominance valuation satisfying the
+      strong triangle axiom (ultrametric-inducing), sim a monotone score
+      transform, and v compatible with the mechanism's algebra (multiplicative
+      on products, super-additive with generic equality on sums). The
+      project's hierarchy mechanisms are instances: Q_p digits (Gamma = Z, v =
+      v_p of a difference = LCP), tropical (Gamma = R, v = leading exponent),
+      Hahn/surreal (Gamma = the exponent group, v = dominance by leading
+      term), IFS cylinders (Gamma = R via -log radius products), tree
+      boundaries (v = Gromov product). The ultrametric and tropical mechanisms
+      are the two projections (difference form / bilinear form) of this one
+      structure.
+    status: proved-on-paper
+    mechanisms: [ultrametric, tropical, surreal, fractal]
+    source_note:
+      path: markdown_documentation/the_valuation_dictionary.md
+      anchor: "valued attention structures"
+    proof_location: "the_valuation_dictionary.md sections 0-2 (definition + five instance proofs + the two projections)"
+    numerical_checks:
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_valued_bilinear_shadows_agree_with_direct_formula
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_lcp_equals_padic_valuation_of_difference
+    used_by: [model_guided_research-8gk.2, model_guided_research-8gk.5, model_guided_research-8gk.6, model_guided_research-cbm]
+    depends_on: [thm-valuation-arithmetic, thm-lcp-is-padic-valuation]
 
   - id: thm-lcp-is-padic-valuation
     statement: >-
@@ -162,6 +200,8 @@ theorems:
         ref: ultrametric.strong_triangle_inequality_lcp
       - kind: pytest
         ref: tests/test_algebraic_properties.py::test_lcp_strong_triangle_inequality_exact
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_lcp_equals_padic_valuation_of_difference
     used_by: [model_guided_research-8gk.2, model_guided_research-8gk.4]
     depends_on: []
 
@@ -171,16 +211,44 @@ theorems:
       v(<q, k>_{Q_p}) equals the (min,+) inner product of the valuation
       vectors: tropical attention computes exactly the valuation of p-adic
       bilinear attention, with the tie locus being the tropical variety where
-      routes switch.
+      routes switch. Exact genericity characterization: equality holds iff the
+      leading terms of the argmin products do not sum to 0 mod p (in
+      particular whenever the min is attained uniquely).
     status: proved-on-paper
     mechanisms: [ultrametric, tropical]
     source_note:
-      path: pending
-      anchor: null
-    proof_location: "follows from thm-valuation-arithmetic; genericity analysis owed by 8gk.2's note"
-    numerical_checks: []
+      path: markdown_documentation/the_valuation_dictionary.md
+      anchor: "tropicalization theorem"
+    proof_location: "the_valuation_dictionary.md section 3 (proof + cancellation-locus measure)"
+    numerical_checks:
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_tropicalization_of_attention_with_exact_genericity_characterization
     used_by: [model_guided_research-8gk.2]
     depends_on: [thm-valuation-arithmetic]
+
+  - id: thm-balltree-exact-attention
+    statement: >-
+      For the hard-digit difference kernel weight(q,k) = alpha^{lcp(q,k)},
+      attention sums decompose exactly over LCP shells (balls are trie nodes,
+      nested by the strong triangle inequality): out(q) = sum_d alpha^d
+      (S_{>=d}(q) - S_{>=d+1}(q)) with per-node sums S. The ball-tree
+      computes exact attention - numerator and normalizer - in O(K) per query
+      after O(NK) build; streaming insertion gives an exactly-causal O(NK)
+      attention pass (vs O(N^2 K) brute force). Correctness is a partition
+      identity, not an approximation bound.
+    status: proved-on-paper
+    mechanisms: [ultrametric]
+    source_note:
+      path: markdown_documentation/the_valuation_dictionary.md
+      anchor: "ball-tree"
+    proof_location: "the_valuation_dictionary.md section 4 (shell partition + early-exit soundness)"
+    numerical_checks:
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_balltree_attention_equals_bruteforce_exact
+      - kind: demo
+        ref: "ultrametric valued-attention section: ball-tree vs brute force equality + timing table"
+    used_by: [model_guided_research-8gk.2]
+    depends_on: [thm-lcp-is-padic-valuation]
 
   - id: thm-flat-error
     statement: >-
@@ -457,20 +525,83 @@ theorems:
       For R-matrices with spectral parameter satisfying the Yang-Baxter
       equation (trigonometric U_q(sl_2) family), row transfer matrices commute,
       [T(u), T(v)] = 0, and log-derivative expansions yield a tower of charges
-      conserved exactly through depth.
+      conserved exactly through depth. Proved for our exact configuration:
+      finite chain, inhomogeneities = the layer's learned rapidities, periodic
+      closure by partial trace over the auxiliary space (RTT train argument;
+      inhomogeneities are free because the same shift is subtracted from both
+      site arguments). The one-particle restriction has the closed form
+      implemented in one_particle_transfer, equal to the dense 2^T tensor
+      construction.
     status: proved-on-paper
     mechanisms: [braid]
     source_note:
-      path: pending
-      anchor: null
-    proof_location: "classical integrability; finite-chain/boundary proof owed by u55.3's note"
+      path: markdown_documentation/integrable_attention_rmatrix.md
+      anchor: Commuting transfer matrices
+    proof_location: "integrable_attention_rmatrix.md section 3 (RTT relation by induction + trace argument, in full)"
     numerical_checks:
       - kind: certify
         ref: braid.ybe_law_holds
       - kind: certify
         ref: braid.restricted_law_violates_ybe
+      - kind: certify
+        ref: braid.rmatrix_braid_relation_holds
+      - kind: certify
+        ref: braid.rmatrix_transfer_matrices_commute
+      - kind: certify
+        ref: braid.rmatrix_perturbed_transfer_separates
+      - kind: pytest
+        ref: tests/test_mathematical_properties.py::TestIntegrableRMatrix
     used_by: [model_guided_research-u55.3]
     depends_on: []
+
+  - id: thm-rmatrix-inversion-protected-memory
+    statement: >-
+      The trigonometric six-vertex braid law satisfies the inversion relation
+      N(w) N(-w) = I exactly (from sinh(eta+w) sinh(eta-w) = sinh^2(eta) -
+      sinh^2(w)), in both the a-normalized and the stochastic gauge (the gauge
+      scalars multiply to 1). Every rmatrix mixing layer is therefore exactly
+      invertible by the same law at negated rapidity differences: protected
+      memory by algebra, not by empirical regularity.
+    status: proved-on-paper
+    mechanisms: [braid]
+    source_note:
+      path: markdown_documentation/integrable_attention_rmatrix.md
+      anchor: The R-matrix
+    proof_location: "integrable_attention_rmatrix.md section 1 (two-line hyperbolic identity)"
+    numerical_checks:
+      - kind: certify
+        ref: braid.rmatrix_inversion_relation_holds
+      - kind: pytest
+        ref: tests/test_mathematical_properties.py::TestIntegrableRMatrix::test_inversion_relation_protected_memory
+    used_by: [model_guided_research-u55.3]
+    depends_on: []
+
+  - id: thm-rmatrix-mass-partition
+    statement: >-
+      In the stochastic gauge (bg, cg) = (b, c)/(b+c) of the trigonometric
+      crossing weights, bg + cg = 1 per crossing, so the causal monodromy
+      sweep telescopes to an exact partition of unity: sum_j A_ij +
+      prod_{j<=i} cg(u_i - u_j) = 1 for every query i. This is the Q1 charge
+      whose drift is exactly zero for the rmatrix law and measurably nonzero
+      for the additive heuristic crossing modes; the per-crossing stochastic
+      normalization does NOT satisfy the lifted braid relation (the identity
+      slots do not rescale), which is why the law is a-normalized and the
+      gauge lives only in the value kernel.
+    status: proved-on-paper
+    mechanisms: [braid]
+    source_note:
+      path: markdown_documentation/integrable_attention_rmatrix.md
+      anchor: conserved charges
+    proof_location: "integrable_attention_rmatrix.md sections 2 and 4 (telescoping; gauge subtlety in 1.2)"
+    numerical_checks:
+      - kind: certify
+        ref: braid.rmatrix_mass_partition_charge_conserved
+      - kind: pytest
+        ref: tests/test_mathematical_properties.py::TestIntegrableRMatrix::test_charge_drift_through_layer_stack_separates_laws
+      - kind: pytest
+        ref: tests/test_mathematical_properties.py::TestIntegrableRMatrix::test_stochastic_gauge_does_not_satisfy_lifted_braid_relation
+    used_by: [model_guided_research-u55.3]
+    depends_on: [thm-ybe-transfer-commutativity]
 
   - id: thm-triality-invariance
     statement: >-

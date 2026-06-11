@@ -21,6 +21,12 @@ Scenarios (run one with --scenario, or all):
   regression-gate bench-fixed-flops two variants -> mgr regressions passes on
                   self-vs-self and TRIPS (--fail-on-regression, exit 1) on a
                   deliberately degraded fixture copy
+  word-problem    (bead u55.3) group word-problem mini-eval: gen-tasks group ->
+                  train tiny braid/rmatrix + tiny standard -> eval-tasks both
+                  -> assert length_slope (held-out OLS + per-group breakdown)
+                  and conserved-charge telemetry land in the artifacts. The
+                  assertion is that the harness runs and produces slope
+                  tables, NOT that the tiny models separate.
 
 Reports: <workdir>/reports/<scenario>/e2e_report.{md,json} - stage matrix
 (pass/fail/skipped), durations, artifact inventory, repro commands. Exit is
@@ -434,6 +440,57 @@ def scenario_determinism(work: Path) -> bool:
     return r.report()
 
 
+def scenario_word_problem(work: Path) -> bool:
+    """Bead u55.3 acceptance stage: the word-problem mini-eval composes
+    gen-tasks group -> train (rmatrix + standard arms) -> eval-tasks with
+    per-length slope fits. S_3-scale lengths (dial length=4) keep every
+    held-out doc inside the tiny model's 64-token rotary cache on CPU."""
+    r = Runner(work, "word-problem")
+    data_dir = work / "diag-group" / "group"
+    try:
+        r.run("gen-tasks", CLI + ["gen-tasks", "--task", "group", "--out", str(work / "diag-group"),
+                                  "--size", "300", "--seed", "11", "--dial", "length=4"])
+        argv_rmx = _train_argv(work, "e2e-wp-rmatrix", "braid", max_steps=20, ckpt_interval=10,
+                               data_dir=data_dir) + ["--braid-crossing-law", "rmatrix", "--braid-verify"]
+        r.run("train-rmatrix", argv_rmx)
+        r.run("train-standard", _train_argv(work, "e2e-wp-standard", "standard", max_steps=20,
+                                            ckpt_interval=10, data_dir=data_dir))
+        # conserved-charge telemetry must land in the D2 metrics stream for the
+        # rmatrix arm: Q1 (mass partition) at fp32 noise, Q2 (braid residual)
+        # at fp64 noise - the integrable-vs-heuristic separation observable
+        charge_recs = [rec for rec in _metric_lines(_run_dir(work, "e2e-wp-rmatrix"))
+                       if rec.get("type") == "step" and "braid_q1_mass_defect_max" in rec]
+        r.assert_true("rmatrix-charge-telemetry",
+                      bool(charge_recs)
+                      and all(rec["braid_q1_mass_defect_max"] < 1e-5 for rec in charge_recs)
+                      and all(rec["braid_q2_braid_residual_max"] < 1e-10 for rec in charge_recs),
+                      f"{len(charge_recs)} step records carry Q1<1e-5 and Q2<1e-10 charge readings")
+        for arm in ("rmatrix", "standard"):
+            r.run(f"eval-{arm}", CLI + ["eval-tasks",
+                                        "--checkpoint", str(_run_dir(work, f"e2e-wp-{arm}") / "checkpoints"),
+                                        "--task", "group", "--dial", "length=4",
+                                        "--seeds", "0", "--examples", "12",
+                                        "--artifacts-dir", str(work / "artifacts"),
+                                        "--run-id", f"e2e-wp-eval-{arm}"])
+            summary = work / "artifacts" / "evals" / "tasks" / f"e2e-wp-eval-{arm}" / "summary.json"
+            rec = json.loads(summary.read_text())
+            slope = rec["tasks"]["group"].get("length_slope")
+            held = (slope or {}).get("held_out")
+            r.assert_true(f"eval-{arm}-slope-contract",
+                          isinstance(slope, dict) and isinstance(held, dict)
+                          and "slope" in held and "ci95" in held and held["n_docs"] >= 3
+                          and isinstance(slope.get("by_category"), dict),
+                          f"{arm}: length_slope.held_out fit present (n={held.get('n_docs') if held else 0}) "
+                          "with per-group by_category breakdown")
+            run_md = (summary.parent / "run.md").read_text()
+            r.assert_true(f"eval-{arm}-slope-table",
+                          "slope held-out" in run_md,
+                          f"{arm}: run.md renders the slope column")
+    except StageFailure:
+        pass
+    return r.report()
+
+
 def scenario_regression_gate(work: Path) -> bool:
     r = Runner(work, "regression-gate")
     try:
@@ -491,7 +548,8 @@ def scenario_regression_gate(work: Path) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--scenario", choices=["full-loop", "resume", "determinism", "regression-gate", "all"],
+    parser.add_argument("--scenario",
+                        choices=["full-loop", "resume", "determinism", "regression-gate", "word-problem", "all"],
                         default="all")
     parser.add_argument("--workdir", type=Path, default=None,
                         help="Working directory (default: a fresh temp dir OUTSIDE the repo; kept on failure)")
@@ -509,6 +567,7 @@ def main() -> int:
         "resume": lambda: scenario_resume(work, args.resume_kill_seed),
         "determinism": lambda: scenario_determinism(work),
         "regression-gate": lambda: scenario_regression_gate(work),
+        "word-problem": lambda: scenario_word_problem(work),
     }
     wanted = list(runners) if args.scenario == "all" else [args.scenario]
     results = {name: runners[name]() for name in wanted}

@@ -3346,6 +3346,103 @@ def _run_certify_checks(
             detail="crossings must preserve the payload multiset {y} exactly",
         )
 
+        # Integrable (rmatrix) law certificates - bead u55.3. fp64 throughout:
+        # these are theorems, not training artifacts, so no dtype relaxation.
+        from nanochat.braid_attention_torch import (
+            one_particle_transfer as _braid_t1p,
+        )
+        from nanochat.braid_attention_torch import (
+            rmatrix_braid_relation_residual as _rmx_braid,
+        )
+        from nanochat.braid_attention_torch import (
+            rmatrix_inversion_residual as _rmx_inv,
+        )
+
+        def _rmx_transfer_comm(perturb: float) -> float:
+            # Closed-form one-particle transfer matrices of the inhomogeneous
+            # six-vertex chain; commutator must vanish for the exact law and
+            # detectably break under an epsilon-perturbation of one Boltzmann
+            # weight (the teeth witness: commutativity is NOT generic).
+            torch.manual_seed(seed + 6)
+            T_, eta_ = 12, 0.9
+            u = torch.cumsum(torch.rand(T_, dtype=torch.float64) * 0.25 + 0.05, dim=0)
+            t1 = _braid_t1p(float(u[-1]) + 1.1, u, eta_)
+            t2 = _braid_t1p(float(u[-1]) + 2.3, u, eta_)
+            if perturb != 0.0:
+                t1 = t1.clone()
+                t1[0, 1] = t1[0, 1] * (1.0 + perturb) + perturb
+            comm = t1 @ t2 - t2 @ t1
+            return float(comm.norm() / (t1.norm() * t2.norm()))
+
+        add_check(
+            "braid",
+            "rmatrix_braid_relation_holds",
+            "classical",
+            lambda: _rmx_braid(trials=256, seed=seed),
+            tolerance=1e-10,
+            detail="spectral-parameter braid relation for the trigonometric six-vertex law (rapidities ride)",
+        )
+        add_check(
+            "braid",
+            "rmatrix_inversion_relation_holds",
+            "classical",
+            lambda: _rmx_inv(trials=256, seed=seed),
+            tolerance=1e-10,
+            detail="inversion relation N(w) N(-w) = I (protected memory: the mixing is exactly invertible)",
+        )
+        add_check(
+            "braid",
+            "rmatrix_transfer_matrices_commute",
+            "classical",
+            lambda: _rmx_transfer_comm(0.0),
+            tolerance=1e-10,
+            detail="[T(u), T(v)] = 0 for the inhomogeneous transfer family (one-particle closed form, fp64)",
+        )
+        add_check(
+            "braid",
+            "rmatrix_perturbed_transfer_separates",
+            "classical",
+            lambda: _rmx_transfer_comm(1e-1),
+            tolerance=1e-6,
+            comparator="ge",
+            detail="separation witness: perturbing one Boltzmann weight must break commutativity (teeth)",
+        )
+
+        def _rmx_mass_partition() -> float:
+            # Q1 conservation on a live forward through the actual module.
+            from nanochat.gpt import GPT, GPTConfig
+
+            torch.manual_seed(seed + 7)
+            cfg = GPTConfig(
+                n_layer=1,
+                n_head=2,
+                n_kv_head=2,
+                n_embd=32,
+                sequence_len=24,
+                vocab_size=64,
+                attention_type="braid",
+                braid_crossing_law="rmatrix",
+            )
+            model = GPT(cfg)
+            model.eval()
+            with torch.no_grad():
+                model(torch.randint(0, 64, (1, 24)))
+            worst = 0.0
+            for module in model.modules():
+                charges = getattr(module, "last_braid_charges", None)
+                if isinstance(charges, dict) and isinstance(charges.get("q1_mass_defect"), float):
+                    worst = max(worst, charges["q1_mass_defect"])
+            return worst
+
+        add_check(
+            "braid",
+            "rmatrix_mass_partition_charge_conserved",
+            "classical",
+            _rmx_mass_partition,
+            tolerance=1e-5,
+            detail="Q1: sum_j A_ij + leftover_i = 1 exactly (stochastic gauge; live module forward)",
+        )
+
     # ----- simplicial: mass conservation through 1-hop and 2-hop paths -----
     if "simplicial" in mechanisms:
 
@@ -4212,14 +4309,24 @@ def _load_eval_checkpoint(checkpoint_dir: Path, step: int | None, device: Any) -
 
 
 def _eval_tasks_provenance(
-    ckpt_meta: dict[str, Any], *, seeds: list[int], examples: int, decode_modes: list[str]
+    ckpt_meta: dict[str, Any],
+    *,
+    seeds: list[int],
+    examples: int,
+    decode_modes: list[str],
+    dials: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     from nanochat.report import build_provenance
 
+    eval_recipe: dict[str, Any] = {"seeds": seeds, "examples": examples, "decode_modes": decode_modes}
+    if dials:
+        # dial overrides change the evidence-producing recipe (doc difficulty),
+        # so they are part of the tamper-evident hash, not an invisible knob
+        eval_recipe["dials"] = dials
     return build_provenance(
         {
             "model_config": ckpt_meta.get("model_config"),
-            "eval": {"seeds": seeds, "examples": examples, "decode_modes": decode_modes},
+            "eval": eval_recipe,
         }
     )
 
@@ -4238,6 +4345,10 @@ _EVAL_TASKS_SCHEMA_VERSION = "mgr.evaltasks.v2"
 #         {"mean": float, "per_seed": [float|null, ...], "majority_answer": str}} | null,
 #     "perplexity": {"in_range": float, "held_out": float},
 #     "curve": {"buckets": [...], "accuracy": [...], "counts": [...]} | null,
+#     "length_slope": {"held_out"|"all":
+#         {"slope": float, "ci95": [lo, hi], "intercept": float, "n_docs": int,
+#          "basis": str} | null,
+#       "by_category"?: {<cat>: <same shape> | null}} | null,
 #     "skipped_too_long": int, "n_examples_per_seed": int}}}
 # Changing this layout requires a schema_version bump and a migration note.
 # v1 -> v2 (2026-06-10, beads 27q3/i4eq): adds (a) per-task answer_prior - the
@@ -4248,11 +4359,19 @@ _EVAL_TASKS_SCHEMA_VERSION = "mgr.evaltasks.v2"
 # generations.jsonl (meta.receipts), so behavioral claims about checkpoints
 # (e.g. "every arm answers 'lt' on every prompt") are committed evidence, not
 # session lore. v1 artifacts remain readable by the verdict engine.
+# 2026-06-11 (bead u55.3, additive within v2 - no consumer reads break): adds
+# per-task length_slope, the doc-level OLS slope (with CI95) of greedy
+# exact-match against the difficulty axis, fit separately on held-out docs and
+# on all docs. This is the length-generalization observable the preregistered
+# word-problem hypotheses (hyp-rmatrix-*) adjudicate against; null when the
+# task has no difficulty axis or too few scored docs.
 
 
-def _eval_split_examples(spec: Any, *, n: int, seed: int) -> tuple[list[str], list[str], float | None]:
+def _eval_split_examples(
+    spec: Any, *, n: int, seed: int, dials: dict[str, float] | None = None
+) -> tuple[list[str], list[str], float | None]:
     """(in-range docs, held-out docs, in_range_max difficulty)."""
-    splits = spec.generate(max(10 * n, 30), seed, spec.resolve_dials(None))
+    splits = spec.generate(max(10 * n, 30), seed, spec.resolve_dials(dials))
     in_range = splits["train"][:n]
     held_out = splits["test"][:n]
     in_range_max = None
@@ -4328,6 +4447,10 @@ def eval_tasks(
     examples: Annotated[int, typer.Option(help="Examples per split per seed")] = 24,
     sampled: Annotated[bool, typer.Option("--sampled", help="Also score temperature-1 sampled decoding")] = False,
     verbose: Annotated[bool, typer.Option("--verbose", help="Log per-example failures (capped per task)")] = False,
+    dial: Annotated[
+        list[str] | None,
+        typer.Option(help="Difficulty dial override name=value (repeatable; recorded in provenance)"),
+    ] = None,
     artifacts_dir: Annotated[Path, typer.Option(help="Artifacts root")] = Path("artifacts"),
     run_id: Annotated[str | None, typer.Option(help="Run identifier (default: timestamp)")] = None,
 ) -> None:
@@ -4367,6 +4490,24 @@ def eval_tasks(
         console.print("[bold red]--seeds must contain at least one integer.[/bold red]")
         raise typer.Exit(code=2)
 
+    dial_overrides: dict[str, float] = {}
+    for pair in dial or []:
+        key, sep, value = pair.partition("=")
+        if not sep:
+            console.print(f"[bold red]--dial expects name=value, got {pair!r}[/bold red]")
+            raise typer.Exit(code=2)
+        try:
+            dial_overrides[key.strip()] = float(value)
+        except ValueError:
+            console.print(f"[bold red]--dial value must be numeric, got {pair!r}[/bold red]")
+            raise typer.Exit(code=2) from None
+    if dial_overrides:
+        known = {d.name for n in names for d in TASKS[n].dials}
+        unknown_dials = sorted(set(dial_overrides) - known)
+        if unknown_dials:
+            console.print(f"[bold red]--dial names {unknown_dials} match no dial of the selected tasks.[/bold red]")
+            raise typer.Exit(code=2)
+
     model, ckpt_meta, resolved_step = _load_eval_checkpoint(checkpoint, step, device)
     tok = get_tokenizer()
     n_params = sum(p.numel() for p in model.parameters())
@@ -4401,14 +4542,17 @@ def eval_tasks(
         prior_counts: dict[str, list[dict[str, int]]] = {"in_range": [], "held_out": []}
         ppl_in: list[float] = []
         ppl_out: list[float] = []
-        curve_points: list[tuple[float, bool]] = []
+        curve_points: list[tuple[float, bool, str, str | None]] = []
         skipped = 0
         failures_logged = 0
         in_range_max: float | None = None
 
+        spec_dials = {k: v for k, v in dial_overrides.items() if k in {d.name for d in spec.dials}}
         with console.status(f"[bold cyan]evaluating {name}…[/bold cyan]"):
             for eval_seed in seed_list:
-                in_docs, out_docs, seed_in_range_max = _eval_split_examples(spec, n=examples, seed=eval_seed)
+                in_docs, out_docs, seed_in_range_max = _eval_split_examples(
+                    spec, n=examples, seed=eval_seed, dials=spec_dials or None
+                )
                 # the train-regime boundary is the max over EVERY seed's train split
                 if seed_in_range_max is not None:
                     in_range_max = seed_in_range_max if in_range_max is None else max(in_range_max, seed_in_range_max)
@@ -4456,7 +4600,8 @@ def eval_tasks(
                                 seed_expected[expected] = seed_expected.get(expected, 0) + 1
                                 diff = spec.difficulty(doc) if spec.difficulty else None
                                 if diff is not None:
-                                    curve_points.append((diff, correct))
+                                    cat = spec.category(doc) if spec.category else None
+                                    curve_points.append((diff, correct, region, cat))
                             if verbose and not correct and failures_logged < failure_log_cap:
                                 failures_logged += 1
                                 console.print(
@@ -4509,14 +4654,60 @@ def eval_tasks(
 
         curve: dict[str, Any] | None = None
         if curve_points:
-            buckets = sorted({d for d, _ in curve_points})
+            buckets = sorted({d for d, _, _, _ in curve_points})
             accuracy = []
             counts = []
             for b in buckets:
-                hits = [c for d, c in curve_points if d == b]
+                hits = [c for d, c, _, _ in curve_points if d == b]
                 accuracy.append(sum(hits) / len(hits))
                 counts.append(len(hits))
             curve = {"buckets": buckets, "accuracy": accuracy, "counts": counts}
+
+        def slope_fit(points: list[tuple[float, bool]]) -> dict[str, Any] | None:
+            # Doc-level OLS of correctness on the difficulty axis: the
+            # length-generalization slope (bead u55.3 - the preregistered
+            # word-problem predictions compare these slopes across mechanisms).
+            # CI95 from the slope's standard error; degenerate spreads -> None.
+            if len(points) < 3:
+                return None
+            xs = [float(d) for d, _ in points]
+            ys = [float(c) for _, c in points]
+            n = len(xs)
+            x_mean = sum(xs) / n
+            y_mean = sum(ys) / n
+            sxx = sum((x - x_mean) ** 2 for x in xs)
+            if sxx <= 0:
+                return None
+            slope = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)) / sxx
+            intercept = y_mean - slope * x_mean
+            if n > 2:
+                rss = sum((y - (intercept + slope * x)) ** 2 for x, y in zip(xs, ys))
+                se = (rss / (n - 2) / sxx) ** 0.5
+            else:
+                se = 0.0
+            half = 1.96 * se
+            return {
+                "slope": slope,
+                "ci95": [slope - half, slope + half],
+                "intercept": intercept,
+                "n_docs": n,
+                "basis": "doc-level OLS of greedy exact-match on the difficulty axis",
+            }
+
+        length_slope: dict[str, Any] | None = None
+        if curve_points:
+            length_slope = {
+                "held_out": slope_fit([(d, c) for d, c, r, _ in curve_points if r == "held_out"]),
+                "all": slope_fit([(d, c) for d, c, _, _ in curve_points]),
+            }
+            categories = sorted({cat for _, _, _, cat in curve_points if cat is not None})
+            if categories:
+                # per-category held-out slopes: the mechanism-specificity
+                # breakdown (e.g. the group task's S5/A5 vs Z60/S3 controls)
+                length_slope["by_category"] = {
+                    cat: slope_fit([(d, c) for d, c, r, cc in curve_points if r == "held_out" and cc == cat])
+                    for cat in categories
+                }
 
         results[name] = {
             "difficulty_axis": spec.difficulty_axis,
@@ -4525,6 +4716,7 @@ def eval_tasks(
             "answer_prior": answer_prior,
             "perplexity": {"in_range": stats_mod.mean(ppl_in), "held_out": stats_mod.mean(ppl_out)},
             "curve": curve,
+            "length_slope": length_slope,
             "skipped_too_long": skipped,
             "n_examples_per_seed": examples,
         }
@@ -4585,6 +4777,7 @@ def eval_tasks(
             "seeds": seed_list,
             "examples_per_seed": examples,
             "decode_modes": [m for m, _ in decode_modes],
+            "dials": dial_overrides or None,
             "git": _get_git_info(),
             "receipts": "generations.jsonl",
         },
@@ -4592,7 +4785,11 @@ def eval_tasks(
         # tainted artifacts. config_hash here covers the EVAL parameters plus
         # the checkpoint's model config (the full evidence-producing recipe).
         "provenance": _eval_tasks_provenance(
-            ckpt_meta, seeds=seed_list, examples=examples, decode_modes=[m for m, _ in decode_modes]
+            ckpt_meta,
+            seeds=seed_list,
+            examples=examples,
+            decode_modes=[m for m, _ in decode_modes],
+            dials=dial_overrides or None,
         ),
         "tasks": results,
     }
@@ -4603,6 +4800,7 @@ def eval_tasks(
     table.add_column("EM in-range", justify="right")
     table.add_column("EM held-out", justify="right")
     table.add_column("ppl in/held", justify="right")
+    table.add_column("slope held-out [CI95]", justify="right")
     table.add_column("axis")
     md_rows = []
     for name, rec in results.items():
@@ -4613,9 +4811,14 @@ def eval_tasks(
             em_in = f"{g_in['mean']:.3f}" if g_in else "-"
             em_out = f"{g_out['mean']:.3f}" if g_out else "-"
         ppl = f"{rec['perplexity']['in_range']:.1f}/{rec['perplexity']['held_out']:.1f}"
-        table.add_row(name, em_in, em_out, ppl, rec["difficulty_axis"] or "(lm-only)")
+        slope_cell = "-"
+        ls = rec.get("length_slope") or {}
+        held = ls.get("held_out") if isinstance(ls, dict) else None
+        if held:
+            slope_cell = f"{held['slope']:+.4f} [{held['ci95'][0]:+.4f},{held['ci95'][1]:+.4f}]"
+        table.add_row(name, em_in, em_out, ppl, slope_cell, rec["difficulty_axis"] or "(lm-only)")
         curve_cell = f"[curve]({curve_files[name]})" if name in curve_files else "-"
-        md_rows.append(f"| {name} | {em_in} | {em_out} | {ppl} | {curve_cell} |")
+        md_rows.append(f"| {name} | {em_in} | {em_out} | {ppl} | {slope_cell} | {curve_cell} |")
     console.print(table)
 
     report_md = (
@@ -4624,13 +4827,247 @@ def eval_tasks(
         f"- attention_type: {summary['meta']['checkpoint']['attention_type']}\n"
         f"- n_params: {n_params:,}\n"
         f"- seeds: {seed_list} · examples/seed: {examples} · decode: {[m for m, _ in decode_modes]}\n\n"
-        "| task | EM in-range | EM held-out | ppl in/held | curve |\n|---|---|---|---|---|\n"
+        "| task | EM in-range | EM held-out | ppl in/held | slope held-out [CI95] | curve |\n|---|---|---|---|---|---|\n"
         + "\n".join(md_rows)
         + "\n\nSee `summary.json` (schema mgr.evaltasks.v2) for the full contract output and "
         "`generations.jsonl` for per-example receipts.\n"
     )
     (run_dir / "run.md").write_text(report_md)
     console.print(f"[bold green]Wrote eval artifacts[/bold green] → {run_dir}")
+
+
+@app.command("probe-charges")
+def probe_charges(
+    checkpoint: Annotated[Path, typer.Option(help="Checkpoint directory (rz8.1 layout); must be braid/rmatrix")],
+    step: Annotated[int | None, typer.Option(help="Checkpoint step (default: latest)")] = None,
+    task: Annotated[str, typer.Option(help="Diagnostic task with a category extractor (default: group)")] = "group",
+    examples: Annotated[int, typer.Option(help="Documents to probe (split 80/20 train/test per category)")] = 240,
+    seed: Annotated[int, typer.Option(help="Generator + probe-fit seed")] = 0,
+    device_str: Annotated[str, typer.Option("--device", help="cpu | cuda")] = "cpu",
+    dial: Annotated[
+        list[str] | None, typer.Option(help="Difficulty dial override name=value (repeatable)")
+    ] = None,
+    artifacts_dir: Annotated[Path, typer.Option(help="Artifacts root")] = Path("artifacts"),
+    run_id: Annotated[str | None, typer.Option(help="Run identifier (default: timestamp)")] = None,
+) -> None:
+    """Charge-decoding probe (bead u55.3, referee round 3 mandatory deliverable).
+
+    Conservation alone proves nothing - conservation of a USELESS quantity is
+    free. This probe tests the second half of the protected-memory story: are
+    the conserved charges DECODABLE to the task's ground-truth group state?
+    For each document, the per-head charge observables q_hk = <v, t_h(theta_k) v>
+    (t = one-particle transfer matrices built from the FINAL braid layer's
+    learned eta/rapidities; v = that layer's value sequences) feed a linear
+    probe and a small-MLP probe predicting the composed group element.
+    Preregistered expectation (hyp-rmatrix-charge-decodability): decodable for
+    the abelian control (Z60), at or near chance for the non-solvable groups
+    whose product is order-sensitive - if charges decode nothing anywhere, the
+    honest conclusion is 'integrable structure conserves the wrong quantities
+    for this task', reported as such.
+    """
+    import torch
+
+    from nanochat.braid_attention_torch import BraidCausalSelfAttention, one_particle_transfer
+    from nanochat.diagnostics_data import TASKS
+    from nanochat.tokenizer import get_tokenizer
+
+    device = torch.device(device_str)
+    if task not in TASKS:
+        console.print(f"[bold red]Unknown task {task!r}; available: {', '.join(sorted(TASKS))}[/bold red]")
+        raise typer.Exit(code=2)
+    spec = TASKS[task]
+    if spec.category is None or spec.answer_marker is None:
+        console.print(f"[bold red]Task {task!r} has no category extractor / answer marker.[/bold red]")
+        raise typer.Exit(code=2)
+
+    dial_overrides: dict[str, float] = {}
+    for pair in dial or []:
+        key, sep, value = pair.partition("=")
+        if not sep:
+            console.print(f"[bold red]--dial expects name=value, got {pair!r}[/bold red]")
+            raise typer.Exit(code=2)
+        dial_overrides[key.strip()] = float(value)
+
+    model, ckpt_meta, resolved_step = _load_eval_checkpoint(checkpoint, step, device)
+    model_cfg = ckpt_meta.get("model_config", {})
+    if model_cfg.get("attention_type") != "braid" or model_cfg.get("braid_crossing_law") != "rmatrix":
+        console.print(
+            "[bold red]probe-charges requires a braid/rmatrix checkpoint "
+            f"(got attention_type={model_cfg.get('attention_type')!r}, "
+            f"braid_crossing_law={model_cfg.get('braid_crossing_law')!r}).[/bold red]"
+        )
+        raise typer.Exit(code=2)
+    tok = get_tokenizer()
+
+    braid_layers = [m for m in model.modules() if isinstance(m, BraidCausalSelfAttention)]
+    final_attn = braid_layers[-1]
+    captured: dict[str, torch.Tensor] = {}
+
+    def _capture(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        captured["x"] = args[0].detach()
+
+    hook = final_attn.register_forward_pre_hook(_capture, with_kwargs=True)
+
+    eta = final_attn.rmatrix_eta().to(torch.float64)  # (H,)
+    u_all = final_attn.rmatrix_rapidities().to(torch.float64)  # (H, S)
+    n_head = int(model.config.n_head)
+    head_dim = int(model.config.n_embd) // n_head
+    # two probe points beyond the rapidity range generate the charge tower
+    theta_offsets = (0.7, 1.6)
+    transfer_cache: dict[tuple[int, int, int], torch.Tensor] = {}
+
+    def charge_features(v_heads: torch.Tensor) -> list[float]:
+        # v_heads: (T, H, D) fp32 -> n_head * len(theta_offsets) features
+        T = v_heads.size(0)
+        feats: list[float] = []
+        v64 = v_heads.to(torch.float64)
+        for h in range(n_head):
+            vh = v64[:, h, :]  # (T, D)
+            denom = float((vh * vh).sum()) or 1.0
+            for k, off in enumerate(theta_offsets):
+                key = (h, T, k)
+                if key not in transfer_cache:
+                    u_h = u_all[h, :T]
+                    transfer_cache[key] = one_particle_transfer(float(u_h[-1]) + off, u_h, float(eta[h]))
+                t_mat = transfer_cache[key]
+                feats.append(float((vh * (t_mat @ vh)).sum()) / denom)
+        return feats
+
+    splits = spec.generate(max(examples, 30), seed, spec.resolve_dials(dial_overrides or None))
+    docs = (splits["train"] + splits["test"])[:examples]
+    by_cat: dict[str, list[tuple[list[float], str]]] = {}
+    skipped = 0
+    with console.status("[bold cyan]extracting charge features…[/bold cyan]"):
+        for doc in docs:
+            parts = spec.split_prompt(doc)
+            cat = spec.category(doc)
+            if parts is None or cat is None:
+                continue
+            prompt, expected = parts
+            ids = tok.encode(prompt)
+            if len(ids) > model.config.sequence_len:
+                skipped += 1
+                continue
+            with torch.inference_mode():
+                model(torch.tensor([ids], dtype=torch.long, device=device))
+                x = captured["x"]  # (1, T, C)
+                v = final_attn.c_v(x).view(x.size(1), n_head, head_dim)
+                feats = charge_features(v)
+            by_cat.setdefault(cat, []).append((feats, expected))
+    hook.remove()
+
+    def fit_probe(rows: list[tuple[list[float], str]], hidden: int | None) -> tuple[float, float, int]:
+        # (train_acc, test_acc, n_classes); deterministic fp32 full-batch fit
+        gen = torch.Generator().manual_seed(seed)
+        labels = sorted({y for _, y in rows})
+        idx = {y: i for i, y in enumerate(labels)}
+        X = torch.tensor([f for f, _ in rows], dtype=torch.float32)
+        X = (X - X.mean(0)) / (X.std(0) + 1e-8)
+        y = torch.tensor([idx[lab] for _, lab in rows], dtype=torch.long)
+        perm = torch.randperm(len(rows), generator=gen)
+        n_test = max(1, len(rows) // 5)
+        te, tr = perm[:n_test], perm[n_test:]
+        if hidden:
+            net: torch.nn.Module = torch.nn.Sequential(
+                torch.nn.Linear(X.size(1), hidden), torch.nn.ReLU(), torch.nn.Linear(hidden, len(labels))
+            )
+        else:
+            net = torch.nn.Linear(X.size(1), len(labels))
+        torch.manual_seed(seed)
+        for m in net.modules():
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                torch.nn.init.zeros_(m.bias)
+        opt = torch.optim.Adam(net.parameters(), lr=1e-2)
+        for _ in range(300):
+            opt.zero_grad()
+            loss = torch.nn.functional.cross_entropy(net(X[tr]), y[tr])
+            loss.backward()
+            opt.step()
+        with torch.no_grad():
+            tr_acc = float((net(X[tr]).argmax(-1) == y[tr]).float().mean())
+            te_acc = float((net(X[te]).argmax(-1) == y[te]).float().mean())
+        return tr_acc, te_acc, len(labels)
+
+    group_sizes = {"s5": 120, "a5": 60, "z60": 60, "s3": 6}
+    results: dict[str, Any] = {}
+    table = Table(title=f"charge-decoding probe — {checkpoint} @ {resolved_step}", box=box.SIMPLE_HEAVY)
+    for col in ("category", "n_docs", "classes", "chance", "linear test acc", "mlp test acc", "verdict"):
+        table.add_column(col, justify="right" if col != "category" else "left")
+    for cat in sorted(by_cat):
+        rows = by_cat[cat]
+        if len(rows) < 10:
+            results[cat] = {"n_docs": len(rows), "skipped": "fewer than 10 docs"}
+            table.add_row(cat, str(len(rows)), "-", "-", "-", "-", "[yellow]skipped[/yellow]")
+            continue
+        lin_tr, lin_te, n_cls = fit_probe(rows, hidden=None)
+        mlp_tr, mlp_te, _ = fit_probe(rows, hidden=64)
+        chance = 1.0 / group_sizes.get(cat, n_cls)
+        decodable = max(lin_te, mlp_te) > 2.0 * chance
+        results[cat] = {
+            "n_docs": len(rows),
+            "n_classes_observed": n_cls,
+            "chance": chance,
+            "linear": {"train_acc": lin_tr, "test_acc": lin_te},
+            "mlp": {"train_acc": mlp_tr, "test_acc": mlp_te},
+            "decodable_at_2x_chance": decodable,
+        }
+        verdict = "[green]decodable[/green]" if decodable else "[red]~chance[/red]"
+        table.add_row(cat, str(len(rows)), str(n_cls), f"{chance:.3f}", f"{lin_te:.3f}", f"{mlp_te:.3f}", verdict)
+    console.print(table)
+    if skipped:
+        console.print(f"[yellow]{skipped} docs skipped (prompt longer than the rotary cache)[/yellow]")
+
+    resolved_run_id = run_id or time.strftime("%Y%m%d_%H%M%S")
+    run_dir = artifacts_dir / "probes" / "charges" / resolved_run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "schema_version": "mgr.chargeprobe.v1",
+        "kind": "probe-charges",
+        "meta": {
+            "run_id": resolved_run_id,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "checkpoint": {"dir": str(checkpoint), "step": resolved_step},
+            "task": task,
+            "examples": examples,
+            "seed": seed,
+            "dials": dial_overrides or None,
+            "theta_offsets": list(theta_offsets),
+            "feature_basis": "per-head <v, t(theta_k) v>/<v, v> at the final braid layer",
+            "git": _get_git_info(),
+        },
+        "categories": results,
+        "skipped_too_long": skipped,
+    }
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    md = [
+        f"# probe-charges — {resolved_run_id}",
+        "",
+        f"- checkpoint: `{checkpoint}` @ step {resolved_step}",
+        f"- task: {task} · examples: {examples} · seed: {seed}",
+        "- features: per-head charge observables `<v, t(theta_k) v>` of the final braid layer",
+        "",
+        "| category | n | classes | chance | linear test | mlp test | decodable@2x |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for cat, rec in sorted(results.items()):
+        if "skipped" in rec:
+            md.append(f"| {cat} | {rec['n_docs']} | - | - | - | - | skipped |")
+        else:
+            md.append(
+                f"| {cat} | {rec['n_docs']} | {rec['n_classes_observed']} | {rec['chance']:.3f} "
+                f"| {rec['linear']['test_acc']:.3f} | {rec['mlp']['test_acc']:.3f} "
+                f"| {rec['decodable_at_2x_chance']} |"
+            )
+    md.append("")
+    md.append(
+        "Both halves of the protected-memory story are required: conservation "
+        "(certify: braid.rmatrix_mass_partition_charge_conserved) AND decodability (this probe). "
+        "If conservation holds but decodability fails, the conclusion is that the integrable "
+        "structure conserves the wrong quantities for this task - a result, not a bug."
+    )
+    (run_dir / "run.md").write_text("\n".join(md) + "\n")
+    console.print(f"[bold green]Wrote charge-probe artifacts[/bold green] → {run_dir}")
 
 
 def _sample_stream(
@@ -4975,6 +5412,11 @@ _CERTIFY_NAMED_CHECKS: frozenset[str] = frozenset(
     {
         "braid.payload_multiset_invariance",
         "braid.restricted_law_violates_ybe",
+        "braid.rmatrix_braid_relation_holds",
+        "braid.rmatrix_inversion_relation_holds",
+        "braid.rmatrix_mass_partition_charge_conserved",
+        "braid.rmatrix_perturbed_transfer_separates",
+        "braid.rmatrix_transfer_matrices_commute",
         "braid.ybe_law_holds",
         "fractal.router_branch_simplex",
         "gauge.kv_decode_matches_full_forward",
