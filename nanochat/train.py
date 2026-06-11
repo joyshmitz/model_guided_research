@@ -559,6 +559,7 @@ def train(args) -> None:
             braid_verify = getattr(args, "braid_verify", None)
             if braid_verify is not None:
                 config.braid_verify = bool(braid_verify)
+            config.braid_rmatrix_probes = int(getattr(args, "braid_rmatrix_probes", config.braid_rmatrix_probes))
         if config.use_flex_attention and config.attention_type != "standard":
             if ddp_rank == 0:
                 print0("[flex] --use-flex-attention only applies to --attention-type standard; disabling.")
@@ -1739,6 +1740,15 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Braid attention only: verify discrete decode invariants; and check YBE once when braid-crossing-law=ybe.",
+    )
+    parser.add_argument(
+        "--braid-rmatrix-probes",
+        type=int,
+        default=int(os.environ.get("NANOCHAT_BRAID_RMATRIX_PROBES", "0")),
+        help=(
+            "Braid rmatrix law only: number of spectral multi-view probe sweeps per head "
+            "(0i1v; zero-init gates, 0 = off). The causal realization of the TL/Markov-trace readout."
+        ),
     )
     parser.add_argument(
         "--ultrametric-mode",

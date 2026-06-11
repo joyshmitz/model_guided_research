@@ -262,10 +262,24 @@ are Jones-polynomial evaluations — *invariant under Markov moves*, i.e.
 under exactly the rewrites that change a braid word without changing its
 closure. Design for sequence-level invariant pooling: evaluate tr_M on the
 layer's crossing word at K spectral points and concatenate — a pooled
-representation invariant to schedule rewrites by construction. This is a
-readout *design* (the bead's deliverable is the construction, not a trained
-claim); the natural first implementation slot is a `finalize()` hook variant,
-left as the follow-on experiment after the word-problem campaign.
+representation invariant to schedule rewrites by construction.
+
+**The causal realization (bead 0i1v).** A global pooled trace cannot enter
+the residual stream of a causal LM (it reads the future), and the Markov
+trace needs a *closed* word while every causal prefix is open. The open-word
+analogue of a trace evaluation is the **monodromy element itself at a fixed
+spectral point**: for each query position i, sweep the prefix with K extra
+probe rapidities θ_k = u_i + δ_k (learned δ_k > 0 keeps every causal argument
+in the stable region) and gate the resulting transported values into the
+output with zero-init per-(head, probe) gates (`--braid-rmatrix-probes K`,
+parameters `rmatrix_probe_delta_raw` / `rmatrix_probe_gate`). At init the
+mechanism is bitwise the base sweep (asserted exactly in
+`test_nanochat_braid_rmatrix_spectral_probes_zero_init_and_kv_parity`);
+training opens the spectral views it finds useful. Each view satisfies its
+own mass-partition identity; Q1 telemetry tracks the base view, and the
+gated views are explicit, learned departures from it. The closed-word Markov
+trace remains available off-line: the charge observables ⟨v, t(θ_k) v⟩ that
+`mgr probe-charges` computes are precisely its quadratic shadows.
 
 ## 6) Circuit class: precisely scoped claims
 

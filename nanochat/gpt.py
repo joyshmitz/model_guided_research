@@ -194,6 +194,7 @@ class GPTConfig:
     braid_crossing_law: str = "restricted"  # "restricted" | "ybe" | "rmatrix" (integrable, u55.3)
     braid_record_schedule: bool = False
     braid_verify: bool = False
+    braid_rmatrix_probes: int = 0  # rmatrix only: spectral multi-view probe sweeps (0i1v; 0 = off)
 
 
 class CausalSelfAttention(AttentionCore):

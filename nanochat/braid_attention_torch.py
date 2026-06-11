@@ -210,6 +210,22 @@ class BraidCausalSelfAttention(AttentionCore):
             # uniform rapidity continuation, the integrable analogue of RoPE's
             # by-formula extrapolation.
             self.rmatrix_rho = nn.Parameter(torch.full((self.n_head, seq_len * 10), _softplus_inv(0.10)))
+            # Spectral multi-view readout (bead 0i1v, the causal realization of
+            # the TL/Markov-trace design in the theory note section 5): K extra
+            # monodromy sweeps per query at probe rapidities ABOVE the query's
+            # own (theta_k = u_i + delta_k, delta_k > 0, so every causal
+            # argument stays in the stable region), gated into the output with
+            # ZERO-INIT per-(head, probe) gates - at init the mechanism is
+            # bitwise the base sweep; training opens the spectral views it
+            # finds useful. 0 probes (the default) creates no parameters.
+            self.rmatrix_n_probes = int(getattr(config, "braid_rmatrix_probes", 0))
+            if self.rmatrix_n_probes < 0:
+                raise ValueError(f"braid_rmatrix_probes must be >= 0, got {self.rmatrix_n_probes}")
+            if self.rmatrix_n_probes > 0:
+                self.rmatrix_probe_delta_raw = nn.Parameter(
+                    torch.full((self.n_head, self.rmatrix_n_probes), _softplus_inv(0.5))
+                )
+                self.rmatrix_probe_gate = nn.Parameter(torch.zeros(self.n_head, self.rmatrix_n_probes))
             # The integrable law is purely positional: the scaffold-mandated
             # q/k projections are dead weights in this mode. Freeze them so
             # optimizers that demand a gradient for every parameter (Muon)
@@ -332,15 +348,34 @@ class BraidCausalSelfAttention(AttentionCore):
         uk = u_all[:, :Tk]  # (H, Tk)
         w = uq.unsqueeze(-1) - uk.unsqueeze(1)  # (H, Tq, Tk); >= 0 iff j <= qpos_i
         valid = w >= 0
-        sh_w = torch.where(valid, torch.sinh(w), torch.zeros((), device=w.device))
-        sh_e = torch.sinh(eta)
-        denom = sh_w + sh_e
-        bg = torch.where(valid, sh_w / denom, torch.zeros((), device=w.device))
-        log_cg = torch.where(valid, torch.log(sh_e / denom), torch.zeros((), device=w.device))
-        cum = torch.cumsum(log_cg, dim=-1)  # (H, Tq, Tk)
-        total = cum[..., -1:]
-        weights = bg * torch.exp(total - cum)  # suffix product prod_{j'>j} cg
-        leftover = torch.exp(total).squeeze(-1)  # (H, Tq): untransported aux mass
+
+        def kernel_rows(w_arg: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # (weights, leftover) of one monodromy sweep family; exact mass
+            # partition per row: weights.sum(-1) + leftover = 1.
+            sh_w = torch.where(valid, torch.sinh(w_arg), torch.zeros((), device=w_arg.device))
+            sh_e = torch.sinh(eta)
+            denom = sh_w + sh_e
+            bg = torch.where(valid, sh_w / denom, torch.zeros((), device=w_arg.device))
+            log_cg = torch.where(valid, torch.log(sh_e / denom), torch.zeros((), device=w_arg.device))
+            cum = torch.cumsum(log_cg, dim=-1)  # (H, Tq, Tk)
+            total = cum[..., -1:]
+            return bg * torch.exp(total - cum), torch.exp(total).squeeze(-1)
+
+        weights, leftover = kernel_rows(w)
+        out = weights.unsqueeze(0).to(v.dtype) @ v  # (B, H, Tq, D)
+
+        # Spectral multi-view readout (0i1v): extra monodromy sweeps at probe
+        # rapidities theta_k = u_i + delta_k (delta_k > 0 keeps every causal
+        # argument in the stable region), gated in with zero-init gates. Each
+        # view satisfies its own mass partition; Q1 telemetry tracks the base
+        # view (gated views are explicit, learned departures from it).
+        if getattr(self, "rmatrix_n_probes", 0) > 0:
+            delta = torch.nn.functional.softplus(self.rmatrix_probe_delta_raw.float()) + _RMATRIX_GAP_MIN
+            for kp in range(self.rmatrix_n_probes):
+                w_k = w + delta[:, kp].view(-1, 1, 1)
+                weights_k, _ = kernel_rows(w_k)
+                gate = self.rmatrix_probe_gate[:, kp].view(1, -1, 1, 1).to(v.dtype)
+                out = out + gate * (weights_k.unsqueeze(0).to(v.dtype) @ v)
 
         with torch.no_grad():
             defect = torch.max(torch.abs(weights.sum(dim=-1) + leftover - 1.0))
@@ -353,7 +388,7 @@ class BraidCausalSelfAttention(AttentionCore):
                 "rapidity_span": [float(x) for x in (uk[:, -1] - uk[:, 0]).detach()],
             }
 
-        return weights.unsqueeze(0).to(v.dtype) @ v  # (B, H, Tq, D)
+        return out
 
     def _live_braid_residual(self) -> float:
         # Q2 telemetry: path-independence of transport, measured on the LIVE

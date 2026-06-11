@@ -6,6 +6,7 @@
     "braid_crossing_law": "restricted",
     "braid_mode": "soft",
     "braid_record_schedule": false,
+    "braid_rmatrix_probes": 0,
     "braid_tau": 0.0,
     "braid_verify": false,
     "ca_init_alpha": 1.0,

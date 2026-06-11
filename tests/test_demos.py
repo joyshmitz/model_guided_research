@@ -232,6 +232,64 @@ def test_nanochat_braid_rmatrix_kv_cache_parity_and_charges():
     require(isinstance(charges["eta"], list) and len(charges["eta"]) == config.n_head, "Expected per-head eta")
 
 
+def test_nanochat_braid_rmatrix_spectral_probes_zero_init_and_kv_parity():
+    """Spectral multi-view probes (0i1v): zero-init gates make the probed
+    mechanism bitwise the base sweep at init; gates receive gradients; the
+    house KV-decode contract holds with probes enabled."""
+    import torch
+
+    from nanochat.engine import KVCache
+    from nanochat.gpt import GPT, GPTConfig
+
+    def build(n_probes: int):
+        torch.manual_seed(0)
+        cfg = GPTConfig(
+            sequence_len=16,
+            vocab_size=128,
+            n_layer=2,
+            n_head=4,
+            n_kv_head=2,
+            n_embd=64,
+            attention_type="braid",
+            braid_crossing_law="rmatrix",
+            braid_rmatrix_probes=n_probes,
+        )
+        return GPT(cfg), cfg
+
+    ids = torch.randint(0, 128, (1, 8), dtype=torch.long, generator=torch.Generator().manual_seed(1))
+    base, _ = build(0)
+    probed, cfg = build(2)
+    base.eval()
+    probed.eval()
+    # probe params are deterministic-init and appended AFTER the shared ones,
+    # so the shared parameters are identical across the two builds
+    with torch.inference_mode():
+        out_base = base(ids)
+        out_probed = probed(ids)
+    torch.testing.assert_close(out_probed, out_base, rtol=0.0, atol=0.0)
+
+    # gates receive gradients once training touches them
+    probed.train()
+    loss = probed(ids, ids)
+    loss.backward()
+    grads = [p.grad for n, p in probed.named_parameters() if "rmatrix_probe_gate" in n]
+    require(all(g is not None for g in grads), "probe gates must receive gradients")
+
+    probed.eval()
+    with torch.inference_mode():
+        full_last = probed(ids)[:, -1, :].float()
+        kv_cache = KVCache(
+            batch_size=1,
+            num_heads=cfg.n_kv_head,
+            seq_len=ids.size(1),
+            head_dim=cfg.n_embd // cfg.n_head,
+            num_layers=cfg.n_layer,
+        )
+        _ = probed(ids[:, :-1], kv_cache=kv_cache)
+        cached_last = probed(ids[:, -1:], kv_cache=kv_cache)[:, -1, :].float()
+    torch.testing.assert_close(cached_last, full_last, rtol=1e-3, atol=1e-2)
+
+
 def test_nanochat_ultrametric_balltree_kv_parity_and_kernel_agreement():
     """Ball-tree mode (33dd): KV-cache decode parity (the house contract) and
     agreement with the hard-digit kernel - the two paths compute the same
