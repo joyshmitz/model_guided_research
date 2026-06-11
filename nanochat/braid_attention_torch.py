@@ -395,8 +395,11 @@ class BraidCausalSelfAttention(AttentionCore):
         # learned parameters - compose the layer's actual crossing law on a
         # probe strand triple along the two braid-equivalent schedules.
         if self.braid_crossing_law == "rmatrix":
-            u_all = self.rmatrix_rapidities().to(torch.float64)
-            eta = self.rmatrix_eta().to(torch.float64)
+            # Telemetry math runs on CPU in fp64: the probe states come from a
+            # CPU generator, so device-resident params must come down to meet
+            # them (and the fp64 composition is host-side scalar work anyway).
+            u_all = self.rmatrix_rapidities().detach().to("cpu", torch.float64)
+            eta = self.rmatrix_eta().detach().to("cpu", torch.float64)
             H, S = u_all.shape
             idx = torch.tensor([0, S // 2, S - 1] if S >= 3 else [0] * 3)
             raps = u_all[:, idx]  # (H, 3)

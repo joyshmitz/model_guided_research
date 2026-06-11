@@ -990,11 +990,18 @@ hypotheses:
         OPERATIONALIZED under ci-v3 (xas7): single-arm chargeprobe prediction
         on the dissociation observable - abelian (z60) over-chance ratio
         divided by the best non-solvable (s5/a5) over-chance ratio (denominator
-        clamped at 1.0). Decodable-everywhere and decodable-nowhere both push
-        the ratio toward 1 and REFUTE as registered; only the predicted
-        representation-theoretic dissociation clears 2.0. Requires probes of
-        >= 3 distinct-seed trained rmatrix checkpoints (budget cohorts apply
-        via the recorded checkpoint budget); a refuted-nowhere outcome
+        clamped at 1.0). FLOOR REFINEMENT (pre-evidence, recorded in the
+        artifact basis): "over chance" divides by the OPERATIVE floor
+        max(1/|G|, best-constant majority-class accuracy on the probe's own
+        test split) - the house answer-prior convention - because at small
+        samples a random probe already scores ~1/n_observed_classes and the
+        statement's theoretical 1/|G| alone would wildly inflate over-chance
+        ratios for the large groups; the refinement is strictly conservative.
+        Decodable-everywhere and decodable-nowhere both push the ratio toward
+        1 and REFUTE as registered; only the predicted representation-
+        theoretic dissociation clears 2.0. Requires probes of >= 3
+        distinct-seed trained rmatrix checkpoints (budget cohorts apply via
+        the recorded checkpoint budget); a refuted-nowhere outcome
         additionally activates the higher-rank R-matrix redesign note in the
         statement.
     status: open

@@ -633,7 +633,10 @@ class GPT(nn.Module):
         named_block = [(n, p) for n, p in self.transformer.h.named_parameters() if p.requires_grad]
 
         def _muon_exempt(name: str) -> bool:
-            return name.endswith("rmatrix_rho")
+            # Every rmatrix_* parameter is a positional scalar field (rapidity
+            # increments, probe offsets, probe gates), never a matmul weight -
+            # Newton-Schulz orthogonalization has no meaning for any of them.
+            return ".rmatrix_" in name or name.startswith("rmatrix_")
 
         matrix_params = [p for n, p in named_block if p.ndim >= 2 and not _muon_exempt(n)]
         lowdim_block_params = [p for n, p in named_block if p.ndim < 2 or _muon_exempt(n)]

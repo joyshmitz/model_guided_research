@@ -200,6 +200,17 @@ class UltrametricCausalSelfAttention(AttentionCore):
         # Digits are derived per-head, so the projection is over head_dim.
         self.to_digits_q = nn.Linear(self.head_dim, self.K, bias=False)
         self.to_digits_k = nn.Linear(self.head_dim, self.K, bias=False)
+        if self.ultrametric_mode == "balltree" or self.ultrametric_hard_digits:
+            # Hard digits sever the graph at the int64 cast, so the q/k path
+            # (c_q, c_k, to_digits_q, to_digits_k) is gradient-dead by math:
+            # backward returns grad=None and Muon refuses parameters without
+            # gradients. Freeze the dead path explicitly (same remedy as the
+            # braid rmatrix law's frozen projections); values/c_v/c_proj stay
+            # fully trainable.
+            self.c_q.weight.requires_grad_(False)
+            self.c_k.weight.requires_grad_(False)
+            self.to_digits_q.weight.requires_grad_(False)
+            self.to_digits_k.weight.requires_grad_(False)
 
     def _digits_soft(self, raw: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(raw) * (self.p - 1)

@@ -4996,17 +4996,24 @@ def probe_charges(
             by_cat.setdefault(cat, []).append((feats, expected))
     hook.remove()
 
-    def fit_probe(rows: list[tuple[list[float], str]], hidden: int | None) -> tuple[float, float, int]:
-        # (train_acc, test_acc, n_classes); deterministic fp32 full-batch fit
+    def fit_probe(rows: list[tuple[list[float], str]], hidden: int | None) -> tuple[float, float, int, float]:
+        # (train_acc, test_acc, n_classes, majority_floor); deterministic fp32
+        # full-batch fit. majority_floor = the best-constant-class accuracy on
+        # the test split (the house answer-prior convention): at small samples
+        # the theoretical 1/|G| floor wildly understates chance, since a random
+        # probe already scores ~1/n_observed_classes.
         gen = torch.Generator().manual_seed(seed)
         labels = sorted({y for _, y in rows})
         idx = {y: i for i, y in enumerate(labels)}
         X = torch.tensor([f for f, _ in rows], dtype=torch.float32)
-        X = (X - X.mean(0)) / (X.std(0) + 1e-8)
         y = torch.tensor([idx[lab] for _, lab in rows], dtype=torch.long)
         perm = torch.randperm(len(rows), generator=gen)
         n_test = max(1, len(rows) // 5)
         te, tr = perm[:n_test], perm[n_test:]
+        # standardize with TRAIN statistics only (no test-set leakage)
+        mu, sd = X[tr].mean(0), X[tr].std(0)
+        X = (X - mu) / (sd + 1e-8)
+        majority_floor = float(torch.bincount(y[te]).max()) / float(len(te))
         if hidden:
             net: torch.nn.Module = torch.nn.Sequential(
                 torch.nn.Linear(X.size(1), hidden), torch.nn.ReLU(), torch.nn.Linear(hidden, len(labels))
@@ -5027,12 +5034,12 @@ def probe_charges(
         with torch.no_grad():
             tr_acc = float((net(X[tr]).argmax(-1) == y[tr]).float().mean())
             te_acc = float((net(X[te]).argmax(-1) == y[te]).float().mean())
-        return tr_acc, te_acc, len(labels)
+        return tr_acc, te_acc, len(labels), majority_floor
 
     group_sizes = {"s5": 120, "a5": 60, "z60": 60, "s3": 6}
     results: dict[str, Any] = {}
     table = Table(title=f"charge-decoding probe — {checkpoint} @ {resolved_step}", box=box.SIMPLE_HEAVY)
-    for col in ("category", "n_docs", "classes", "chance", "linear test acc", "mlp test acc", "verdict"):
+    for col in ("category", "n_docs", "classes", "floor", "linear test acc", "mlp test acc", "verdict"):
         table.add_column(col, justify="right" if col != "category" else "left")
     for cat in sorted(by_cat):
         rows = by_cat[cat]
@@ -5040,20 +5047,27 @@ def probe_charges(
             results[cat] = {"n_docs": len(rows), "skipped": "fewer than 10 docs"}
             table.add_row(cat, str(len(rows)), "-", "-", "-", "-", "[yellow]skipped[/yellow]")
             continue
-        lin_tr, lin_te, n_cls = fit_probe(rows, hidden=None)
-        mlp_tr, mlp_te, _ = fit_probe(rows, hidden=64)
+        lin_tr, lin_te, n_cls, floor_lin = fit_probe(rows, hidden=None)
+        mlp_tr, mlp_te, _, _ = fit_probe(rows, hidden=64)
         chance = 1.0 / group_sizes.get(cat, n_cls)
-        decodable = max(lin_te, mlp_te) > 2.0 * chance
+        # the operative floor: best-constant accuracy on the test split (never
+        # below the theoretical 1/|G|) - a random probe already scores
+        # ~1/n_observed at small samples, so 1/|G| alone wildly inflates
+        # "over-chance" for the large groups
+        floor_used = max(chance, floor_lin)
+        decodable = max(lin_te, mlp_te) > 2.0 * floor_used
         results[cat] = {
             "n_docs": len(rows),
             "n_classes_observed": n_cls,
             "chance": chance,
+            "majority_floor": floor_lin,
+            "floor_used": floor_used,
             "linear": {"train_acc": lin_tr, "test_acc": lin_te},
             "mlp": {"train_acc": mlp_tr, "test_acc": mlp_te},
             "decodable_at_2x_chance": decodable,
         }
         verdict = "[green]decodable[/green]" if decodable else "[red]~chance[/red]"
-        table.add_row(cat, str(len(rows)), str(n_cls), f"{chance:.3f}", f"{lin_te:.3f}", f"{mlp_te:.3f}", verdict)
+        table.add_row(cat, str(len(rows)), str(n_cls), f"{floor_used:.3f}", f"{lin_te:.3f}", f"{mlp_te:.3f}", verdict)
     console.print(table)
     if skipped:
         console.print(f"[yellow]{skipped} docs skipped (prompt longer than the rotary cache)[/yellow]")
@@ -5065,10 +5079,10 @@ def probe_charges(
     # the ratio toward 1 - only the predicted dissociation pattern clears 2.0.
     def _over_chance(cat: str) -> float | None:
         rec = results.get(cat)
-        if not isinstance(rec, dict) or "chance" not in rec:
+        if not isinstance(rec, dict) or "floor_used" not in rec:
             return None
         best = max(rec["linear"]["test_acc"], rec["mlp"]["test_acc"])
-        return best / rec["chance"] if rec["chance"] > 0 else None
+        return best / rec["floor_used"] if rec["floor_used"] > 0 else None
 
     dissociation: dict[str, Any] | None = None
     abelian = _over_chance("z60")
@@ -5079,7 +5093,11 @@ def probe_charges(
             "abelian_over_chance": abelian,
             "nonsolvable_over_chance": nonsolvable,
             "ratio": abelian / max(nonsolvable, 1.0),
-            "basis": "max(linear, mlp) test_acc / chance; ratio denominator clamped at 1.0",
+            "basis": (
+                "max(linear, mlp) test_acc / floor_used, where floor_used = "
+                "max(1/|G|, best-constant accuracy on the probe's test split); "
+                "ratio denominator clamped at 1.0"
+            ),
         }
 
     from nanochat.report import build_provenance
@@ -5130,7 +5148,7 @@ def probe_charges(
         f"- task: {task} · examples: {examples} · seed: {seed}",
         "- features: per-head charge observables `<v, t(theta_k) v>` of the final braid layer",
         "",
-        "| category | n | classes | chance | linear test | mlp test | decodable@2x |",
+        "| category | n | classes | floor | linear test | mlp test | decodable@2x |",
         "|---|---|---|---|---|---|---|",
     ]
     for cat, rec in sorted(results.items()):
@@ -5138,7 +5156,7 @@ def probe_charges(
             md.append(f"| {cat} | {rec['n_docs']} | - | - | - | - | skipped |")
         else:
             md.append(
-                f"| {cat} | {rec['n_docs']} | {rec['n_classes_observed']} | {rec['chance']:.3f} "
+                f"| {cat} | {rec['n_docs']} | {rec['n_classes_observed']} | {rec['floor_used']:.3f} "
                 f"| {rec['linear']['test_acc']:.3f} | {rec['mlp']['test_acc']:.3f} "
                 f"| {rec['decodable_at_2x_chance']} |"
             )
@@ -7023,12 +7041,15 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
         bb: list[dict[str, Any]]
         if schema in ("certify", "bench"):
             # budget-exempt schemas (ci-v3): invariant suites and path
-            # microbenchmarks have no training budget by construction
+            # microbenchmarks have no training budget by construction; both
+            # arms (the baseline arm only for two-arm predictions) must still
+            # reach min_seeds.
             n_c = sum(len(_adj_observations(a, dotted) or []) for a in cand_m)
-            if n_c < need:
+            n_b = need if single_arm else sum(len(_adj_observations(a, dotted) or []) for a in base_m)
+            if n_c < need or n_b < need:
                 return {"id": hid, "verdict": "blocked", "reason_code": "insufficient_seeds", "mechanism": mech,
                         "reason": _ADJ_BLOCK_REASONS["insufficient_seeds"]}
-            anchor, cc, bb = None, cand_m, []
+            anchor, cc, bb = None, cand_m, ([] if single_arm else base_m)
         else:
             cand_f = [(a, f) for a in cand_m if (f := _adj_planned_flops(a)) is not None]
             base_f = [(a, f) for a in base_m if (f := _adj_planned_flops(a)) is not None]

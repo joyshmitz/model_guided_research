@@ -627,8 +627,9 @@ def _chargeprobe_artifact(root: Path, name: str, *, ratio: float, seed: int = 0,
             "seed": seed,
         },
         "provenance": CLEAN_PROV,
-        "categories": {"z60": {"chance": 0.017, "linear": {"test_acc": 0.2}, "mlp": {"test_acc": 0.25}}},
-        "dissociation": {"abelian_over_chance": 3.0 * ratio / 3.0 * 3.0, "nonsolvable_over_chance": 1.0,
+        "categories": {"z60": {"chance": 0.017, "floor_used": 0.1,
+                                "linear": {"test_acc": 0.2}, "mlp": {"test_acc": 0.25}}},
+        "dissociation": {"abelian_over_chance": ratio, "nonsolvable_over_chance": 1.0,
                           "ratio": ratio},
     }))
 
