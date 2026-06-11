@@ -4633,6 +4633,192 @@ def eval_tasks(
     console.print(f"[bold green]Wrote eval artifacts[/bold green] → {run_dir}")
 
 
+def _sample_stream(
+    model: Any,
+    tok: Any,
+    prompt_ids: list[int],
+    *,
+    max_tokens: int,
+    temperature: float,
+    top_k: int | None,
+    seed: int,
+    stop_at_separator: bool,
+    on_token: Any = None,
+) -> dict[str, Any]:
+    """The testable core of mgr sample: stream one generation, returning
+    {tokens, text, elapsed_s, tokens_per_s}. Stops at the document separator
+    (the trained format's answer terminator) unless told otherwise - the same
+    contract the eval scorer uses (kbj2 finding)."""
+    stop_id = None
+    if stop_at_separator:
+        get_bos = getattr(tok, "get_bos_token_id", None)
+        if callable(get_bos):
+            stop_id = get_bos()
+    pieces: list[int] = []
+    t0 = time.perf_counter()
+    for piece in model.generate(prompt_ids, max_tokens=max_tokens, temperature=temperature, top_k=top_k, seed=seed):
+        if stop_id is not None and piece == stop_id:
+            break
+        pieces.append(piece)
+        if on_token is not None:
+            on_token(tok.decode(pieces))
+    elapsed = time.perf_counter() - t0
+    return {
+        "tokens": pieces,
+        "text": tok.decode(pieces),
+        "elapsed_s": elapsed,
+        "tokens_per_s": (len(pieces) / elapsed) if elapsed > 0 and pieces else 0.0,
+    }
+
+
+def _sample_peak_memory(device: Any) -> str:
+    import torch
+
+    if device.type == "cuda":
+        return f"{torch.cuda.max_memory_allocated(device) / 1e9:.2f} GB (CUDA peak)"
+    import resource
+
+    # ru_maxrss is KiB on Linux; process-lifetime peak (coarse but honest on CPU)
+    return f"{resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6:.2f} GB (process peak RSS)"
+
+
+@app.command("sample")
+def sample(
+    checkpoint: Annotated[Path | None, typer.Option(help="Checkpoint directory (rz8.1 layout)")] = None,
+    compare: Annotated[
+        list[Path] | None,
+        typer.Option("--compare", help="Additional checkpoint dir(s) for side-by-side comparison (repeatable)"),
+    ] = None,
+    prompt: Annotated[
+        str,
+        typer.Option(help="Prompt text. Diagnostic-task formats work best, e.g. 'TASK arith CMP 1.00e-02 2.00e+03 OUT'"),
+    ] = "",
+    max_tokens: Annotated[int, typer.Option(help="Max new tokens")] = 64,
+    temperature: Annotated[float, typer.Option(help="0 = greedy (deterministic); >0 samples")] = 0.0,
+    top_k: Annotated[int | None, typer.Option(help="Top-k filtering (sampled mode)")] = None,
+    seed: Annotated[int, typer.Option(help="Sampling seed (greedy mode ignores it)")] = 0,
+    step: Annotated[int | None, typer.Option(help="Checkpoint step (default: latest in the directory)")] = None,
+    device_str: Annotated[str, typer.Option("--device", help="cpu | cuda")] = "cpu",
+    stop_at_separator: Annotated[
+        bool,
+        typer.Option(
+            "--stop-at-separator/--no-stop-at-separator",
+            help="Stop at the <|endoftext|> document separator (the trained format's answer terminator)",
+        ),
+    ] = True,
+    json_out: Annotated[bool, typer.Option("--json", help="Machine-readable output (no live display)")] = False,
+) -> None:
+    """Generate text from trained checkpoints (bead rz8.5): streaming display,
+    tokens/s + peak memory, and side-by-side mechanism comparison via --compare
+    (same prompt, same seed, same sampling params).
+
+    EXPECTATION SETTING: research-scale checkpoints (2-15M params) produce
+    barely-coherent text. The point is (a) end-to-end decode-path validation
+    in anger, (b) RELATIVE comparisons between mechanisms at matched budgets -
+    never absolute prose quality.
+    """
+    import torch
+
+    from nanochat.tokenizer import get_tokenizer
+
+    ckpts: list[Path] = ([checkpoint] if checkpoint else []) + list(compare or [])
+    if not ckpts:
+        console.print("[bold red]Provide --checkpoint DIR (and optionally --compare DIR, repeatable).[/bold red]")
+        raise typer.Exit(code=2)
+    if not prompt:
+        console.print("[bold red]--prompt is required.[/bold red]")
+        raise typer.Exit(code=2)
+
+    device = torch.device(device_str)
+    tok = get_tokenizer()
+    prompt_ids = tok.encode(prompt)
+    results: list[dict[str, Any]] = []
+
+    for ckpt_dir in ckpts:
+        model, ckpt_meta, resolved_step = _load_eval_checkpoint(ckpt_dir, step, device)
+        attn = str((ckpt_meta.get("model_config") or {}).get("attention_type", "?"))
+        n_params = sum(p.numel() for p in model.parameters())
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        title = f"{attn} · {ckpt_dir} @ step {resolved_step}"
+        if json_out:
+            rec = _sample_stream(
+                model, tok, prompt_ids, max_tokens=max_tokens, temperature=temperature,
+                top_k=top_k, seed=seed, stop_at_separator=stop_at_separator,
+            )
+        else:
+            from rich.live import Live
+
+            shown = {"text": ""}
+
+            def render() -> Panel:
+                return Panel(shown["text"] or "[dim]…[/dim]", title=title, border_style="cyan")
+
+            with Live(render(), console=console, refresh_per_second=12) as live:
+
+                def on_token(text_so_far: str) -> None:
+                    shown["text"] = text_so_far
+                    live.update(render())
+
+                rec = _sample_stream(
+                    model, tok, prompt_ids, max_tokens=max_tokens, temperature=temperature,
+                    top_k=top_k, seed=seed, stop_at_separator=stop_at_separator, on_token=on_token,
+                )
+        rec.update(
+            {
+                "checkpoint": str(ckpt_dir),
+                "step": resolved_step,
+                "attention_type": attn,
+                "n_params": n_params,
+                "peak_memory": _sample_peak_memory(device),
+            }
+        )
+        results.append(rec)
+
+    if json_out:
+        payload = {
+            "prompt": prompt,
+            "seed": seed,
+            "temperature": temperature,
+            "top_k": top_k,
+            "max_tokens": max_tokens,
+            "device": str(device),
+            "stop_at_separator": stop_at_separator,
+            "results": [
+                {k: v for k, v in r.items() if k != "tokens"} | {"n_tokens": len(r["tokens"])} for r in results
+            ],
+        }
+        console.print_json(json.dumps(payload))
+        return
+
+    table = Table(title="mgr sample — generation stats", box=box.SIMPLE_HEAVY)
+    table.add_column("mechanism", style="bold")
+    table.add_column("checkpoint")
+    table.add_column("params", justify="right")
+    table.add_column("tokens", justify="right")
+    table.add_column("tokens/s", justify="right")
+    table.add_column("peak memory", justify="right")
+    for r in results:
+        table.add_row(
+            r["attention_type"], f"{r['checkpoint']} @ {r['step']}", f"{r['n_params']:,}",
+            str(len(r["tokens"])), f"{r['tokens_per_s']:.1f}", r["peak_memory"],
+        )
+    console.print(table)
+    if len(results) > 1:
+        from rich.columns import Columns
+
+        panels = [
+            Panel(
+                r["text"] or "[dim](no tokens before the separator)[/dim]",
+                title=f"{r['attention_type']} @ step {r['step']}",
+                border_style="cyan",
+                width=46,
+            )
+            for r in results
+        ]
+        console.print(Columns(panels, equal=True))
+
+
 @app.command("profile-data")
 def profile_data(
     data: Annotated[Path | None, typer.Option(help="Directory (or file) of .txt/.md/.parquet documents")] = None,
