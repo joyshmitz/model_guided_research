@@ -691,3 +691,46 @@ hypotheses:
     status: blocked
     evidence: []
     verdict_history: []
+
+  - id: hyp-braid-dyck-directional
+    statement: >-
+      Braid attention beats standard attention on held-out Dyck nesting depths by ANY meaningful margin (directional claim, effect at least +0.02 EM): the sm47 campaign showed the effect's CI excludes zero; this entry registers the direction at a resolvable threshold while hyp-braid-dyck-depth-extrapolation continues to carry the original +0.05 size claim.
+    mechanisms: [braid]
+    source:
+      kind: model
+      provenance: "Registered AFTER sm47 (ef3cd42: braid +0.101 [+0.012,+0.190] at n=9) and BEFORE the seeds 9-24 confirmation campaign - registered-report style; the motivating data is disclosed and the decisive evidence is collected post-registration"
+    date_registered: "2026-06-11"
+    prediction:
+      metric_path: "evaltasks:tasks.dyck.exact_match.greedy.held_out.mean"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 0.02
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 5
+      validity:
+        baseline_floor: 0.512
+        floor_source: "population majority-answer prior of the dyck held-out split (10 generator seeds x 3000 docs, 2026-06-10); ci-v2 prefers the artifact-recorded answer_prior"
+      scale_caveats: "registered at the E1 rung (L4/D128 @ 1e14); motivated by sm47, decided by seeds 9-24"
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-surreal-optimization-rate
+    statement: >-
+      Surreal (scale-direction) parameterization OPTIMIZES dramatically faster than standard at equal FLOPs on structure-free data: held-out perplexity on the placebo task at most 0.85x standard's. This is a training-dynamics claim, distinct from (and surviving) the refuted held-out-generalization claim; it is also exactly the two-sided trip the placebo-no-winner guard anticipates, so its confirmation OBLIGATES the two-cause protocol (re-run at 2x budget separates optimization-rate from harness unfairness) before any cross-mechanism comparison cites it.
+    mechanisms: [surreal]
+    source:
+      kind: model
+      provenance: "Registered AFTER the E1 campaign exposed the effect (placebo held-out ppl ~48-53 surreal vs ~77-104 standard, n=3) and BEFORE the placebo seeds 3-7 confirmation arms - motivating data disclosed, decisive evidence post-registration"
+    date_registered: "2026-06-11"
+    prediction:
+      metric_path: "evaltasks:tasks.placebo.perplexity.held_out"
+      comparator: "<="
+      threshold_kind: ratio
+      threshold: 0.85
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 5
+      scale_caveats: "E1 rung; the observed ratio ~0.55 leaves wide margin; if supported, hyp-placebo-no-winner will trip on surreal BY DESIGN and the 2x-budget root-cause run is mandatory before publication-grade claims"
+    status: open
+    evidence: []
+    verdict_history: []
