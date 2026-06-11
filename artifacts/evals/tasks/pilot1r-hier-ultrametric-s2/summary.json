@@ -1,0 +1,132 @@
+{
+  "kind": "eval-tasks",
+  "meta": {
+    "checkpoint": {
+      "attention_type": "ultrametric",
+      "budget": {
+        "flops_consumed_est": 10038055796736,
+        "flops_per_step_est": 41479569408,
+        "max_steps": 242,
+        "target_flops": 10000000000000.0
+      },
+      "dir": "artifacts/campaigns/pilot1/hier-ultrametric-s2/checkpoints",
+      "lineage": {
+        "parent_run_ids": [],
+        "run_id": "hier-ultrametric-s2"
+      },
+      "n_params": 6529536,
+      "step": 241
+    },
+    "decode_modes": [
+      "greedy"
+    ],
+    "device": "cpu",
+    "examples_per_seed": 32,
+    "generated_at": "2026-06-11T01:24:33Z",
+    "git": {
+      "branch": "main",
+      "commit": "351bd3b",
+      "commit_full": "351bd3b6a145f60b232e740a91d90bb6621e97e5",
+      "dirty": false
+    },
+    "receipts": "generations.jsonl",
+    "run_id": "pilot1r-hier-ultrametric-s2",
+    "seeds": [
+      0,
+      1,
+      2
+    ]
+  },
+  "provenance": {
+    "config_hash": "36cae067efb1085a0a10996923ab5d2bc606d66f6a64f6f50eb4b5c6e2566b1d",
+    "data_snapshot_hash": null,
+    "git_dirty": false,
+    "git_sha": "351bd3b6a145f60b232e740a91d90bb6621e97e5",
+    "schema_version": "mgr.metrics.v1",
+    "tainted": false
+  },
+  "schema_version": "mgr.evaltasks.v2",
+  "tasks": {
+    "hier": {
+      "answer_prior": {
+        "held_out": {
+          "majority_answer": "v79",
+          "mean": 0.0625,
+          "per_seed": [
+            0.0625,
+            0.0625,
+            0.0625
+          ]
+        },
+        "in_range": {
+          "majority_answer": "v6",
+          "mean": 0.07291666666666667,
+          "per_seed": [
+            0.09375,
+            0.0625,
+            0.0625
+          ]
+        }
+      },
+      "curve": {
+        "accuracy": [
+          0.0,
+          0.0,
+          0.043478260869565216,
+          0.14285714285714285,
+          0.012195121951219513
+        ],
+        "buckets": [
+          1.0,
+          2.0,
+          3.0,
+          4.0,
+          5.0
+        ],
+        "counts": [
+          6,
+          5,
+          92,
+          7,
+          82
+        ]
+      },
+      "difficulty_axis": "path_depth",
+      "exact_match": {
+        "greedy": {
+          "held_out": {
+            "ci95": [
+              0.0004166666666666659,
+              0.041249999999999995
+            ],
+            "mean": 0.020833333333333332,
+            "per_seed": [
+              0.03125,
+              0.0,
+              0.03125
+            ]
+          },
+          "in_range": {
+            "ci95": [
+              0.021249999999999998,
+              0.06208333333333333
+            ],
+            "mean": 0.041666666666666664,
+            "per_seed": [
+              0.03125,
+              0.0625,
+              0.03125
+            ]
+          }
+        }
+      },
+      "in_range_max": 3.0,
+      "n_examples_per_seed": 32,
+      "perplexity": {
+        "held_out": 23.59483852982521,
+        "in_range": 3.0504173760612807
+      },
+      "skipped_too_long": 0
+    }
+  }
+}
