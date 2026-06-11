@@ -1,0 +1,150 @@
+{
+  "kind": "eval-tasks",
+  "meta": {
+    "checkpoint": {
+      "attention_type": "quaternion",
+      "budget": {
+        "flops_consumed_est": 100047437955072,
+        "flops_per_step_est": 91200946176,
+        "max_steps": 1097,
+        "target_flops": 100000000000000.0
+      },
+      "dir": "artifacts/campaigns/e1/rot-quaternion-s0/checkpoints",
+      "lineage": {
+        "parent_run_ids": [],
+        "run_id": "rot-quaternion-s0"
+      },
+      "n_params": 13598720,
+      "step": 1096
+    },
+    "decode_modes": [
+      "greedy"
+    ],
+    "device": "cpu",
+    "examples_per_seed": 32,
+    "generated_at": "2026-06-11T03:52:47Z",
+    "git": {
+      "branch": "main",
+      "commit": "97f587c",
+      "commit_full": "97f587c5a3d1b4f69f808dab8cd8eec8be46644c",
+      "dirty": false
+    },
+    "receipts": "generations.jsonl",
+    "run_id": "e1-rot-quaternion-s0",
+    "seeds": [
+      0,
+      1,
+      2
+    ]
+  },
+  "provenance": {
+    "config_hash": "4da338c39227fb3c032496fb321608ee91eed873356ab60446ecf1df6dfbdacf",
+    "data_snapshot_hash": null,
+    "git_dirty": false,
+    "git_sha": "97f587c5a3d1b4f69f808dab8cd8eec8be46644c",
+    "schema_version": "mgr.metrics.v1",
+    "tainted": false
+  },
+  "schema_version": "mgr.evaltasks.v2",
+  "tasks": {
+    "rot": {
+      "answer_prior": {
+        "held_out": {
+          "majority_answer": "o13",
+          "mean": 0.13541666666666666,
+          "per_seed": [
+            0.15625,
+            0.125,
+            0.125
+          ]
+        },
+        "in_range": {
+          "majority_answer": "o15",
+          "mean": 0.11458333333333333,
+          "per_seed": [
+            0.125,
+            0.09375,
+            0.125
+          ]
+        }
+      },
+      "curve": {
+        "accuracy": [
+          0.125,
+          0.05,
+          0.0,
+          0.047619047619047616,
+          0.0,
+          0.0,
+          0.05,
+          0.05555555555555555,
+          0.0,
+          0.0,
+          0.05555555555555555
+        ],
+        "buckets": [
+          2.0,
+          3.0,
+          4.0,
+          5.0,
+          6.0,
+          7.0,
+          8.0,
+          9.0,
+          10.0,
+          11.0,
+          12.0
+        ],
+        "counts": [
+          16,
+          20,
+          17,
+          21,
+          22,
+          12,
+          20,
+          18,
+          13,
+          15,
+          18
+        ]
+      },
+      "difficulty_axis": "rotation_count",
+      "exact_match": {
+        "greedy": {
+          "held_out": {
+            "ci95": [
+              -0.004112703987864577,
+              0.06661270398786458
+            ],
+            "mean": 0.03125,
+            "per_seed": [
+              0.0,
+              0.0625,
+              0.03125
+            ]
+          },
+          "in_range": {
+            "ci95": [
+              0.0008333333333333318,
+              0.08249999999999999
+            ],
+            "mean": 0.041666666666666664,
+            "per_seed": [
+              0.0625,
+              0.0,
+              0.0625
+            ]
+          }
+        }
+      },
+      "in_range_max": 6.0,
+      "n_examples_per_seed": 32,
+      "perplexity": {
+        "held_out": 4.089688936869304,
+        "in_range": 2.3297381848096848
+      },
+      "skipped_too_long": 0
+    }
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "kind": "eval-tasks",
+  "meta": {
+    "checkpoint": {
+      "attention_type": "surreal",
+      "budget": {
+        "flops_consumed_est": 100068143136768,
+        "flops_per_step_est": 91219820544,
+        "max_steps": 1097,
+        "target_flops": 100000000000000.0
+      },
+      "dir": "artifacts/campaigns/e1/placebo-surreal-s0/checkpoints",
+      "lineage": {
+        "parent_run_ids": [],
+        "run_id": "placebo-surreal-s0"
+      },
+      "n_params": 13600256,
+      "step": 1096
+    },
+    "decode_modes": [
+      "greedy"
+    ],
+    "device": "cpu",
+    "examples_per_seed": 32,
+    "generated_at": "2026-06-11T04:24:13Z",
+    "git": {
+      "branch": "main",
+      "commit": "97f587c",
+      "commit_full": "97f587c5a3d1b4f69f808dab8cd8eec8be46644c",
+      "dirty": false
+    },
+    "receipts": "generations.jsonl",
+    "run_id": "e1-placebo-surreal-s0",
+    "seeds": [
+      0,
+      1,
+      2
+    ]
+  },
+  "provenance": {
+    "config_hash": "eaceb31952943b82e53811e90fd0cf7f7ec7166cfb3ea2bb496b585c553ba383",
+    "data_snapshot_hash": null,
+    "git_dirty": false,
+    "git_sha": "97f587c5a3d1b4f69f808dab8cd8eec8be46644c",
+    "schema_version": "mgr.metrics.v1",
+    "tainted": false
+  },
+  "schema_version": "mgr.evaltasks.v2",
+  "tasks": {
+    "placebo": {
+      "answer_prior": null,
+      "curve": null,
+      "difficulty_axis": null,
+      "exact_match": null,
+      "in_range_max": null,
+      "n_examples_per_seed": 32,
+      "perplexity": {
+        "held_out": 53.210022032260895,
+        "in_range": 4.111024364829063
+      },
+      "skipped_too_long": 0
+    }
+  }
+}

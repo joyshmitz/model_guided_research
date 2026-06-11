@@ -1,0 +1,64 @@
+{
+  "kind": "eval-tasks",
+  "meta": {
+    "checkpoint": {
+      "attention_type": "quaternion",
+      "budget": {
+        "flops_consumed_est": 100047437955072,
+        "flops_per_step_est": 91200946176,
+        "max_steps": 1097,
+        "target_flops": 100000000000000.0
+      },
+      "dir": "artifacts/campaigns/e1/placebo-quaternion-s2/checkpoints",
+      "lineage": {
+        "parent_run_ids": [],
+        "run_id": "placebo-quaternion-s2"
+      },
+      "n_params": 13598720,
+      "step": 1096
+    },
+    "decode_modes": [
+      "greedy"
+    ],
+    "device": "cpu",
+    "examples_per_seed": 32,
+    "generated_at": "2026-06-11T08:36:50Z",
+    "git": {
+      "branch": "main",
+      "commit": "acc9814",
+      "commit_full": "acc9814eccfa00663375daff410e0adda28ba52b",
+      "dirty": false
+    },
+    "receipts": "generations.jsonl",
+    "run_id": "e1-placebo-quaternion-s2",
+    "seeds": [
+      0,
+      1,
+      2
+    ]
+  },
+  "provenance": {
+    "config_hash": "d93c289e0107860b620974953bd7db4af90db9d676629f7d037a536af195f44d",
+    "data_snapshot_hash": null,
+    "git_dirty": false,
+    "git_sha": "acc9814eccfa00663375daff410e0adda28ba52b",
+    "schema_version": "mgr.metrics.v1",
+    "tainted": false
+  },
+  "schema_version": "mgr.evaltasks.v2",
+  "tasks": {
+    "placebo": {
+      "answer_prior": null,
+      "curve": null,
+      "difficulty_axis": null,
+      "exact_match": null,
+      "in_range_max": null,
+      "n_examples_per_seed": 32,
+      "perplexity": {
+        "held_out": 66.69271488984425,
+        "in_range": 4.184331168731053
+      },
+      "skipped_too_long": 0
+    }
+  }
+}

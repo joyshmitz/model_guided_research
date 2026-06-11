@@ -1,0 +1,132 @@
+{
+  "kind": "eval-tasks",
+  "meta": {
+    "checkpoint": {
+      "attention_type": "standard",
+      "budget": {
+        "flops_consumed_est": 100047437955072,
+        "flops_per_step_est": 91200946176,
+        "max_steps": 1097,
+        "target_flops": 100000000000000.0
+      },
+      "dir": "artifacts/campaigns/e1/hier-standard-s1/checkpoints",
+      "lineage": {
+        "parent_run_ids": [],
+        "run_id": "hier-standard-s1"
+      },
+      "n_params": 13598720,
+      "step": 1096
+    },
+    "decode_modes": [
+      "greedy"
+    ],
+    "device": "cpu",
+    "examples_per_seed": 32,
+    "generated_at": "2026-06-11T05:08:31Z",
+    "git": {
+      "branch": "main",
+      "commit": "a201a10",
+      "commit_full": "a201a10dfe0a3076de6f06c96cbc8f3167c71cd1",
+      "dirty": false
+    },
+    "receipts": "generations.jsonl",
+    "run_id": "e1-hier-standard-s1",
+    "seeds": [
+      0,
+      1,
+      2
+    ]
+  },
+  "provenance": {
+    "config_hash": "12263073041ea8b219b650ece9a3603c737391c0913e7ebc47119e358bb5c3e9",
+    "data_snapshot_hash": null,
+    "git_dirty": false,
+    "git_sha": "a201a10dfe0a3076de6f06c96cbc8f3167c71cd1",
+    "schema_version": "mgr.metrics.v1",
+    "tainted": false
+  },
+  "schema_version": "mgr.evaltasks.v2",
+  "tasks": {
+    "hier": {
+      "answer_prior": {
+        "held_out": {
+          "majority_answer": "v79",
+          "mean": 0.0625,
+          "per_seed": [
+            0.0625,
+            0.0625,
+            0.0625
+          ]
+        },
+        "in_range": {
+          "majority_answer": "v6",
+          "mean": 0.07291666666666667,
+          "per_seed": [
+            0.09375,
+            0.0625,
+            0.0625
+          ]
+        }
+      },
+      "curve": {
+        "accuracy": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.012195121951219513
+        ],
+        "buckets": [
+          1.0,
+          2.0,
+          3.0,
+          4.0,
+          5.0
+        ],
+        "counts": [
+          6,
+          5,
+          92,
+          7,
+          82
+        ]
+      },
+      "difficulty_axis": "path_depth",
+      "exact_match": {
+        "greedy": {
+          "held_out": {
+            "ci95": [
+              -0.01,
+              0.03083333333333333
+            ],
+            "mean": 0.010416666666666666,
+            "per_seed": [
+              0.0,
+              0.0,
+              0.03125
+            ]
+          },
+          "in_range": {
+            "ci95": [
+              0.0,
+              0.0
+            ],
+            "mean": 0.0,
+            "per_seed": [
+              0.0,
+              0.0,
+              0.0
+            ]
+          }
+        }
+      },
+      "in_range_max": 3.0,
+      "n_examples_per_seed": 32,
+      "perplexity": {
+        "held_out": 61.495231449604034,
+        "in_range": 1.5759410994748275
+      },
+      "skipped_too_long": 0
+    }
+  }
+}

@@ -1,0 +1,307 @@
+{
+  "date": "2026-06-11",
+  "policy_version": "ci-v2",
+  "verdicts": [
+    {
+      "arms": {
+        "ultrametric": {
+          "baseline_floor": 0.0625,
+          "baseline_mean": 0.006944444444444444,
+          "budget_flops": 100000000000000.0,
+          "ci95": [
+            -0.02188421086718563,
+            0.007995321978296742
+          ],
+          "effect": -0.006944444444444444,
+          "floor_effect": true,
+          "floor_source": "recorded_answer_prior",
+          "n_baseline": 3,
+          "n_candidate": 3,
+          "verdict": "inconclusive"
+        }
+      },
+      "artifacts": [
+        "artifacts/evals/tasks/e1-hier-standard-s0/summary.json",
+        "artifacts/evals/tasks/e1-hier-standard-s1/summary.json",
+        "artifacts/evals/tasks/e1-hier-standard-s2/summary.json",
+        "artifacts/evals/tasks/e1-hier-ultrametric-s0/summary.json",
+        "artifacts/evals/tasks/e1-hier-ultrametric-s1/summary.json",
+        "artifacts/evals/tasks/e1-hier-ultrametric-s2/summary.json"
+      ],
+      "floor_effect": true,
+      "id": "hyp-ultrametric-hier-heldout-depth",
+      "policy_version": "ci-v2",
+      "tainted_artifacts_seen": false,
+      "verdict": "inconclusive"
+    },
+    {
+      "arms": {
+        "fractal": {
+          "baseline_floor": 0.0625,
+          "baseline_mean": 0.006944444444444444,
+          "budget_flops": 100000000000000.0,
+          "ci95": [
+            -0.024990843976592247,
+            0.024990843976592247
+          ],
+          "effect": 0.0,
+          "floor_effect": true,
+          "floor_source": "recorded_answer_prior",
+          "n_baseline": 3,
+          "n_candidate": 3,
+          "verdict": "inconclusive"
+        }
+      },
+      "artifacts": [
+        "artifacts/evals/tasks/e1-hier-fractal-s0/summary.json",
+        "artifacts/evals/tasks/e1-hier-fractal-s1/summary.json",
+        "artifacts/evals/tasks/e1-hier-fractal-s2/summary.json",
+        "artifacts/evals/tasks/e1-hier-standard-s0/summary.json",
+        "artifacts/evals/tasks/e1-hier-standard-s1/summary.json",
+        "artifacts/evals/tasks/e1-hier-standard-s2/summary.json"
+      ],
+      "floor_effect": true,
+      "id": "hyp-fractal-hier-heldout-depth",
+      "policy_version": "ci-v2",
+      "tainted_artifacts_seen": false,
+      "verdict": "inconclusive"
+    },
+    {
+      "id": "hyp-ultrametric-needle-long-context",
+      "mechanism": "ultrametric",
+      "reason": "qualifying artifact lacks the metric at the registered path",
+      "reason_code": "metric_missing",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-ultrametric-trie-decode-speedup",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "arms": {
+        "braid": {
+          "baseline_floor": 0.625,
+          "baseline_mean": 0.4479166666666667,
+          "budget_flops": 100000000000000.0,
+          "ci95": [
+            -0.15468203003608488,
+            0.40468203003608477
+          ],
+          "effect": 0.12499999999999994,
+          "floor_source": "recorded_answer_prior",
+          "n_baseline": 3,
+          "n_candidate": 3,
+          "verdict": "inconclusive"
+        }
+      },
+      "artifacts": [
+        "artifacts/evals/tasks/e1-dyck-braid-s0/summary.json",
+        "artifacts/evals/tasks/e1-dyck-braid-s1/summary.json",
+        "artifacts/evals/tasks/e1-dyck-braid-s2/summary.json",
+        "artifacts/evals/tasks/e1-dyck-standard-s0/summary.json",
+        "artifacts/evals/tasks/e1-dyck-standard-s1/summary.json",
+        "artifacts/evals/tasks/e1-dyck-standard-s2/summary.json"
+      ],
+      "id": "hyp-braid-dyck-depth-extrapolation",
+      "policy_version": "ci-v2",
+      "tainted_artifacts_seen": false,
+      "verdict": "inconclusive"
+    },
+    {
+      "id": "hyp-braid-length-generalization",
+      "mechanism": "braid",
+      "reason": "qualifying artifact lacks the metric at the registered path",
+      "reason_code": "metric_missing",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-reversible-activation-memory",
+      "mechanism": "reversible",
+      "reason": "only tainted artifacts available (dirty tree / missing provenance) - evidence not attributable to a committed code state",
+      "reason_code": "tainted_evidence",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-reversible-gradient-stability",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-tropical-needle-no-dilution",
+      "mechanism": "tropical",
+      "reason": "no qualifying artifact for the candidate arm",
+      "reason_code": "no_candidate_artifacts",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-tropical-certified-robustness",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "arms": {
+        "quaternion": {
+          "baseline_floor": 0.13541666666666666,
+          "baseline_mean": 0.03819444444444444,
+          "budget_flops": 100000000000000.0,
+          "ci95": [
+            -0.06310784293191893,
+            0.07699673182080782
+          ],
+          "effect": 0.006944444444444441,
+          "floor_source": "recorded_answer_prior",
+          "n_baseline": 3,
+          "n_candidate": 3,
+          "verdict": "inconclusive"
+        }
+      },
+      "artifacts": [
+        "artifacts/evals/tasks/e1-rot-quaternion-s0/summary.json",
+        "artifacts/evals/tasks/e1-rot-quaternion-s1/summary.json",
+        "artifacts/evals/tasks/e1-rot-quaternion-s2/summary.json",
+        "artifacts/evals/tasks/e1-rot-standard-s0/summary.json",
+        "artifacts/evals/tasks/e1-rot-standard-s1/summary.json",
+        "artifacts/evals/tasks/e1-rot-standard-s2/summary.json"
+      ],
+      "id": "hyp-quaternion-rotation-composition",
+      "policy_version": "ci-v2",
+      "tainted_artifacts_seen": false,
+      "verdict": "inconclusive"
+    },
+    {
+      "id": "hyp-octonion-rotation-composition",
+      "mechanism": "octonion",
+      "reason": "no qualifying artifact for the candidate arm",
+      "reason_code": "no_candidate_artifacts",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-octonion-norm-stability",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "arms": {
+        "simplicial": {
+          "baseline_floor": 0.16666666666666666,
+          "baseline_mean": 0.05555555555555556,
+          "budget_flops": 100000000000000.0,
+          "ci95": [
+            -0.1288839205147439,
+            0.08027280940363277
+          ],
+          "effect": -0.02430555555555556,
+          "floor_source": "recorded_answer_prior",
+          "n_baseline": 3,
+          "n_candidate": 3,
+          "verdict": "inconclusive"
+        }
+      },
+      "artifacts": [
+        "artifacts/evals/tasks/e1-rel-simplicial-s0/summary.json",
+        "artifacts/evals/tasks/e1-rel-simplicial-s1/summary.json",
+        "artifacts/evals/tasks/e1-rel-simplicial-s2/summary.json",
+        "artifacts/evals/tasks/e1-rel-standard-s0/summary.json",
+        "artifacts/evals/tasks/e1-rel-standard-s1/summary.json",
+        "artifacts/evals/tasks/e1-rel-standard-s2/summary.json"
+      ],
+      "id": "hyp-simplicial-two-hop-composition",
+      "policy_version": "ci-v2",
+      "tainted_artifacts_seen": false,
+      "verdict": "inconclusive"
+    },
+    {
+      "arms": {
+        "surreal": {
+          "baseline_floor": 0.5208333333333334,
+          "baseline_mean": 0.8368055555555557,
+          "budget_flops": 100000000000000.0,
+          "ci95": [
+            -0.14259312842585084,
+            0.08009312842585084
+          ],
+          "effect": -0.03125,
+          "floor_source": "recorded_answer_prior",
+          "n_baseline": 3,
+          "n_candidate": 3,
+          "verdict": "inconclusive"
+        }
+      },
+      "artifacts": [
+        "artifacts/evals/tasks/e1-arith-standard-s0/summary.json",
+        "artifacts/evals/tasks/e1-arith-standard-s1/summary.json",
+        "artifacts/evals/tasks/e1-arith-standard-s2/summary.json",
+        "artifacts/evals/tasks/e1-arith-surreal-s0/summary.json",
+        "artifacts/evals/tasks/e1-arith-surreal-s1/summary.json",
+        "artifacts/evals/tasks/e1-arith-surreal-s2/summary.json"
+      ],
+      "id": "hyp-surreal-wide-dynamic-range",
+      "policy_version": "ci-v2",
+      "tainted_artifacts_seen": false,
+      "verdict": "inconclusive"
+    },
+    {
+      "id": "hyp-surreal-scaling-axis-prediction",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-ordinal-regime-shift-recovery",
+      "mechanism": "ordinal",
+      "reason": "no qualifying artifact for the candidate arm",
+      "reason_code": "no_candidate_artifacts",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-hoss-stiff-lr-robustness",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-gauge-gradient-stability",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-gauge-bag-conservation",
+      "mechanism": "gauge",
+      "reason": "no qualifying artifact for the candidate arm",
+      "reason_code": "no_candidate_artifacts",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-group-nonsolvable-barrier",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-placebo-no-winner",
+      "mechanism": "tropical",
+      "reason": "no qualifying artifact for the candidate arm",
+      "reason_code": "no_candidate_artifacts",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-ordinal-cosine-parity-simple",
+      "mechanism": "ordinal",
+      "reason": "no qualifying artifact for the candidate arm",
+      "reason_code": "no_candidate_artifacts",
+      "verdict": "blocked"
+    },
+    {
+      "id": "hyp-gauge-grad-stability-demo",
+      "reason": "prediction is null; operationalization_note names the blocker",
+      "reason_code": "prediction_not_operationalized",
+      "verdict": "blocked"
+    }
+  ]
+}
