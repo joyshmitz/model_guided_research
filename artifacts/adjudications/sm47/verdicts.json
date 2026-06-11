@@ -1,0 +1,90 @@
+{
+  "date": "2026-06-11",
+  "policy_version": "ci-v2",
+  "verdicts": [
+    {
+      "arms": {
+        "braid": {
+          "baseline_floor": 0.625,
+          "baseline_mean": 0.39814814814814814,
+          "budget_flops": 100000000000000.0,
+          "ci95": [
+            0.01157001559717373,
+            0.1898188732917151
+          ],
+          "effect": 0.10069444444444442,
+          "floor_source": "recorded_answer_prior",
+          "n_baseline": 9,
+          "n_candidate": 9,
+          "verdict": "inconclusive"
+        }
+      },
+      "artifacts": [
+        "artifacts/evals/tasks/e1-dyck-braid-s0/summary.json",
+        "artifacts/evals/tasks/e1-dyck-braid-s1/summary.json",
+        "artifacts/evals/tasks/e1-dyck-braid-s2/summary.json",
+        "artifacts/evals/tasks/e1-dyck-braid-s3/summary.json",
+        "artifacts/evals/tasks/e1-dyck-braid-s4/summary.json",
+        "artifacts/evals/tasks/e1-dyck-braid-s5/summary.json",
+        "artifacts/evals/tasks/e1-dyck-braid-s6/summary.json",
+        "artifacts/evals/tasks/e1-dyck-braid-s7/summary.json",
+        "artifacts/evals/tasks/e1-dyck-braid-s8/summary.json",
+        "artifacts/evals/tasks/e1-dyck-standard-s0/summary.json",
+        "artifacts/evals/tasks/e1-dyck-standard-s1/summary.json",
+        "artifacts/evals/tasks/e1-dyck-standard-s2/summary.json",
+        "artifacts/evals/tasks/e1-dyck-standard-s3/summary.json",
+        "artifacts/evals/tasks/e1-dyck-standard-s4/summary.json",
+        "artifacts/evals/tasks/e1-dyck-standard-s5/summary.json",
+        "artifacts/evals/tasks/e1-dyck-standard-s6/summary.json",
+        "artifacts/evals/tasks/e1-dyck-standard-s7/summary.json",
+        "artifacts/evals/tasks/e1-dyck-standard-s8/summary.json"
+      ],
+      "id": "hyp-braid-dyck-depth-extrapolation",
+      "policy_version": "ci-v2",
+      "tainted_artifacts_seen": false,
+      "verdict": "inconclusive"
+    },
+    {
+      "arms": {
+        "surreal": {
+          "baseline_floor": 0.5208333333333334,
+          "baseline_mean": 0.832175925925926,
+          "budget_flops": 100000000000000.0,
+          "ci95": [
+            -0.04709052494517193,
+            0.028572006426653328
+          ],
+          "effect": -0.0092592592592593,
+          "floor_source": "recorded_answer_prior",
+          "n_baseline": 9,
+          "n_candidate": 9,
+          "verdict": "refuted"
+        }
+      },
+      "artifacts": [
+        "artifacts/evals/tasks/e1-arith-standard-s0/summary.json",
+        "artifacts/evals/tasks/e1-arith-standard-s1/summary.json",
+        "artifacts/evals/tasks/e1-arith-standard-s2/summary.json",
+        "artifacts/evals/tasks/e1-arith-standard-s3/summary.json",
+        "artifacts/evals/tasks/e1-arith-standard-s4/summary.json",
+        "artifacts/evals/tasks/e1-arith-standard-s5/summary.json",
+        "artifacts/evals/tasks/e1-arith-standard-s6/summary.json",
+        "artifacts/evals/tasks/e1-arith-standard-s7/summary.json",
+        "artifacts/evals/tasks/e1-arith-standard-s8/summary.json",
+        "artifacts/evals/tasks/e1-arith-surreal-s0/summary.json",
+        "artifacts/evals/tasks/e1-arith-surreal-s1/summary.json",
+        "artifacts/evals/tasks/e1-arith-surreal-s2/summary.json",
+        "artifacts/evals/tasks/e1-arith-surreal-s3/summary.json",
+        "artifacts/evals/tasks/e1-arith-surreal-s4/summary.json",
+        "artifacts/evals/tasks/e1-arith-surreal-s5/summary.json",
+        "artifacts/evals/tasks/e1-arith-surreal-s6/summary.json",
+        "artifacts/evals/tasks/e1-arith-surreal-s7/summary.json",
+        "artifacts/evals/tasks/e1-arith-surreal-s8/summary.json"
+      ],
+      "id": "hyp-surreal-wide-dynamic-range",
+      "policy_version": "ci-v2",
+      "tainted_artifacts_seen": false,
+      "verdict": "refuted"
+    }
+  ]
+}
