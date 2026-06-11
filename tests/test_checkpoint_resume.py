@@ -547,3 +547,92 @@ def test_dequantization_annealing_schedule_telemetry(monkeypatch, tmp_path):
         (tmp_path / "artifacts" / "baseline" / "nanochat" / "anneal-smoke" / "summary.json").read_text()
     )
     assert summary["hparams"]["semiring_beta_spec"] == "linear:1:32"
+
+
+def test_coverage_beta_controller_transitions_exact():
+    """9jzb closed-loop controller: raise/hold/back-off transitions are exact,
+    bounds are respected, and beta is NEVER raised on a below-floor or missing
+    reading (the preregistration's checkable-from-logs invariant)."""
+    ctl = train_mod._CoverageBetaController(1.0, 64.0, 0.7)
+    up, down = ctl.UP, ctl.DOWN
+
+    assert ctl.step(None) == 1.0                      # no reading -> hold
+    assert ctl.step(0.9) == 1.0 * up                  # covered -> raise
+    assert ctl.step(0.7) == 1.0 * up * up             # floor is inclusive
+    b = ctl.beta
+    assert ctl.step(0.69) == max(b / down, ctl.b0)    # dip -> back off, clamped at B0
+    held = ctl.beta
+    assert ctl.step(None) == held                     # missing -> hold
+
+    # never-raise-below-floor invariant over an adversarial random stream
+    import random as _random
+
+    rng = _random.Random(9362)
+    ctl = train_mod._CoverageBetaController(1.0, 64.0, 0.7)
+    prev = ctl.beta
+    for _ in range(500):
+        cov = rng.choice([None, rng.random()])
+        beta = ctl.step(cov)
+        assert 1.0 <= beta <= 64.0
+        if beta > prev:
+            assert cov is not None and cov >= 0.7, "raised beta without floor-clearing coverage"
+        prev = beta
+
+    # saturation at BMAX under sustained coverage
+    ctl = train_mod._CoverageBetaController(1.0, 4.0, 0.5)
+    for _ in range(200):
+        ctl.step(1.0)
+    assert ctl.beta == 4.0
+
+
+def test_semiring_beta_spec_parser_coverage_mode():
+    assert train_mod._parse_semiring_beta_spec("coverage:1:64:0.7") == ("coverage", 1.0, 64.0, 0.7)
+    for bad in ("coverage:1:64", "coverage:0:64:0.7", "coverage:8:4:0.7", "coverage:1:64:1.5", "sigmoid:1:2"):
+        with pytest.raises(ValueError):
+            train_mod._parse_semiring_beta_spec(bad)
+
+
+def test_closed_loop_schedule_e2e_invariant(monkeypatch, tmp_path):
+    """Closed-loop e2e smoke: metrics stream shows beta never raised on a
+    step whose PREVIOUS coverage reading was below the floor."""
+    import json as json_mod
+
+    monkeypatch.setattr(
+        train_mod, "tokenizing_distributed_data_loader_with_state", _fake_loader_factory()
+    )
+    monkeypatch.setattr(train_mod, "list_parquet_files", lambda data_dir=None: ["a.parquet", "b.parquet"])
+    args = _train_args(
+        tmp_path, "coverage-smoke",
+        attention_type="tropical",
+        semiring_beta="coverage:1:16:0.5",
+        tropical_record_margins=None,
+        log_interval="1",
+    )
+    train_mod.train(args)
+    metrics = tmp_path / "artifacts" / "baseline" / "nanochat" / "coverage-smoke" / "metrics.jsonl"
+    rows = []
+    for line in metrics.read_text().splitlines():
+        rec = json_mod.loads(line)
+        if "semiring_beta" in rec:
+            rows.append((rec["semiring_beta"], rec.get("route_coverage")))
+    assert len(rows) >= 10, f"expected per-step telemetry, got {len(rows)}"
+    assert all(1.0 <= b <= 16.0 for b, _ in rows)
+    for (b_prev, cov_prev), (b_next, _) in zip(rows, rows[1:], strict=False):
+        if b_next > b_prev:
+            assert cov_prev is not None and cov_prev >= 0.5, (
+                f"beta raised {b_prev} -> {b_next} after coverage {cov_prev}"
+            )
+
+
+def test_coverage_spec_requires_margins(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        train_mod, "tokenizing_distributed_data_loader_with_state", _fake_loader_factory()
+    )
+    monkeypatch.setattr(train_mod, "list_parquet_files", lambda data_dir=None: ["a.parquet", "b.parquet"])
+    args = _train_args(
+        tmp_path, "coverage-no-margins",
+        attention_type="tropical",
+        semiring_beta="coverage:1:16:0.5",
+    )
+    with pytest.raises(ValueError, match="tropical-record-margins"):
+        train_mod.train(args)
