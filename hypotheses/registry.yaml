@@ -686,9 +686,24 @@ hypotheses:
       kind: model
       provenance: "8gk.1 theory note (markdown_documentation/maslov_dequantization_annealing.md section 4); the anneal-vs-snap contrast is the bead's preregistered experiment"
     date_registered: "2026-06-11"
-    prediction: null
-    operationalization_note: "needs an arm selector for semiring_beta schedules: the verdict engine distinguishes arms by attention_type/scheduler/optimizer only, so annealed-vs-fixed-beta tropical runs are indistinguishable as evidence; extend arm detection (or the bench variant selector) before operationalizing thresholds"
-    status: blocked
+    prediction:
+      # operationalized 2026-06-11 once rgyl landed the variant selectors
+      # (the original blocker); 95% quality retention = annealed val CE at
+      # most 1/0.95 = 1.053x the smooth-start (fixed beta=1) model's. The
+      # statement's coverage clause is reported in the campaign artifact
+      # (coverage is per-step telemetry, not a summary metric path yet).
+      metric_path: "train:results.val_ce_final"
+      comparator: "<="
+      threshold_kind: ratio
+      threshold: 1.053
+      baseline:
+        mechanism: tropical
+        equal_flops: true
+        variant: {semiring_beta_spec: "1.0"}
+      candidate_variant: {semiring_beta_spec: "linear:1:32"}
+      min_seeds: 3
+      scale_caveats: "E1 rung on the arith corpus (the validated discriminator); runs must enable --val-interval (campaign trainings default to no validation pass)"
+    status: open
     evidence: []
     verdict_history: []
 
