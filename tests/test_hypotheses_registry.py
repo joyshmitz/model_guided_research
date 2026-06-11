@@ -324,3 +324,35 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_variant_selector_validation():
+    """rgyl: variant selectors must be non-empty scalar-valued mappings."""
+    good = _entry()
+    good["prediction"] = {
+        **good["prediction"],
+        "baseline": {"mechanism": "tropical", "equal_flops": True, "variant": {"semiring_beta_spec": "1.0"}},
+        "candidate_variant": {"semiring_beta_spec": "linear:1:32"},
+    }
+    errors, _, _ = _validate(_registry(good))
+    assert errors == [], errors
+
+    cases = [
+        ({"variant": "not-a-mapping"}, "baseline.variant must be a non-empty mapping"),
+        ({"variant": {}}, "baseline.variant must be a non-empty mapping"),
+        ({"variant": {"semiring_beta_spec": {"nested": 1}}}, "must be a scalar"),
+        ({"variant": {"not an identifier": 1}}, "identifier-like"),
+    ]
+    for variant_patch, fragment in cases:
+        bad = _entry()
+        bad["prediction"] = {
+            **bad["prediction"],
+            "baseline": {"mechanism": "standard", "equal_flops": True, **variant_patch},
+        }
+        errors, _, _ = _validate(_registry(bad))
+        assert any(fragment in e for e in errors), f"expected {fragment!r}, got {errors}"
+
+    bad = _entry()
+    bad["prediction"] = {**bad["prediction"], "candidate_variant": []}
+    errors, _, _ = _validate(_registry(bad))
+    assert any("candidate_variant must be a non-empty mapping" in e for e in errors)

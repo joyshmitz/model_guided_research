@@ -5469,6 +5469,20 @@ def _validate_hypothesis_prediction(pred: Any, where: str, errors: list[str], wa
         errors.append(f"{where}: prediction.threshold must be a number")
     elif pred.get("threshold_kind") == "ratio" and threshold <= 0:
         errors.append(f"{where}: ratio threshold must be > 0, got {threshold}")
+    def _check_variant(variant: Any, label: str) -> None:
+        # rgyl: a variant selector restricts an arm WITHIN a mechanism by
+        # recorded hparams/config values; scalars only (matched by equality)
+        if variant is None:
+            return
+        if not isinstance(variant, dict) or not variant:
+            errors.append(f"{where}: {label} must be a non-empty mapping of recorded knob -> value")
+            return
+        for k, v in variant.items():
+            if not isinstance(k, str) or not k.isidentifier():
+                errors.append(f"{where}: {label} key {k!r} must be an identifier-like string")
+            if isinstance(v, (dict, list)):
+                errors.append(f"{where}: {label}[{k!r}] must be a scalar (matched by equality), got {type(v).__name__}")
+
     baseline = pred.get("baseline")
     if not isinstance(baseline, dict):
         errors.append(f"{where}: prediction.baseline must be a mapping")
@@ -5480,6 +5494,8 @@ def _validate_hypothesis_prediction(pred: Any, where: str, errors: list[str], wa
                 f"{where}: baseline.equal_flops must be true - equal-budget comparison is "
                 "the registry's fairness invariant"
             )
+        _check_variant(baseline.get("variant"), "baseline.variant")
+    _check_variant(pred.get("candidate_variant"), "prediction.candidate_variant")
     min_seeds = pred.get("min_seeds")
     if not isinstance(min_seeds, int) or isinstance(min_seeds, bool) or min_seeds < 1:
         errors.append(f"{where}: prediction.min_seeds must be an integer >= 1")
@@ -6056,23 +6072,53 @@ def _adj_collect_artifacts(roots: list[Path]) -> list[dict[str, Any]]:
     return index
 
 
-def _adj_artifact_matches_arm(art: dict[str, Any], mechanism: str) -> bool:
+def _adj_variant_matches(art: dict[str, Any], variant: dict[str, Any] | None) -> bool:
+    """Variant selector (rgyl): every key in `variant` must equal the
+    artifact's recorded value - looked up in hparams first, then config for
+    train artifacts; in meta.checkpoint for evaltasks. A null value selects
+    artifacts where the knob is recorded null OR absent (the all-defaults
+    arm), so 'exact tropical' (semiring_beta_spec: null) matches both new
+    artifacts that record the field and pre-rgyl artifacts that predate it.
+    This is what lets annealed / fixed-beta / endpoint runs of the SAME
+    mechanism be distinguished as evidence (hyp-maslov-anneal-loss-retention)."""
+    if not variant:
+        return True
+    data = art["data"]
+    if art["schema"] == "evaltasks":
+        sources: list[dict[str, Any]] = [((data.get("meta") or {}).get("checkpoint") or {})]
+    else:
+        sources = [data.get("hparams") or {}, data.get("config") or {}]
+    for key, wanted in variant.items():
+        found = None
+        for src in sources:
+            if key in src:
+                found = src[key]
+                break
+        if found != wanted:
+            return False
+    return True
+
+
+def _adj_artifact_matches_arm(art: dict[str, Any], mechanism: str, variant: dict[str, Any] | None = None) -> bool:
     """Arm membership: an arm changes exactly ITS axis from the all-defaults
-    baseline (attention standard, scheduler none, optimizer non-hoss)."""
+    baseline (attention standard, scheduler none, optimizer non-hoss); an
+    optional variant selector further restricts within the mechanism."""
     data = art["data"]
     if art["schema"] == "evaltasks":
         attn = ((data.get("meta") or {}).get("checkpoint") or {}).get("attention_type")
-        return attn == (mechanism if mechanism in _ADJ_ATTENTION_MECHS else "standard")
+        return attn == (mechanism if mechanism in _ADJ_ATTENTION_MECHS else "standard") and _adj_variant_matches(
+            art, variant
+        )
     config = data.get("config") or {}
     hparams = data.get("hparams") or {}
     attn = config.get("attention_type")
     sched = hparams.get("scheduler_type", "none")
     opt = config.get("optimizer_type", "adamw")
     if mechanism == "ordinal":
-        return attn == "standard" and sched == "ordinal"
+        return attn == "standard" and sched == "ordinal" and _adj_variant_matches(art, variant)
     if mechanism == "hoss":
-        return attn == "standard" and opt == "hoss"
-    return attn == mechanism and sched != "ordinal" and opt != "hoss"
+        return attn == "standard" and opt == "hoss" and _adj_variant_matches(art, variant)
+    return attn == mechanism and sched != "ordinal" and opt != "hoss" and _adj_variant_matches(art, variant)
 
 
 def _adj_planned_flops(art: dict[str, Any]) -> float | None:
@@ -6204,6 +6250,14 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
     threshold_kind = str(pred.get("threshold_kind", "absolute_delta"))
     validity_raw = pred.get("validity")
     validity: dict[str, Any] = validity_raw if isinstance(validity_raw, dict) else {}
+    # Variant selectors (rgyl): restrict arms WITHIN a mechanism by recorded
+    # hparams/config values (e.g. semiring_beta_spec distinguishes annealed
+    # vs fixed-beta vs exact-tropical evidence). Absent selectors = the
+    # pre-rgyl behavior, identically.
+    base_variant_raw = (pred.get("baseline") or {}).get("variant")
+    base_variant: dict[str, Any] | None = base_variant_raw if isinstance(base_variant_raw, dict) else None
+    cand_variant_raw = pred.get("candidate_variant")
+    cand_variant: dict[str, Any] | None = cand_variant_raw if isinstance(cand_variant_raw, dict) else None
     need = max(2, min_seeds)
 
     pool = [a for a in artifacts if a["schema"] == schema]
@@ -6214,8 +6268,8 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
     # A multi-mechanism entry is a FOR-ALL claim: every listed mechanism must
     # adjudicate; the overall verdict is the worst case across arms.
     for mech in hyp.get("mechanisms") or []:
-        cand_all = [a for a in pool if _adj_artifact_matches_arm(a, mech)]
-        base_all = [a for a in pool if _adj_artifact_matches_arm(a, baseline_mech)]
+        cand_all = [a for a in pool if _adj_artifact_matches_arm(a, mech, cand_variant)]
+        base_all = [a for a in pool if _adj_artifact_matches_arm(a, baseline_mech, base_variant)]
         saw_tainted = saw_tainted or any(a["tainted"] for a in cand_all + base_all)
         cand = _adj_dedupe_evaltasks([a for a in cand_all if not a["tainted"]])
         base = _adj_dedupe_evaltasks([a for a in base_all if not a["tainted"]])

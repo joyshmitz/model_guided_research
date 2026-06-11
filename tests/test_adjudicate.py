@@ -504,3 +504,75 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_variant_selector_distinguishes_semiring_beta_arms(tmp_path):
+    """rgyl: annealed vs fixed-beta vs exact-tropical runs share a mechanism;
+    variant selectors split them into arms. A null variant value matches both
+    recorded-null and knob-absent (pre-rgyl) artifacts."""
+
+    def train_artifact(name, *, spec, val_ce, record_key=True):
+        run = tmp_path / name
+        run.mkdir(parents=True)
+        hparams = {"scheduler_type": "none"}
+        if record_key:
+            hparams["semiring_beta_spec"] = spec
+        (run / "summary.json").write_text(json.dumps({
+            "schema_version": "mgr.telemetry.v1",
+            "config": {"attention_type": "tropical", "optimizer_type": "adamw"},
+            "hparams": hparams,
+            "budget": {"max_steps": 100, "target_flops": 1e9, "flops_per_step_est": 1e7},
+            "provenance": CLEAN_PROV,
+            "results": {"val_ce_final": val_ce},
+        }))
+
+    for i, ce in enumerate([1.90, 1.92, 1.91]):
+        train_artifact(f"anneal{i}", spec="linear:1:32", val_ce=ce)
+    for i, ce in enumerate([2.00, 2.02, 2.01]):
+        train_artifact(f"fixed{i}", spec="1.0", val_ce=ce)
+    # pre-rgyl artifact: the knob is ABSENT entirely (legacy summary)
+    for i, ce in enumerate([2.50, 2.52, 2.51]):
+        train_artifact(f"legacy{i}", spec=None, val_ce=ce, record_key=(i == 0))
+
+    hyp = _hyp(
+        {
+            "metric_path": "train:results.val_ce_final",
+            "comparator": "<=", "threshold_kind": "ratio", "threshold": 0.98,
+            "baseline": {"mechanism": "tropical", "equal_flops": True,
+                          "variant": {"semiring_beta_spec": "1.0"}},
+            "candidate_variant": {"semiring_beta_spec": "linear:1:32"},
+        },
+        mechanisms=["tropical"],
+    )
+    v = cli._adjudicate_hypothesis(hyp, _index(tmp_path))
+    assert v["verdict"] == "supported", v
+    arm = v["arms"]["tropical"]
+    assert arm["n_candidate"] == 3 and arm["n_baseline"] == 3
+    assert abs(arm["effect"] - 1.91 / 2.01) < 0.01
+    assert all("anneal" in p or "fixed" in p for p in v["artifacts"]), v["artifacts"]
+
+    # null variant = the exact-tropical arm: catches recorded-null AND absent
+    hyp_null = _hyp(
+        {
+            "metric_path": "train:results.val_ce_final",
+            "comparator": "<=", "threshold_kind": "ratio", "threshold": 0.98,
+            "baseline": {"mechanism": "tropical", "equal_flops": True,
+                          "variant": {"semiring_beta_spec": None}},
+            "candidate_variant": {"semiring_beta_spec": "linear:1:32"},
+        },
+        mechanisms=["tropical"],
+    )
+    v = cli._adjudicate_hypothesis(hyp_null, _index(tmp_path))
+    assert v["verdict"] == "supported", v
+    assert v["arms"]["tropical"]["n_baseline"] == 3  # all three legacy/null artifacts
+    assert all("anneal" in p or "legacy" in p for p in v["artifacts"]), v["artifacts"]
+
+    # no selector = pre-rgyl behavior: every tropical run pools into one arm
+    hyp_plain = _hyp(
+        {"metric_path": "train:results.val_ce_final",
+         "comparator": "<=", "threshold_kind": "ratio", "threshold": 0.98},
+        mechanisms=["tropical"],
+    )
+    hyp_plain["prediction"]["baseline"] = {"mechanism": "tropical", "equal_flops": True}
+    v = cli._adjudicate_hypothesis(hyp_plain, _index(tmp_path))
+    assert v["arms"]["tropical"]["n_candidate"] == 9

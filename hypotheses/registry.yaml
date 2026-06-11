@@ -40,6 +40,15 @@
 #   the CI convention (mean +/- CI95 must clear the threshold) is adjudicated
 #   by the verdict engine (policy stamped per verdict), recorded in
 #   verdict_history.
+#   variant selectors (optional, rgyl): when both arms share a mechanism but
+#   differ in a recorded knob (e.g. dequantization annealing vs fixed beta),
+#   baseline.variant and prediction.candidate_variant are mappings of
+#   recorded hparams/config keys -> scalar values matched by equality
+#   (null matches recorded-null AND knob-absent, so pre-rgyl artifacts count
+#   as the all-defaults arm). Example:
+#     baseline:  {mechanism: tropical, equal_flops: true,
+#                 variant: {semiring_beta_spec: "1.0"}}
+#     candidate_variant: {semiring_beta_spec: "linear:1:32"}
 #   validity (optional, ci-v2 floor gate — the pilot1/kbj2 lesson): a
 #   REFUTED verdict additionally requires the BASELINE to have demonstrably
 #   cleared the answer-prior floor. Below it every arm sits at the

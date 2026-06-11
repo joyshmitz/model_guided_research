@@ -542,3 +542,8 @@ def test_dequantization_annealing_schedule_telemetry(monkeypatch, tmp_path):
     assert all(b2 >= b1 for b1, b2 in zip(betas, betas[1:], strict=False)), "beta must anneal monotonically"
     assert abs(betas[0] - 1.0) < 1e-6 and abs(betas[-1] - 32.0) < 1e-6, (betas[0], betas[-1])
     assert coverages and all(0.0 <= c <= 1.0 for c in coverages), "coverage must be a fraction when margins are on"
+    # rgyl: the RAW schedule spec must be durably recorded for arm detection
+    summary = json_mod.loads(
+        (tmp_path / "artifacts" / "baseline" / "nanochat" / "anneal-smoke" / "summary.json").read_text()
+    )
+    assert summary["hparams"]["semiring_beta_spec"] == "linear:1:32"

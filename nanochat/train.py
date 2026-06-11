@@ -1431,6 +1431,15 @@ def train(args) -> None:
             "grad_clip_norm": (float(grad_clip_norm) if grad_clip_norm is not None else None),
             "model_type": model_type,
             "scheduler_type": str(args.scheduler_type),  # arm detection for the G2 verdict engine
+            # arm detection for semiring_beta variants (rgyl): the RAW spec -
+            # "linear:1:32" vs "32.0" vs null (exact tropical) - so annealed,
+            # fixed-beta, and endpoint runs are distinguishable as evidence
+            "semiring_beta_spec": (
+                str(args.semiring_beta)
+                if getattr(args, "semiring_beta", None) is not None
+                and getattr(config, "attention_type", None) == "tropical"
+                else None
+            ),
             "synaptic_config": (asdict(config.syn_cfg) if model_type == "synaptic" else None),
             "val_interval": val_interval,
             "val_batches": val_batches if val_interval > 0 else None,
