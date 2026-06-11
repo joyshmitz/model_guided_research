@@ -4224,19 +4224,30 @@ def _eval_tasks_provenance(
     )
 
 
-_EVAL_TASKS_SCHEMA_VERSION = "mgr.evaltasks.v1"
+_EVAL_TASKS_SCHEMA_VERSION = "mgr.evaltasks.v2"
 # SCHEMA CONTRACT (consumed by C4 scorecards and the G2 verdict engine):
 # {"schema_version", "kind": "eval-tasks",
 #  "meta": {run_id, generated_at, checkpoint{dir, step, attention_type, n_params,
-#           budget, lineage}, device, seeds, examples_per_seed, decode_modes, git},
+#           budget, lineage}, device, seeds, examples_per_seed, decode_modes, git,
+#           receipts},
 #  "tasks": {<name>: {
 #     "difficulty_axis": str|null, "in_range_max": float|null,
 #     "exact_match": {<mode>: {"in_range"|"held_out":
 #         {"mean": float, "ci95": [lo, hi], "per_seed": [float, ...]}}} | null,
+#     "answer_prior": {"in_range"|"held_out":
+#         {"mean": float, "per_seed": [float|null, ...], "majority_answer": str}} | null,
 #     "perplexity": {"in_range": float, "held_out": float},
 #     "curve": {"buckets": [...], "accuracy": [...], "counts": [...]} | null,
 #     "skipped_too_long": int, "n_examples_per_seed": int}}}
 # Changing this layout requires a schema_version bump and a migration note.
+# v1 -> v2 (2026-06-10, beads 27q3/i4eq): adds (a) per-task answer_prior - the
+# exact-match score of the best CONSTANT-answer policy on the very docs this
+# run scored, i.e. the floor a model that learned only the answer format +
+# majority token would hit; the ci-v2 verdict engine prefers this recorded
+# floor over registered fallbacks - and (b) per-example receipts in
+# generations.jsonl (meta.receipts), so behavioral claims about checkpoints
+# (e.g. "every arm answers 'lt' on every prompt") are committed evidence, not
+# session lore. v1 artifacts remain readable by the verdict engine.
 
 
 def _eval_split_examples(spec: Any, *, n: int, seed: int) -> tuple[list[str], list[str], float | None]:
@@ -4325,7 +4336,8 @@ def eval_tasks(
     Headline output: extrapolation curves (accuracy vs difficulty, in-range vs
     held-out marked) per task, exact-match via the vdc.1 brute-force format,
     per-task perplexity as the secondary metric. Writes summary.json (schema
-    mgr.evaltasks.v1 - a versioned contract) + run.md + curve PNGs.
+    mgr.evaltasks.v2 - a versioned contract), per-example receipts
+    (generations.jsonl), run.md, and curve PNGs.
     """
     import statistics as stats_mod
 
@@ -4373,6 +4385,7 @@ def eval_tasks(
 
     decode_modes = [("greedy", 0.0)] + ([("sampled", 1.0)] if sampled else [])
     results: dict[str, Any] = {}
+    receipt_rows: list[dict[str, Any]] = []  # per-example evidence -> generations.jsonl
     failure_log_cap = 10
 
     for name in names:
@@ -4383,6 +4396,9 @@ def eval_tasks(
         per_seed_em: dict[str, dict[str, list[float | None]]] = {
             mode: {"in_range": [], "held_out": []} for mode, _ in decode_modes
         }
+        # expected answers per region/seed (greedy pass; docs are identical
+        # across modes) -> the best-constant-policy floor for this exact sample
+        prior_counts: dict[str, list[dict[str, int]]] = {"in_range": [], "held_out": []}
         ppl_in: list[float] = []
         ppl_out: list[float] = []
         curve_points: list[tuple[float, bool]] = []
@@ -4408,7 +4424,8 @@ def eval_tasks(
                     for region, docs in (("in_range", in_docs), ("held_out", out_docs)):
                         correct_n = 0
                         scored_n = 0
-                        for doc in docs:
+                        seed_expected: dict[str, int] = {}
+                        for doc_idx, doc in enumerate(docs):
                             scored = _eval_score_doc(
                                 model, tok, spec, doc, device=device, temperature=temp, seed=eval_seed
                             )
@@ -4423,7 +4440,20 @@ def eval_tasks(
                                 continue
                             scored_n += 1
                             correct_n += int(correct)
+                            receipt_rows.append(
+                                {
+                                    "task": name,
+                                    "mode": mode,
+                                    "region": region,
+                                    "eval_seed": eval_seed,
+                                    "doc_index": doc_idx,
+                                    "expected": expected,
+                                    "got": got,
+                                    "correct": correct,
+                                }
+                            )
                             if mode == "greedy":
+                                seed_expected[expected] = seed_expected.get(expected, 0) + 1
                                 diff = spec.difficulty(doc) if spec.difficulty else None
                                 if diff is not None:
                                     curve_points.append((diff, correct))
@@ -4434,6 +4464,8 @@ def eval_tasks(
                                     f"expected={expected!r} got={got!r}"
                                 )
                         per_seed_em[mode][region].append(correct_n / scored_n if scored_n else None)
+                        if mode == "greedy":
+                            prior_counts[region].append(seed_expected)
 
         def agg(values: list[float | None]) -> dict[str, Any] | None:
             valid = [v for v in values if v is not None]
@@ -4453,6 +4485,28 @@ def eval_tasks(
                 for mode, regions in per_seed_em.items()
             }
 
+        def prior_agg(counters: list[dict[str, int]]) -> dict[str, Any] | None:
+            # best-constant-answer score on this exact sample, per seed: any
+            # model that learned only the answer format + one fixed token sits
+            # AT or BELOW this line (the ci-v2 floor gate's preferred floor)
+            per: list[float | None] = []
+            for c in counters:
+                total = sum(c.values())
+                per.append(max(c.values()) / total if total else None)
+            valid = [v for v in per if v is not None]
+            if not valid:
+                return None
+            pooled: dict[str, int] = {}
+            for c in counters:
+                for ans, n in c.items():
+                    pooled[ans] = pooled.get(ans, 0) + n
+            majority = max(pooled, key=lambda k: pooled[k])
+            return {"mean": stats_mod.mean(valid), "per_seed": per, "majority_answer": majority}
+
+        answer_prior: dict[str, Any] | None = None
+        if spec.answer_marker is not None:
+            answer_prior = {region: prior_agg(counters) for region, counters in prior_counts.items()}
+
         curve: dict[str, Any] | None = None
         if curve_points:
             buckets = sorted({d for d, _ in curve_points})
@@ -4468,6 +4522,7 @@ def eval_tasks(
             "difficulty_axis": spec.difficulty_axis,
             "in_range_max": in_range_max,
             "exact_match": exact_match,
+            "answer_prior": answer_prior,
             "perplexity": {"in_range": stats_mod.mean(ppl_in), "held_out": stats_mod.mean(ppl_out)},
             "curve": curve,
             "skipped_too_long": skipped,
@@ -4477,6 +4532,12 @@ def eval_tasks(
     resolved_run_id = run_id or time.strftime("%Y%m%d_%H%M%S")
     run_dir = artifacts_dir / "evals" / "tasks" / resolved_run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Per-example receipts: every scored (prompt, expected, got, correct) row,
+    # so claims about model behavior are auditable from the artifact alone.
+    with (run_dir / "generations.jsonl").open("w", encoding="utf-8") as fh:
+        for row in receipt_rows:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
 
     # Extrapolation curves (matplotlib, headless)
     curve_files: dict[str, str] = {}
@@ -4525,6 +4586,7 @@ def eval_tasks(
             "examples_per_seed": examples,
             "decode_modes": [m for m, _ in decode_modes],
             "git": _get_git_info(),
+            "receipts": "generations.jsonl",
         },
         # Tamper-evidence (rz8.2 contract): the G2 verdict engine refuses
         # tainted artifacts. config_hash here covers the EVAL parameters plus
@@ -4564,7 +4626,8 @@ def eval_tasks(
         f"- seeds: {seed_list} · examples/seed: {examples} · decode: {[m for m, _ in decode_modes]}\n\n"
         "| task | EM in-range | EM held-out | ppl in/held | curve |\n|---|---|---|---|---|\n"
         + "\n".join(md_rows)
-        + "\n\nSee `summary.json` (schema mgr.evaltasks.v1) for the full contract output.\n"
+        + "\n\nSee `summary.json` (schema mgr.evaltasks.v2) for the full contract output and "
+        "`generations.jsonl` for per-example receipts.\n"
     )
     (run_dir / "run.md").write_text(report_md)
     console.print(f"[bold green]Wrote eval artifacts[/bold green] → {run_dir}")
@@ -5236,6 +5299,28 @@ def _validate_hypothesis_prediction(pred: Any, where: str, errors: list[str], wa
         errors.append(f"{where}: prediction.min_seeds must be an integer >= 1")
     elif min_seeds < 3:
         warnings.append(f"{where}: min_seeds={min_seeds} is below the house convention of 3")
+    validity = pred.get("validity")
+    if validity is not None:
+        if not isinstance(validity, dict):
+            errors.append(f"{where}: prediction.validity must be a mapping or omitted")
+        else:
+            unknown_keys = set(validity) - {"baseline_floor", "floor_margin", "floor_source"}
+            if unknown_keys:
+                errors.append(f"{where}: prediction.validity has unknown key(s) {sorted(unknown_keys)}")
+            floor = validity.get("baseline_floor")
+            if not isinstance(floor, (int, float)) or isinstance(floor, bool):
+                errors.append(f"{where}: validity.baseline_floor must be a number")
+            margin = validity.get("floor_margin", 0.0)
+            if not isinstance(margin, (int, float)) or isinstance(margin, bool) or margin < 0:
+                errors.append(f"{where}: validity.floor_margin must be a number >= 0")
+            floor_source = validity.get("floor_source")
+            if not isinstance(floor_source, str) or not floor_source.strip():
+                errors.append(f"{where}: validity.floor_source must document how the floor was computed")
+    elif isinstance(metric_path, str) and ".exact_match." in metric_path:
+        warnings.append(
+            f"{where}: exact-match prediction without validity.baseline_floor - the ci-v2 "
+            "floor gate will rely on artifact-recorded answer priors only"
+        )
 
 
 def _validate_hypothesis_registry(
@@ -5513,6 +5598,13 @@ def hypotheses_show(
             f"{'x' if pred.get('threshold_kind') == 'ratio' else '+'} {pred.get('threshold')} "
             f"({pred.get('threshold_kind')}, equal FLOPs, >= {pred.get('min_seeds')} seeds)"
         )
+        validity = pred.get("validity")
+        if isinstance(validity, dict):
+            lines.append(
+                f"  validity: baseline must clear floor {validity.get('baseline_floor')} "
+                f"(+{validity.get('floor_margin', 0.0)}) for a refutation to stand "
+                f"— {validity.get('floor_source', '?')}"
+            )
         if pred.get("scale_caveats"):
             lines.append(f"  caveats: {pred['scale_caveats']}")
     else:
@@ -5588,6 +5680,16 @@ def hypotheses_add(
     ] = "standard",
     min_seeds: Annotated[int, typer.Option(help="Minimum seeds per arm")] = 3,
     scale_caveats: Annotated[str | None, typer.Option(help="Scale caveats for the prediction")] = None,
+    baseline_floor: Annotated[
+        float | None,
+        typer.Option(help="validity.baseline_floor - answer-prior fallback floor for the ci-v2 gate"),
+    ] = None,
+    floor_margin: Annotated[
+        float | None, typer.Option(help="validity.floor_margin (default 0.0 when floor registered)")
+    ] = None,
+    floor_source: Annotated[
+        str | None, typer.Option(help="validity.floor_source - how the floor was computed (required with --baseline-floor)")
+    ] = None,
     note: Annotated[
         str | None, typer.Option(help="operationalization_note (required when --metric-path is omitted)")
     ] = None,
@@ -5598,6 +5700,9 @@ def hypotheses_add(
         console.print(
             "[bold red]--note (operationalization_note) is required when --metric-path is omitted.[/bold red]"
         )
+        raise typer.Exit(code=2)
+    if baseline_floor is not None and not (floor_source and floor_source.strip()):
+        console.print("[bold red]--floor-source is required when --baseline-floor is given.[/bold red]")
         raise typer.Exit(code=2)
     path = _hypotheses_registry_path()
     original = path.read_text(encoding="utf-8")
@@ -5630,6 +5735,12 @@ def hypotheses_add(
                 f"      min_seeds: {min_seeds}",
             ]
         )
+        if baseline_floor is not None:
+            lines.append("      validity:")
+            lines.append(f"        baseline_floor: {baseline_floor}")
+            if floor_margin is not None:
+                lines.append(f"        floor_margin: {floor_margin}")
+            lines.append(f"        floor_source: {yq(floor_source or '')}")
         if scale_caveats:
             lines.append(f"      scale_caveats: {yq(scale_caveats)}")
         lines.append("    status: open")
@@ -5663,21 +5774,46 @@ def hypotheses_add(
 # evidence yields BLOCKED with a machine-readable reason, never a soft verdict.
 # =============================================================================
 
-_ADJ_POLICY_VERSION = "ci-v1"
-# ci-v1 statistical policy (recorded in every verdict so a future policy
-# change cannot silently reinterpret history):
-#   - observations per arm: per_seed values when the metric_path ends in
-#     ".mean" and a sibling per_seed list exists; otherwise one observation
-#     per qualifying artifact. CIs need >= 2 observations per arm.
-#   - absolute_delta: effect = mean(C) - mean(B); Welch-normal CI95
-#     (d +/- 1.96 * sqrt(sC^2/nC + sB^2/nB)).
+_ADJ_POLICY_VERSION = "ci-v2"
+# ci-v2 statistical policy (recorded in every verdict so a future policy
+# change cannot silently reinterpret history). ci-v1 verdicts remain in the
+# ledger stamped ci-v1; ci-v2 supersedes by APPENDING, never rewriting.
+#
+#   - observation unit (the ci-v1 -> ci-v2 fix #1): for evaltasks artifacts,
+#     ONE observation per TRAINED MODEL - the artifact's `.mean`, which
+#     already averages its eval seeds. Eval seeds are repeated measurements
+#     of the same checkpoint, not independent replications; ci-v1 pooled
+#     them as i.i.d. (3 train seeds x 3 eval seeds = "n=9"), an
+#     anti-conservative pseudo-replication. Re-evals of the same checkpoint
+#     (lineage run_id + step) are deduped to the newest/richest artifact.
+#     train artifacts: per_seed values when present (those ARE training
+#     seeds), else the single value. CIs need >= max(2, min_seeds) obs/arm.
+#   - absolute_delta: effect = mean(C) - mean(B); Welch t CI95 with
+#     Satterthwaite df (fix #2: at the n=3 clustering produces, the normal
+#     1.96 understates the interval; t(df~4) ~ 2.78). Zero spread in both
+#     arms -> a degenerate point CI at the effect.
 #   - ratio: effect = mean(C) / mean(B); percentile bootstrap CI95
 #     (10_000 resamples, numpy default_rng(1234) - deterministic).
 #   - SUPPORTED: the CI95 lies entirely on the predicted side of the
 #     threshold. REFUTED: entirely on the failing side (the registered
 #     effect size is part of the claim). INCONCLUSIVE: the CI straddles.
-#   - budgets: all qualifying artifacts' planned total FLOPs must agree
-#     within 5% of the maximum, else BLOCKED budget_mismatch.
+#   - floor validity gate (fix #3, the pilot1/kbj2 lesson): a REFUTED arm
+#     additionally requires the BASELINE to have demonstrably cleared the
+#     answer-prior floor - mean(B) > floor + floor_margin. Below it, every
+#     arm sits at the best-constant-answer score, the experiment has no
+#     power to see a mechanism advantage, and a null effect is evidence of
+#     NO POWER, not evidence of absence: the arm downgrades to INCONCLUSIVE
+#     with floor_effect: true. The floor is the artifact-recorded
+#     answer_prior (mgr.evaltasks.v2: the best constant-answer score on the
+#     exact docs scored) when every baseline artifact records it, else the
+#     registered prediction.validity.baseline_floor. SUPPORTED needs no
+#     gate: clearing baseline + threshold proves the candidate learned.
+#   - budget cohorts (fix #4): qualifying artifacts are grouped into
+#     planned-FLOPs cohorts (within 5% of a cohort anchor); the verdict uses
+#     the LARGEST-budget cohort where both arms reach min_seeds. Bigger-
+#     budget evidence supersedes smaller automatically; cross-budget pools
+#     never mix. No cohort containing both arms -> BLOCKED budget_mismatch;
+#     both arms present but too few runs -> BLOCKED insufficient_seeds.
 _ADJ_BUDGET_RTOL = 0.05
 _ADJ_BOOTSTRAP_SEED = 1234
 _ADJ_BOOTSTRAP_N = 10_000
@@ -5690,8 +5826,8 @@ _ADJ_BLOCK_REASONS = {
     "no_candidate_artifacts": "no qualifying artifact for the candidate arm",
     "no_baseline_artifacts": "no qualifying artifact for the baseline arm",
     "tainted_evidence": "only tainted artifacts available (dirty tree / missing provenance) - evidence not attributable to a committed code state",
-    "insufficient_seeds": "fewer observations than the prediction's min_seeds (or < 2, the CI floor)",
-    "budget_mismatch": "candidate and baseline budgets differ beyond the 5% equal-FLOPs tolerance",
+    "insufficient_seeds": "no equal-FLOPs cohort gives both arms at least min_seeds (>= 2) training runs",
+    "budget_mismatch": "no equal-FLOPs cohort (5% tolerance) contains both arms, or an artifact cannot prove its planned budget",
     "metric_missing": "qualifying artifact lacks the metric at the registered path",
 }
 
@@ -5722,7 +5858,7 @@ def _adj_collect_artifacts(roots: list[Path]) -> list[dict[str, Any]]:
             if not isinstance(data, dict):
                 continue
             sv = data.get("schema_version")
-            if sv == "mgr.evaltasks.v1":
+            if sv in ("mgr.evaltasks.v1", "mgr.evaltasks.v2"):
                 schema = "evaltasks"
             elif sv == "mgr.telemetry.v1":
                 schema = "train"
@@ -5772,10 +5908,44 @@ def _adj_planned_flops(art: dict[str, Any]) -> float | None:
     return None
 
 
+def _adj_dedupe_evaltasks(arts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One eval artifact per trained checkpoint (ci-v2): re-evals of the same
+    training run (lineage run_id + step) are repeated measurements of the same
+    model, never extra evidence. Keep the richest/newest artifact (schema v2
+    over v1, then generated_at, then path - all deterministic)."""
+    best: dict[Any, tuple[tuple[str, str, str], dict[str, Any]]] = {}
+    out: list[dict[str, Any]] = []
+    for a in arts:
+        if a["schema"] != "evaltasks":
+            out.append(a)
+            continue
+        meta = a["data"].get("meta") or {}
+        ckpt = meta.get("checkpoint") or {}
+        lineage = ckpt.get("lineage") or {}
+        run_id = lineage.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            out.append(a)  # no lineage -> cannot dedupe; keep as-is
+            continue
+        key = (run_id, ckpt.get("step"))
+        rank = (
+            str(a["data"].get("schema_version", "")),  # "...v2" > "...v1"
+            str(meta.get("generated_at", "")),
+            str(a["path"]),
+        )
+        prev = best.get(key)
+        if prev is None or rank > prev[0]:
+            best[key] = (rank, a)
+    out.extend(a for _, a in best.values())
+    return sorted(out, key=lambda a: str(a["path"]))
+
+
 def _adj_observations(art: dict[str, Any], dotted: str) -> list[float] | None:
-    """Extract per-seed observations when available, else the single value."""
+    """ci-v2 observation units. evaltasks: ONE observation per artifact - the
+    `.mean` value, which already averages that checkpoint's eval seeds (eval
+    seeds are repeated measurements, not replications). train: per_seed values
+    when present (those ARE training seeds), else the single value."""
     value = _adj_walk_path(art["data"], dotted)
-    if dotted.endswith(".mean"):
+    if art["schema"] != "evaltasks" and dotted.endswith(".mean"):
         parent = _adj_walk_path(art["data"], dotted.rsplit(".", 1)[0])
         if isinstance(parent, dict) and isinstance(parent.get("per_seed"), list):
             obs = [float(v) for v in parent["per_seed"] if isinstance(v, (int, float))]
@@ -5785,18 +5955,39 @@ def _adj_observations(art: dict[str, Any], dotted: str) -> list[float] | None:
     return None
 
 
+def _adj_prior_path(dotted: str) -> str | None:
+    """Derive the recorded-floor path from an exact-match metric path:
+    tasks.<t>.exact_match.<mode>.<region>.mean -> tasks.<t>.answer_prior.<region>.mean
+    (None for non-exact-match metrics - the recorded floor only exists there)."""
+    segs = dotted.split(".")
+    if segs[-1] != "mean" or "exact_match" not in segs:
+        return None
+    i = segs.index("exact_match")
+    if len(segs) != i + 4:  # exact_match.<mode>.<region>.mean
+        return None
+    return ".".join(segs[:i] + ["answer_prior", segs[i + 2], "mean"])
+
+
 def _adj_ci(cand: list[float], base: list[float], threshold_kind: str) -> tuple[float, float, float]:
-    """(effect, ci_low, ci_high) under the ci-v1 policy."""
+    """(effect, ci_low, ci_high) under the ci-v2 policy."""
     import statistics as stats_mod
 
     import numpy as _np
 
     if threshold_kind == "absolute_delta":
         effect = stats_mod.mean(cand) - stats_mod.mean(base)
-        se = (
-            (stats_mod.variance(cand) / len(cand)) + (stats_mod.variance(base) / len(base))
-        ) ** 0.5
-        return effect, effect - 1.96 * se, effect + 1.96 * se
+        vc, vb = stats_mod.variance(cand), stats_mod.variance(base)
+        nc, nb = len(cand), len(base)
+        se = (vc / nc + vb / nb) ** 0.5
+        if se == 0.0:
+            return effect, effect, effect  # zero spread in both arms: a point CI
+        # Welch t with Satterthwaite df: honest widths at the small n that
+        # per-training-run clustering produces (n=3 -> crit ~2.78, not 1.96)
+        df = (vc / nc + vb / nb) ** 2 / ((vc / nc) ** 2 / (nc - 1) + (vb / nb) ** 2 / (nb - 1))
+        from scipy import stats as _scipy_stats
+
+        crit = float(_scipy_stats.t.ppf(0.975, df))
+        return effect, effect - crit * se, effect + crit * se
     rng = _np.random.default_rng(_ADJ_BOOTSTRAP_SEED)
     c = _np.asarray(cand, dtype=float)
     b = _np.asarray(base, dtype=float)
@@ -5825,19 +6016,23 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
     comparator = pred.get("comparator")
     threshold = float(pred.get("threshold", 0.0))
     threshold_kind = str(pred.get("threshold_kind", "absolute_delta"))
+    validity_raw = pred.get("validity")
+    validity: dict[str, Any] = validity_raw if isinstance(validity_raw, dict) else {}
+    need = max(2, min_seeds)
 
     pool = [a for a in artifacts if a["schema"] == schema]
     arms: dict[str, dict[str, Any]] = {}
     used_paths: list[str] = []
     saw_tainted = False
+    floor_gated = False
     # A multi-mechanism entry is a FOR-ALL claim: every listed mechanism must
     # adjudicate; the overall verdict is the worst case across arms.
     for mech in hyp.get("mechanisms") or []:
         cand_all = [a for a in pool if _adj_artifact_matches_arm(a, mech)]
         base_all = [a for a in pool if _adj_artifact_matches_arm(a, baseline_mech)]
         saw_tainted = saw_tainted or any(a["tainted"] for a in cand_all + base_all)
-        cand = [a for a in cand_all if not a["tainted"]]
-        base = [a for a in base_all if not a["tainted"]]
+        cand = _adj_dedupe_evaltasks([a for a in cand_all if not a["tainted"]])
+        base = _adj_dedupe_evaltasks([a for a in base_all if not a["tainted"]])
         if not cand:
             code = "tainted_evidence" if cand_all else "no_candidate_artifacts"
             return {"id": hid, "verdict": "blocked", "reason_code": code, "mechanism": mech,
@@ -5846,35 +6041,89 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
             code = "tainted_evidence" if base_all else "no_baseline_artifacts"
             return {"id": hid, "verdict": "blocked", "reason_code": code, "mechanism": mech,
                     "reason": _ADJ_BLOCK_REASONS[code]}
-        flops = [f for a in cand + base if (f := _adj_planned_flops(a)) is not None]
-        if len(flops) != len(cand) + len(base) or (max(flops) - min(flops)) > _ADJ_BUDGET_RTOL * max(flops):
-            return {"id": hid, "verdict": "blocked", "reason_code": "budget_mismatch", "mechanism": mech,
-                    "reason": _ADJ_BLOCK_REASONS["budget_mismatch"]}
-        cand_obs = [v for a in cand for v in (_adj_observations(a, dotted) or [])]
-        base_obs = [v for a in base for v in (_adj_observations(a, dotted) or [])]
-        if not cand_obs or not base_obs:
+        # qualifying = carries the registered metric (keeps evidence lists
+        # honest: an arith-trained model's eval cannot witness a hier claim)
+        cand_m = [a for a in cand if _adj_observations(a, dotted)]
+        base_m = [a for a in base if _adj_observations(a, dotted)]
+        if not cand_m or not base_m:
             return {"id": hid, "verdict": "blocked", "reason_code": "metric_missing", "mechanism": mech,
                     "reason": _ADJ_BLOCK_REASONS["metric_missing"]}
-        if min(len(cand_obs), len(base_obs)) < max(2, min_seeds):
-            return {"id": hid, "verdict": "blocked", "reason_code": "insufficient_seeds", "mechanism": mech,
-                    "reason": _ADJ_BLOCK_REASONS["insufficient_seeds"]}
+        # budget cohorts: every artifact must prove its planned FLOPs; the
+        # verdict uses the LARGEST cohort where both arms reach min_seeds
+        cand_f = [(a, f) for a in cand_m if (f := _adj_planned_flops(a)) is not None]
+        base_f = [(a, f) for a in base_m if (f := _adj_planned_flops(a)) is not None]
+        if not cand_f or not base_f:
+            return {"id": hid, "verdict": "blocked", "reason_code": "budget_mismatch", "mechanism": mech,
+                    "reason": _ADJ_BLOCK_REASONS["budget_mismatch"]}
+        anchors = sorted({f for _, f in cand_f + base_f}, reverse=True)
+        chosen: tuple[float, list[dict[str, Any]], list[dict[str, Any]]] | None = None
+        both_arms_seen = False
+        for anchor in anchors:
+            lo_bound = anchor * (1.0 - _ADJ_BUDGET_RTOL)
+            cc = [a for a, f in cand_f if lo_bound <= f <= anchor]
+            bb = [a for a, f in base_f if lo_bound <= f <= anchor]
+            if not cc or not bb:
+                continue
+            both_arms_seen = True
+            n_c = sum(len(_adj_observations(a, dotted) or []) for a in cc)
+            n_b = sum(len(_adj_observations(a, dotted) or []) for a in bb)
+            if min(n_c, n_b) >= need:
+                chosen = (anchor, cc, bb)
+                break
+        if chosen is None:
+            code = "insufficient_seeds" if both_arms_seen else "budget_mismatch"
+            return {"id": hid, "verdict": "blocked", "reason_code": code, "mechanism": mech,
+                    "reason": _ADJ_BLOCK_REASONS[code]}
+        anchor, cc, bb = chosen
+        cand_obs = [v for a in cc for v in (_adj_observations(a, dotted) or [])]
+        base_obs = [v for a in bb for v in (_adj_observations(a, dotted) or [])]
         effect, lo, hi = _adj_ci(cand_obs, base_obs, threshold_kind)
         if comparator == ">=":
             arm_verdict = "supported" if lo >= threshold else ("refuted" if hi < threshold else "inconclusive")
         else:  # "<="
             arm_verdict = "supported" if hi <= threshold else ("refuted" if lo > threshold else "inconclusive")
-        arms[mech] = {
-            "verdict": arm_verdict,
+        arm: dict[str, Any] = {
             "effect": effect,
             "ci95": [lo, hi],
             "n_candidate": len(cand_obs),
             "n_baseline": len(base_obs),
+            "budget_flops": anchor,
         }
-        used_paths.extend(sorted({a["path"] for a in cand + base}))
+        # ---- floor validity gate (ci-v2) ----
+        floor: float | None = None
+        floor_src: str | None = None
+        prior_dotted = _adj_prior_path(dotted)
+        if prior_dotted is not None:
+            priors = [_adj_walk_path(a["data"], prior_dotted) for a in bb]
+            vals = [float(p) for p in priors if isinstance(p, (int, float)) and not isinstance(p, bool)]
+            if vals and len(vals) == len(bb):
+                floor = sum(vals) / len(vals)
+                floor_src = "recorded_answer_prior"
+        if floor is None:
+            reg = validity.get("baseline_floor")
+            if isinstance(reg, (int, float)) and not isinstance(reg, bool):
+                floor = float(reg)
+                floor_src = "registered_baseline_floor"
+        if floor is not None:
+            margin = validity.get("floor_margin", 0.0)
+            margin = float(margin) if isinstance(margin, (int, float)) and not isinstance(margin, bool) else 0.0
+            baseline_mean = sum(base_obs) / len(base_obs)
+            arm["baseline_mean"] = baseline_mean
+            arm["baseline_floor"] = floor
+            arm["floor_source"] = floor_src
+            if arm_verdict == "refuted" and baseline_mean <= floor + margin:
+                # the baseline never demonstrably learned the task: a null
+                # effect here is evidence of NO POWER, not evidence of absence
+                arm_verdict = "inconclusive"
+                arm["floor_effect"] = True
+                floor_gated = True
+        arm["verdict"] = arm_verdict
+        arms[mech] = arm
+        used_paths.extend(sorted({a["path"] for a in cc + bb}))
 
     order = {"refuted": 0, "inconclusive": 1, "supported": 2}
     verdict = min((a["verdict"] for a in arms.values()), key=lambda v: order[v])
-    return {
+    record: dict[str, Any] = {
         "id": hid,
         "verdict": verdict,
         "arms": arms,
@@ -5882,6 +6131,9 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
         "policy_version": _ADJ_POLICY_VERSION,
         "tainted_artifacts_seen": saw_tainted,
     }
+    if floor_gated:
+        record["floor_effect"] = True
+    return record
 
 
 def _registry_append_verdict(path: Path, hyp_id: str, entry_line: str, new_status: str) -> None:
@@ -6015,7 +6267,13 @@ def adjudicate(
             detail = f"{v['reason_code']}" + (f" [{v.get('mechanism')}]" if v.get("mechanism") else "")
         else:
             detail = "; ".join(
-                f"{m}: effect={a['effect']:.4g} ci95=[{a['ci95'][0]:.4g},{a['ci95'][1]:.4g}] (n={a['n_candidate']}/{a['n_baseline']})"
+                f"{m}: effect={a['effect']:.4g} ci95=[{a['ci95'][0]:.4g},{a['ci95'][1]:.4g}] "
+                f"(n={a['n_candidate']}/{a['n_baseline']})"
+                + (
+                    f" FLOOR(base {a['baseline_mean']:.4g} <= {a['baseline_floor']:.4g}, no power)"
+                    if a.get("floor_effect")
+                    else ""
+                )
                 for m, a in v["arms"].items()
             )
         table.add_row(str(v["id"]), f"[{style[st]}]{st}[/{style[st]}]", detail)

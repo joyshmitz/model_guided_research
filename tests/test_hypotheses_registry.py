@@ -120,10 +120,29 @@ def test_prediction_contract_enforced():
         ({**bad_pred, "baseline": {"mechanism": "standard", "equal_flops": False}}, "equal_flops"),
         ({**bad_pred, "baseline": {"mechanism": "alien", "equal_flops": True}}, "baseline.mechanism"),
         ({**bad_pred, "min_seeds": 0}, "min_seeds"),
+        ({**bad_pred, "validity": "not-a-mapping"}, "validity must be a mapping"),
+        ({**bad_pred, "validity": {"baseline_floor": "tall", "floor_source": "x"}}, "baseline_floor must be a number"),
+        ({**bad_pred, "validity": {"baseline_floor": 0.5}}, "floor_source"),
+        ({**bad_pred, "validity": {"baseline_floor": 0.5, "floor_margin": -0.1, "floor_source": "x"}}, "floor_margin"),
+        ({**bad_pred, "validity": {"baseline_floor": 0.5, "floor_ceiling": 1.0, "floor_source": "x"}}, "unknown key"),
     ]
     for pred, fragment in cases:
         errors, _, _ = _validate(_registry(_entry(prediction=pred)))
         assert any(fragment in e for e in errors), f"expected {fragment!r} error, got {errors}"
+
+
+def test_exact_match_prediction_without_floor_warns():
+    """ci-v2: EM predictions should register an answer-prior fallback floor;
+    without one the gate has only artifact-recorded priors to lean on."""
+    errors, warnings, _ = _validate(_registry(_entry()))  # dyck EM metric, no validity
+    assert errors == []
+    assert any("floor gate" in w for w in warnings), warnings
+
+    with_floor = _entry()
+    with_floor["prediction"] = {**with_floor["prediction"],
+                                "validity": {"baseline_floor": 0.512, "floor_source": "population prior (test)"}}
+    errors, warnings, _ = _validate(_registry(with_floor))
+    assert errors == [] and not any("floor gate" in w for w in warnings)
 
 
 def test_null_prediction_requires_note_and_open_or_blocked_status():

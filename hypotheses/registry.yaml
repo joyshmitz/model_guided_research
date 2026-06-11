@@ -25,7 +25,7 @@
 #
 # PREDICTION SEMANTICS (the contract the verdict engine hij.2 will execute)
 #   metric_path: "<schema>:<dotted.path>" into a versioned artifact schema:
-#     evaltasks — mgr.evaltasks.v1 (mgr eval-tasks summary.json)
+#     evaltasks — mgr.evaltasks.v1/v2 (mgr eval-tasks summary.json)
 #     train     — mgr.telemetry.v1 (nanochat train summary.json)
 #     certify   — mgr certify summary.json
 #     bench     — mgr bench-fixed-flops aggregate
@@ -35,9 +35,25 @@
 #     "<=" + absolute_delta : claim holds iff M <= B - threshold
 #     ">=" + ratio          : claim holds iff M >= threshold * B
 #     "<=" + ratio          : claim holds iff M <= threshold * B
-#   min_seeds: the verdict needs at least this many seeds per arm; the CI
-#   convention (mean +/- CI95 must clear the threshold) is adjudicated by
-#   hij.2, recorded in verdict_history.
+#   min_seeds: the verdict needs at least this many TRAINING RUNS per arm
+#   (ci-v2 counts one observation per trained model, never per eval seed);
+#   the CI convention (mean +/- CI95 must clear the threshold) is adjudicated
+#   by the verdict engine (policy stamped per verdict), recorded in
+#   verdict_history.
+#   validity (optional, ci-v2 floor gate — the pilot1/kbj2 lesson): a
+#   REFUTED verdict additionally requires the BASELINE to have demonstrably
+#   cleared the answer-prior floor. Below it every arm sits at the
+#   best-constant-answer score, the experiment has no power to surface a
+#   mechanism advantage, and a null effect is evidence of NO POWER, not
+#   evidence of absence — the verdict downgrades to INCONCLUSIVE
+#   (floor_effect: true). Fields:
+#     baseline_floor — fallback floor: the population majority-answer prior
+#       of the task's held-out split. The engine PREFERS the artifact-
+#       recorded answer_prior (mgr.evaltasks.v2: the exact best-constant
+#       score on the docs actually scored) whenever every baseline artifact
+#       records it.
+#     floor_margin   — optional gate widening (default 0.0).
+#     floor_source   — how the floor was computed (required).
 #   prediction: null is allowed ONLY with an operationalization_note naming
 #   what is missing — visible debt, never silent omission.
 #
@@ -72,6 +88,9 @@ hypotheses:
       threshold: 0.05
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
+      validity:
+        baseline_floor: 0.014
+        floor_source: "population majority-answer prior of the hier held-out split (10 generator seeds x 3000 docs, 2026-06-10); ci-v2 prefers the artifact-recorded answer_prior"
       scale_caveats: "registered at nanochat research scale; E1 rungs decide persistence"
     status: refuted
     evidence: []
@@ -96,6 +115,9 @@ hypotheses:
       threshold: 0.05
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
+      validity:
+        baseline_floor: 0.014
+        floor_source: "population majority-answer prior of the hier held-out split (10 generator seeds x 3000 docs, 2026-06-10); ci-v2 prefers the artifact-recorded answer_prior"
       scale_caveats: "registered at nanochat research scale"
     status: refuted
     evidence: []
@@ -121,6 +143,9 @@ hypotheses:
       threshold: 0.05
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
+      validity:
+        baseline_floor: 0.014
+        floor_source: "population majority-answer prior of the needle held-out split (10 generator seeds x 3000 docs, 2026-06-10); ci-v2 prefers the artifact-recorded answer_prior"
       scale_caveats: "held-out lengths are 4x train; longer contexts need E1"
     status: open
     evidence: []
@@ -165,6 +190,9 @@ hypotheses:
       threshold: 0.05
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
+      validity:
+        baseline_floor: 0.512
+        floor_source: "population majority-answer prior of the dyck held-out split (10 generator seeds x 3000 docs, 2026-06-10); ci-v2 prefers the artifact-recorded answer_prior"
       scale_caveats: "registered at nanochat research scale"
     status: inconclusive
     evidence: []
@@ -189,6 +217,9 @@ hypotheses:
       threshold: 0.10
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
+      validity:
+        baseline_floor: 0.001
+        floor_source: "population majority-answer prior of the copyops held-out split (10 generator seeds x 3000 docs, 2026-06-10: answers are near-unique sequences); ci-v2 prefers the artifact-recorded answer_prior"
       scale_caveats: "demo numbers come from a task-built JAX model; the nanochat LM setting is the harder version of the claim"
     status: open
     evidence: []
@@ -256,6 +287,9 @@ hypotheses:
       threshold: 0.10
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
+      validity:
+        baseline_floor: 0.014
+        floor_source: "population majority-answer prior of the needle held-out split (10 generator seeds x 3000 docs, 2026-06-10); ci-v2 prefers the artifact-recorded answer_prior"
       scale_caveats: "registered at nanochat research scale"
     status: open
     evidence: []
@@ -301,6 +335,9 @@ hypotheses:
       threshold: 0.05
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
+      validity:
+        baseline_floor: 0.049
+        floor_source: "population majority-answer prior of the rot held-out split (10 generator seeds x 3000 docs, 2026-06-10); ci-v2 prefers the artifact-recorded answer_prior"
       scale_caveats: "registered at nanochat research scale"
     status: refuted
     evidence: []
@@ -327,6 +364,9 @@ hypotheses:
       threshold: 0.05
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
+      validity:
+        baseline_floor: 0.049
+        floor_source: "population majority-answer prior of the rot held-out split (10 generator seeds x 3000 docs, 2026-06-10); ci-v2 prefers the artifact-recorded answer_prior"
       scale_caveats: "secondary check (octonion vs quaternion expected ~equal) adjudicated alongside"
     status: open
     evidence: []
@@ -369,6 +409,9 @@ hypotheses:
       threshold: 0.05
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
+      validity:
+        baseline_floor: 0.059
+        floor_source: "population majority-answer prior of the rel held-out split (10 generator seeds x 3000 docs, 2026-06-10); ci-v2 prefers the artifact-recorded answer_prior"
       scale_caveats: "the doc's provably-impossible construction is stronger than this LM proxy; a dedicated task may sharpen the threshold later"
     status: refuted
     evidence: []
@@ -396,6 +439,9 @@ hypotheses:
       threshold: 0.05
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
+      validity:
+        baseline_floor: 0.521
+        floor_source: "population majority-answer prior of the arith held-out split (10 generator seeds x 3000 docs, 2026-06-10); ci-v2 prefers the artifact-recorded answer_prior"
       scale_caveats: "registered at nanochat research scale"
     status: refuted
     evidence: []
@@ -507,6 +553,9 @@ hypotheses:
       threshold: 0.05
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
+      validity:
+        baseline_floor: 0.336
+        floor_source: "population majority-answer prior of the bag held-out split (10 generator seeds x 3000 docs, 2026-06-10); ci-v2 prefers the artifact-recorded answer_prior"
       scale_caveats: "u55.5's symplectic transformer is the designed carrier of this prediction; gauge/reversible are the available proxies"
     status: open
     evidence: []

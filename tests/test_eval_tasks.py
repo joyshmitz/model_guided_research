@@ -10,7 +10,8 @@
   change must update the fixture deliberately (set MGR_CAPTURE_EVAL_GOLDEN=1)
   with a justification in the commit message.
 - End-to-end: train a tiny CPU checkpoint (synthetic loader), eval it through
-  the CLI, validate the mgr.evaltasks.v1 schema + artifacts.
+  the CLI, validate the mgr.evaltasks.v2 schema + artifacts (answer_prior
+  floors + generations.jsonl receipts included).
 """
 
 import json
@@ -294,11 +295,22 @@ def test_e2e_trained_checkpoint_evaluates(attention_type, monkeypatch, tmp_path)
     assert result.exit_code == 0, result.output
     run_dir = tmp_path / "artifacts" / "evals" / "tasks" / f"eval-{attention_type}"
     summary = json.loads((run_dir / "summary.json").read_text())
-    assert summary["schema_version"] == "mgr.evaltasks.v1"
+    assert summary["schema_version"] == "mgr.evaltasks.v2"
     assert summary["meta"]["checkpoint"]["attention_type"] == attention_type
+    assert summary["meta"]["receipts"] == "generations.jsonl"
     rec = summary["tasks"]["arith"]
     assert 0.0 <= rec["exact_match"]["greedy"]["in_range"]["mean"] <= 1.0
     assert rec["perplexity"]["in_range"] > 0
+    # v2: the recorded floor - what the best constant-answer policy scores on
+    # the exact docs scored (the ci-v2 gate's preferred floor)
+    prior = rec["answer_prior"]["in_range"]
+    assert 0.0 < prior["mean"] <= 1.0
+    assert len(prior["per_seed"]) == 1 and isinstance(prior["majority_answer"], str)
+    # per-example receipts: every scored example, machine-readable
+    receipts = [json.loads(line) for line in (run_dir / "generations.jsonl").read_text().splitlines()]
+    assert receipts, "receipts must not be empty"
+    assert {"task", "mode", "region", "eval_seed", "doc_index", "expected", "got", "correct"} <= set(receipts[0])
+    assert all(r["task"] == "arith" and isinstance(r["correct"], bool) for r in receipts)
     assert (run_dir / "run.md").exists()
 
 
@@ -323,11 +335,13 @@ def test_e2e_lm_only_task_and_sampled_mode(monkeypatch, tmp_path):
     )
     regime = summary["tasks"]["regime"]
     assert regime["exact_match"] is None and regime["curve"] is None  # LM-only: perplexity is the metric
+    assert regime["answer_prior"] is None  # no answers -> no constant-answer floor
     assert regime["perplexity"]["in_range"] > 0
     dyck = summary["tasks"]["dyck"]
     assert set(dyck["exact_match"]) == {"greedy", "sampled"}
     assert summary["meta"]["decode_modes"] == ["greedy", "sampled"]
     assert len(dyck["exact_match"]["greedy"]["in_range"]["per_seed"]) == 2  # multi-seed aggregation
+    assert len(dyck["answer_prior"]["in_range"]["per_seed"]) == 2  # priors aligned with eval seeds
 
 
 def test_eval_cli_argument_errors(tmp_path):
