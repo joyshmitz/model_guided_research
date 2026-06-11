@@ -1744,8 +1744,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--ultrametric-mode",
         type=str,
         default=os.environ.get("NANOCHAT_ULTRAMETRIC_MODE", "kernel"),
-        choices=["kernel", "trie"],
-        help="Ultrametric attention only: kernel (continuous) vs trie (packed-prefix lookup) decode path.",
+        choices=["kernel", "trie", "balltree"],
+        help=(
+            "Ultrametric attention only: kernel (continuous, O(T^2 K)) vs trie (packed-prefix decode path) vs "
+            "balltree (exact hard-digit ball-tree, O(K T log T), training/prefill/decode; bead 33dd)."
+        ),
     )
     parser.add_argument(
         "--ultrametric-hard-digits",

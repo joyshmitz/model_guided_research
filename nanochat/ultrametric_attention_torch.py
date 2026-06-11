@@ -4,6 +4,16 @@ Ultrametric Attention Module (PyTorch).
 Modes (select via GPTConfig.ultrametric_mode):
 - ``kernel``: continuous LCP-kernel attention (baseline; supports training/prefill).
 - ``trie``: packed prefix-trie lookup for KV-cache decode (currently CPU-only and only used when Tq==1).
+- ``balltree``: exact hard-digit ball-tree attention (bead 33dd, the torch port
+  of thm-balltree-exact-attention): per depth d, keys and queries become a
+  merged event stream sorted by (prefix code, time, kind); a segmented
+  inclusive cumsum gives every query the causal sum of its depth-d ball, and
+  the telescoped shell decomposition
+      out = [S_ge0 + (alpha-1) sum_{d>=1} alpha^(d-1) S_ged] / (same in counts)
+  reproduces alpha^lcp attention EXACTLY in O(K * T log T) (vs the kernel's
+  O(T^2 K)), batched over (B, H), any device, training/prefill/decode alike.
+  Digits are hard by construction (the exactness contract); gradients flow
+  through v exactly as in hard-digit kernel mode.
 """
 
 import math
@@ -171,9 +181,19 @@ class UltrametricCausalSelfAttention(AttentionCore):
             raise ValueError(f"ultrametric_alpha must be finite and > 1, got {self.alpha}")
         if not (self.lcp_beta > 0.0 and math.isfinite(self.lcp_beta)):
             raise ValueError(f"ultrametric_lcp_beta must be finite and > 0, got {self.lcp_beta}")
-        if self.ultrametric_mode not in {"kernel", "trie"}:
-            raise ValueError(f"ultrametric_mode must be 'kernel' or 'trie', got {self.ultrametric_mode!r}")
+        if self.ultrametric_mode not in {"kernel", "trie", "balltree"}:
+            raise ValueError(
+                f"ultrametric_mode must be 'kernel', 'trie', or 'balltree', got {self.ultrametric_mode!r}"
+            )
         self._log_alpha = math.log(self.alpha)
+        if self.ultrametric_mode == "balltree":
+            # int64 sort keys: ((p+1)^K * 2T) * 2 must not overflow; guard at
+            # init with the rotary-cache bound (10x sequence_len, see gpt.py).
+            max_t = int(getattr(config, "sequence_len", 2048)) * 10
+            if ((self.p + 1) ** self.K) * 2 * max_t * 2 >= 2**62:
+                raise ValueError(
+                    f"balltree sort keys overflow int64 for p={self.p}, K={self.K}, T<={max_t}; reduce K or p"
+                )
 
         # Trie cache keyed by KVCache object (decode-only; CPU).
         self._trie_cache: weakref.WeakKeyDictionary[object, _TrieCacheState] = weakref.WeakKeyDictionary()
@@ -238,11 +258,87 @@ class UltrametricCausalSelfAttention(AttentionCore):
                 y[b, h] = state.tries[b][h].query(q_digits[b, h, 0], alpha=self.alpha)
         return y.to(dtype=out_dtype).unsqueeze(2)
 
+    def _balltree_attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Exact hard-digit alpha^lcp attention in O(K * T log T) (bead 33dd).
+
+        Correctness is thm-balltree-exact-attention's shell partition: balls
+        are prefix-code groups, nested by the strong triangle inequality, so
+        a per-depth segmented causal cumsum over the merged (key, query) event
+        stream gives every query its exact ball sums - numerator and
+        normalizer alike. Queries at absolute positions Tk-Tq..Tk-1 (decode
+        and chunked prefill included) see exactly their causal prefix: key
+        events sort before query events at equal (code, time).
+        """
+        B, H, Tq, _ = q.shape
+        Tk = k.size(2)
+        D = v.size(-1)
+        G = B * H
+        device = q.device
+        q_dig = self._digits_hard_int(self.to_digits_q(q)).reshape(G, Tq, self.K)
+        k_dig = self._digits_hard_int(self.to_digits_k(k)).reshape(G, Tk, self.K)
+        vv = v.reshape(G, Tk, D).to(torch.float32)
+
+        n_ev = Tk + Tq
+        k_time = torch.arange(Tk, device=device)
+        q_time = (Tk - Tq) + torch.arange(Tq, device=device)  # absolute positions
+        ev_time = torch.cat([k_time, q_time])  # (n_ev,)
+        # kind tiebreak: keys (0) before queries (1) at equal (code, time)
+        ev_kind = torch.cat(
+            [torch.zeros(Tk, dtype=torch.int64, device=device), torch.ones(Tq, dtype=torch.int64, device=device)]
+        )
+        # event weights: zero rows for query events (no masking needed post-sort)
+        ev_w = torch.cat([vv, torch.zeros(G, Tq, D, device=device)], dim=1)
+        ev_is_key = torch.cat(
+            [torch.ones(Tk, device=device), torch.zeros(Tq, device=device)]
+        )
+        positions = torch.arange(n_ev, device=device).expand(G, -1)
+
+        qc = torch.zeros(G, Tq, dtype=torch.int64, device=device)
+        kc = torch.zeros(G, Tk, dtype=torch.int64, device=device)
+        S_total = torch.zeros(G, Tq, D, device=device)
+        C_total = torch.zeros(G, Tq, device=device)
+        time_kind = ev_time * 2 + ev_kind  # constant across depths
+        for d in range(self.K + 1):
+            if d > 0:
+                # radix prefix codes, +1-shifted so depth-d codes are unique
+                qc = qc * (self.p + 1) + q_dig[:, :, d - 1] + 1
+                kc = kc * (self.p + 1) + k_dig[:, :, d - 1] + 1
+            ev_code = torch.cat([kc, qc], dim=1)  # (G, n_ev)
+            order = torch.argsort(ev_code * (2 * n_ev) + time_kind, dim=1)
+            inv = torch.empty_like(order)
+            inv.scatter_(1, order, positions)
+            s_code = torch.gather(ev_code, 1, order)
+            s_w = torch.gather(ev_w, 1, order.unsqueeze(-1).expand(-1, -1, D))
+            s_cnt = torch.gather(ev_is_key.expand(G, -1), 1, order)
+            cw = torch.cumsum(s_w, dim=1)
+            cc = torch.cumsum(s_cnt, dim=1)
+            # segment bases: cumsum value just before each code group starts
+            seg_start = torch.ones(G, n_ev, dtype=torch.bool, device=device)
+            seg_start[:, 1:] = s_code[:, 1:] != s_code[:, :-1]
+            start_idx = torch.cummax(torch.where(seg_start, positions, torch.zeros_like(positions)), dim=1).values
+            gather_idx = (start_idx - 1).clamp(min=0)
+            zero_mask = start_idx == 0
+            base_w = torch.gather(cw, 1, gather_idx.unsqueeze(-1).expand(-1, -1, D))
+            base_c = torch.gather(cc, 1, gather_idx)
+            seg_w = cw - base_w.masked_fill(zero_mask.unsqueeze(-1), 0.0)
+            seg_c = cc - base_c.masked_fill(zero_mask, 0.0)
+            # read each query's running ball sum at its sorted position
+            q_pos = inv[:, Tk:]  # (G, Tq)
+            S_d = torch.gather(seg_w, 1, q_pos.unsqueeze(-1).expand(-1, -1, D))
+            C_d = torch.gather(seg_c, 1, q_pos)
+            coeff = 1.0 if d == 0 else (self.alpha - 1.0) * (self.alpha ** (d - 1))
+            S_total = S_total + coeff * S_d
+            C_total = C_total + coeff * C_d
+        out = S_total / C_total.clamp(min=1e-9).unsqueeze(-1)
+        return out.reshape(B, H, Tq, D).to(v.dtype)
+
     def attend(self, q, k, v, *, kv_cache, pos0):
         B = q.size(0)
         Tq = q.size(2)
         Tk = k.size(2)
         mode = str(self.ultrametric_mode).strip().lower()
+        if mode == "balltree":
+            return self._balltree_attend(q, k, v)
         if mode == "trie" and kv_cache is not None and q.device.type == "cpu":
             # The trie ingests new keys on EVERY cached forward (prefill
             # chunks included) so single-token decode can read it; only the
@@ -284,6 +380,85 @@ class UltrametricCausalSelfAttention(AttentionCore):
         attn = (weights / denom).to(dtype=v.dtype)
 
         return attn @ v
+
+
+def bench_ultrametric_paths(
+    *,
+    context_lengths: tuple[int, ...] = (1024, 4096),
+    repeats: int = 3,
+    seed: int = 0,
+) -> dict:
+    """Wall-clock comparison of the ultrametric paths (bead 33dd, CPU).
+
+    - forward: kernel (O(T^2 K)) vs balltree (O(K T log T)) full prefill at T.
+    - decode: kernel vs trie per-token decode (the existing sanity probe).
+
+    Identical projections (same seed/init) and hard digits in both arms: the
+    paths compute the same function (thm-balltree-exact-attention), so the
+    quality side is a correctness check and wall-clock is the entire claim.
+    Best-of-`repeats` per point. This feeds `mgr bench-ultrametric`'s
+    versioned artifact (mgr.bench.ultrametric_paths.v1).
+    """
+    import time
+    from types import SimpleNamespace
+
+    if repeats < 1:
+        raise ValueError("repeats must be >= 1")
+    device = torch.device("cpu")
+    B, n_head, head_dim = 1, 4, 16
+    n_embd = n_head * head_dim
+
+    forward_rows: list[dict[str, float]] = []
+    for T in context_lengths:
+        cfg = SimpleNamespace(
+            n_head=n_head,
+            n_kv_head=n_head,
+            n_embd=n_embd,
+            sequence_len=max(int(T) // 10 + 1, 64),  # balltree overflow guard reads 10x this
+            ultrametric_K=8,
+            ultrametric_p=2,
+            ultrametric_alpha=2.0,
+            ultrametric_lcp_beta=32.0,
+            ultrametric_hard_digits=True,
+            ultrametric_mode="kernel",
+        )
+        g = torch.Generator(device="cpu").manual_seed(int(seed))
+        x = torch.randn((B, int(T), n_embd), generator=g, device=device)
+        cos = torch.ones((1, int(T), 1, head_dim // 2), device=device)
+        sin = torch.zeros((1, int(T), 1, head_dim // 2), device=device)
+
+        def _time_forward(mode: str, T=T, cfg=cfg, x=x, cos=cos, sin=sin) -> float:
+            cfg.ultrametric_mode = mode
+            torch.manual_seed(int(seed))
+            attn = UltrametricCausalSelfAttention(cfg, layer_idx=0).train(False)
+            best = float("inf")
+            for _ in range(repeats):
+                t0 = time.perf_counter()
+                with torch.inference_mode():
+                    _ = attn(x, (cos, sin), None)
+                best = min(best, time.perf_counter() - t0)
+            return float(best)
+
+        kernel_s = _time_forward("kernel")
+        balltree_s = _time_forward("balltree")
+        forward_rows.append(
+            {
+                "T": float(T),
+                "kernel_s": kernel_s,
+                "balltree_s": balltree_s,
+                "speedup": (kernel_s / balltree_s) if balltree_s > 0 else float("inf"),
+            }
+        )
+
+    decode_rows = perf_sanity_ultrametric_trie_decode(
+        context_lengths=tuple(int(t) for t in context_lengths), repeats=repeats, seed=seed
+    )
+    out: dict = {"forward": forward_rows, "decode": decode_rows}
+    for row in forward_rows:
+        out[f"speedup_forward_t{int(row['T'])}"] = row["speedup"]
+    for row in decode_rows:
+        out[f"speedup_decode_t{int(row['Tk'])}"] = row["speedup"]
+    return out
 
 
 def perf_sanity_ultrametric_trie_decode(

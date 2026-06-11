@@ -182,7 +182,7 @@ class GPTConfig:
     # alongside 8gk.1's attention schedule when that lands).
     ffn_beta: float | None = None
     # Ultrametric-specific options (see nanochat.ultrametric_attention_torch).
-    ultrametric_mode: str = "kernel"  # "kernel" | "trie"
+    ultrametric_mode: str = "kernel"  # "kernel" | "trie" | "balltree" (exact O(K T log T), bead 33dd)
     ultrametric_hard_digits: bool = False
     ultrametric_K: int = 8
     ultrametric_p: int = 2

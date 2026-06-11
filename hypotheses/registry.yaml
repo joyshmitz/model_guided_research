@@ -174,12 +174,21 @@ hypotheses:
       kind: model
       provenance: "ultrametric doc '## 6) Attention in a tree' (O(K) per-token claim)"
     date_registered: "2026-06-10"
-    prediction: null
-    operationalization_note: >-
-      needs a versioned perf artifact: perf_sanity_ultrametric_trie_decode
-      (nanochat/ultrametric_attention_torch.py) measures exactly this but
-      writes no schema'd summary; promote it into the bench schema first.
-    status: blocked
+    prediction:
+      metric_path: "bench:results.speedup_decode_t4096"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 1.0
+      baseline: null
+      min_seeds: 3
+      scale_caveats: >-
+        OPERATIONALIZED under ci-v3 (33dd): mgr bench-ultrametric writes the
+        versioned artifact (mgr.bench.ultrametric_paths.v1, budget-exempt);
+        the recorded loadavg documents box contention - evidence runs must
+        come from an idle box (>= 3 distinct seeds). Threshold 1.0 = the
+        crossover claim exactly as registered (trie decode at least matches
+        the kernel per token at T = 4096; the sanity probe suggests far more).
+    status: open
     evidence: []
     verdict_history: []
 
@@ -775,21 +784,25 @@ hypotheses:
       provenance: "EPIC THEORY-I 8gk.2 (the algorithmic payoff); theory note the_valuation_dictionary.md section 4; demo-level prototype + measured timing table in ultrametric_worlds_and_p_adic_computation.py (run_valued_attention_section)"
     date_registered: "2026-06-11"
     theorem_refs: [thm-balltree-exact-attention, thm-lcp-is-padic-valuation]
-    prediction: null
-    operationalization_note: >-
-      Blocked on the torch serving/training port of the ball-tree path (the E3
-      follow-on): the demo prototype proves exactness (== vs brute force) and
-      measures the per-query advantage at N up to 4096 on CPU, but the
-      preregistered claim compares mgr eval-tasks hier quality + a schema'd
-      wall-clock benchmark of the TORCH kernel-mode vs ball-tree paths at
-      T = 4096, which requires (a) a trie/ball-tree decode+train path in
-      nanochat/ultrametric_attention_torch.py beyond the current CPU
-      decode-only trie, and (b) a versioned perf artifact for wall-clock
-      (the same blocker as hyp-ultrametric-trie-decode-speedup). Protocol when
-      promoted: >= 3 seeds per arm, hier exact-match parity within CI (the
-      arms compute the same function in hard-digit mode - any gap is a bug,
-      not a finding), wall-clock ratio >= 4.0 at T = 4096.
-    status: blocked
+    prediction:
+      metric_path: "bench:results.speedup_forward_t4096"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 4.0
+      baseline: null
+      min_seeds: 3
+      scale_caveats: >-
+        OPERATIONALIZED under ci-v3 (33dd landed the torch port): ultrametric
+        mode 'balltree' is the exact O(K T log T) sort/segmented-cumsum path
+        (training/prefill/decode, any device); mgr bench-ultrametric writes
+        the versioned wall-clock artifact (mgr.bench.ultrametric_paths.v1,
+        budget-exempt; recorded loadavg documents contention - evidence must
+        come from an idle box, >= 3 distinct seeds). The quality-parity half
+        is a CORRECTNESS check, enforced by
+        test_nanochat_ultrametric_balltree_kv_parity_and_kernel_agreement
+        (same function, thm-balltree-exact-attention) - any hier eval gap
+        between ultrametric_mode variants is a bug, not a finding.
+    status: open
     evidence: []
     verdict_history: []
 

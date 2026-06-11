@@ -232,6 +232,66 @@ def test_nanochat_braid_rmatrix_kv_cache_parity_and_charges():
     require(isinstance(charges["eta"], list) and len(charges["eta"]) == config.n_head, "Expected per-head eta")
 
 
+def test_nanochat_ultrametric_balltree_kv_parity_and_kernel_agreement():
+    """Ball-tree mode (33dd): KV-cache decode parity (the house contract) and
+    agreement with the hard-digit kernel - the two paths compute the same
+    alpha^lcp attention; the kernel's soft-lcp approximation (exp(-beta d^2)
+    instead of exact 0/1 digit matches) bounds the gap."""
+    import torch
+
+    from nanochat.engine import KVCache
+    from nanochat.gpt import GPT, GPTConfig
+
+    torch.manual_seed(0)
+    config = GPTConfig(
+        sequence_len=16,
+        vocab_size=128,
+        n_layer=2,
+        n_head=4,
+        n_kv_head=2,  # exercise GQA paths
+        n_embd=64,
+        attention_type="ultrametric",
+        ultrametric_mode="balltree",
+        ultrametric_hard_digits=True,
+    )
+    model = GPT(config).train(False)
+
+    ids = torch.randint(0, config.vocab_size, (1, 8), dtype=torch.long)
+    with torch.inference_mode():
+        full_last = model(ids)[:, -1, :].float()
+
+        kv_cache = KVCache(
+            batch_size=1,
+            num_heads=config.n_kv_head,
+            seq_len=ids.size(1),
+            head_dim=config.n_embd // config.n_head,
+            num_layers=config.n_layer,
+        )
+        _ = model(ids[:, :-1], kv_cache=kv_cache)
+        cached_last = model(ids[:, -1:], kv_cache=kv_cache)[:, -1, :].float()
+
+    torch.testing.assert_close(cached_last, full_last, rtol=1e-3, atol=1e-2)
+
+    # same weights, kernel mode with hard digits: outputs must closely agree
+    torch.manual_seed(0)
+    config_k = GPTConfig(
+        sequence_len=16,
+        vocab_size=128,
+        n_layer=2,
+        n_head=4,
+        n_kv_head=2,
+        n_embd=64,
+        attention_type="ultrametric",
+        ultrametric_mode="kernel",
+        ultrametric_hard_digits=True,
+    )
+    model_k = GPT(config_k).train(False)
+    model_k.load_state_dict(model.state_dict())
+    with torch.inference_mode():
+        out_k = model_k(ids)[:, -1, :].float()
+    torch.testing.assert_close(out_k, full_last, rtol=1e-3, atol=1e-2)
+
+
 def test_nanochat_standard_attention_entropy_records_per_head_stats():
     """Standard attention should optionally record a finite per-head entropy summary."""
     import torch

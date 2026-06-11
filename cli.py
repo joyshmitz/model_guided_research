@@ -6,6 +6,7 @@ Model Guided Research CLI - Run experimental mathematical models for ML research
 import importlib
 import json
 import math
+import os
 import platform
 import shlex
 import statistics
@@ -5152,6 +5153,94 @@ def probe_charges(
     console.print(f"[bold green]Wrote charge-probe artifacts[/bold green] → {run_dir}")
 
 
+@app.command("bench-ultrametric")
+def bench_ultrametric(
+    context_lengths: Annotated[str, typer.Option(help="Comma-separated T values")] = "1024,4096",
+    repeats: Annotated[int, typer.Option(help="Best-of-N timing per point")] = 3,
+    seed: Annotated[int, typer.Option(help="Init/data seed")] = 0,
+    artifacts_dir: Annotated[Path, typer.Option(help="Artifacts root")] = Path("artifacts"),
+    run_id: Annotated[str | None, typer.Option(help="Run identifier (default: timestamp)")] = None,
+) -> None:
+    """Wall-clock benchmark of the ultrametric attention paths (bead 33dd).
+
+    kernel (O(T^2 K)) vs balltree (O(K T log T)) full prefill, and kernel vs
+    trie per-token decode - the versioned artifact
+    (mgr.bench.ultrametric_paths.v1) that hyp-balltree-valued-attention-speedup
+    and hyp-ultrametric-trie-decode-speedup adjudicate against. The two paths
+    compute the same function (thm-balltree-exact-attention), so wall-clock is
+    the entire claim; the recorded load average documents box contention.
+    """
+    from nanochat.report import build_provenance
+    from nanochat.ultrametric_attention_torch import bench_ultrametric_paths
+
+    lengths = tuple(int(t.strip()) for t in context_lengths.split(",") if t.strip())
+    if not lengths:
+        console.print("[bold red]--context-lengths must name at least one T.[/bold red]")
+        raise typer.Exit(code=2)
+    load_before = os.getloadavg()
+    with console.status("[bold cyan]benchmarking ultrametric paths…[/bold cyan]"):
+        results = bench_ultrametric_paths(context_lengths=lengths, repeats=repeats, seed=seed)
+
+    table = Table(title="ultrametric paths — wall clock (CPU)", box=box.SIMPLE_HEAVY)
+    for col in ("T", "kernel ms", "balltree ms", "fwd speedup", "trie-decode speedup"):
+        table.add_column(col, justify="right")
+    decode_by_t = {int(r["Tk"]): r for r in results["decode"]}
+    for row in results["forward"]:
+        t = int(row["T"])
+        dec = decode_by_t.get(t)
+        table.add_row(
+            str(t),
+            f"{1000 * row['kernel_s']:.1f}",
+            f"{1000 * row['balltree_s']:.1f}",
+            f"{row['speedup']:.1f}x",
+            f"{dec['speedup']:.1f}x" if dec else "-",
+        )
+    console.print(table)
+    console.print(f"[dim]loadavg at start: {load_before} (timings on a busy box understate speedups)[/dim]")
+
+    resolved_run_id = run_id or time.strftime("%Y%m%d_%H%M%S")
+    run_dir = artifacts_dir / "bench" / "ultrametric_paths" / resolved_run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "schema_version": "mgr.bench.ultrametric_paths.v1",
+        "kind": "bench-ultrametric",
+        "mechanism": "ultrametric",
+        "meta": {
+            "run_id": resolved_run_id,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "seed": seed,
+            "repeats": repeats,
+            "context_lengths": list(lengths),
+            "device": "cpu",
+            "loadavg": list(load_before),
+            "git": _get_git_info(),
+        },
+        "provenance": build_provenance(
+            {"bench": {"kind": "ultrametric_paths", "seed": seed, "repeats": repeats, "lengths": list(lengths)}}
+        ),
+        "results": results,
+    }
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    md_lines = [
+        f"# bench-ultrametric — {resolved_run_id}",
+        "",
+        f"- seed {seed} · repeats {repeats} · loadavg {load_before}",
+        "",
+        "| T | kernel ms | balltree ms | fwd speedup | trie-decode speedup |",
+        "|---|---|---|---|---|",
+    ]
+    for row in results["forward"]:
+        t = int(row["T"])
+        dec = decode_by_t.get(t)
+        md_lines.append(
+            f"| {t} | {1000 * row['kernel_s']:.1f} | {1000 * row['balltree_s']:.1f} "
+            f"| {row['speedup']:.1f}x | {dec['speedup']:.1f}x |" if dec else
+            f"| {t} | {1000 * row['kernel_s']:.1f} | {1000 * row['balltree_s']:.1f} | {row['speedup']:.1f}x | - |"
+        )
+    (run_dir / "run.md").write_text("\n".join(md_lines) + "\n")
+    console.print(f"[bold green]Wrote bench artifacts[/bold green] → {run_dir}")
+
+
 def _sample_stream(
     model: Any,
     tok: Any,
@@ -6625,6 +6714,8 @@ def _adj_collect_artifacts(roots: list[Path]) -> list[dict[str, Any]]:
                 schema = "train"
             elif sv == "mgr.chargeprobe.v1":
                 schema = "chargeprobe"
+            elif sv == "mgr.bench.ultrametric_paths.v1":
+                schema = "bench"
             elif sv == 1 and data.get("kind") == "certify":
                 schema = "certify"
             else:
@@ -6682,6 +6773,9 @@ def _adj_artifact_matches_arm(art: dict[str, Any], mechanism: str, variant: dict
         return isinstance(checks, list) and any(
             isinstance(c, dict) and c.get("mechanism") == mechanism for c in checks
         )
+    if art["schema"] == "bench":
+        # path benchmarks record the mechanism they exercise top-level
+        return data.get("mechanism") == mechanism
     if art["schema"] in ("evaltasks", "chargeprobe"):
         attn = ((data.get("meta") or {}).get("checkpoint") or {}).get("attention_type")
         return attn == (mechanism if mechanism in _ADJ_ATTENTION_MECHS else "standard") and _adj_variant_matches(
@@ -6726,7 +6820,7 @@ def _adj_dedupe_evaltasks(arts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     best: dict[Any, tuple[tuple[str, str, str], dict[str, Any]]] = {}
     out: list[dict[str, Any]] = []
     for a in arts:
-        if a["schema"] not in ("evaltasks", "chargeprobe", "certify"):
+        if a["schema"] not in ("evaltasks", "chargeprobe", "certify", "bench"):
             out.append(a)
             continue
         meta = a["data"].get("meta") or {}
@@ -6735,6 +6829,10 @@ def _adj_dedupe_evaltasks(arts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             # evidence; distinct seeds ARE replications and all survive
             key: Any = ("certify", a["data"].get("seed"), a["data"].get("device"), a["data"].get("dtype"))
             rank = ("", str(a["data"].get("run_id", "")), str(a["path"]))
+        elif a["schema"] == "bench":
+            # one bench observation per (seed, device); timings are best-of-N
+            key = ("bench", a["data"].get("schema_version"), meta.get("seed"), meta.get("device"))
+            rank = ("", str(meta.get("generated_at", "")), str(a["path"]))
         else:
             ckpt = meta.get("checkpoint") or {}
             lineage = ckpt.get("lineage") or {}
@@ -6923,7 +7021,9 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
         anchor: float | None
         cc: list[dict[str, Any]]
         bb: list[dict[str, Any]]
-        if schema == "certify":
+        if schema in ("certify", "bench"):
+            # budget-exempt schemas (ci-v3): invariant suites and path
+            # microbenchmarks have no training budget by construction
             n_c = sum(len(_adj_observations(a, dotted) or []) for a in cand_m)
             if n_c < need:
                 return {"id": hid, "verdict": "blocked", "reason_code": "insufficient_seeds", "mechanism": mech,
