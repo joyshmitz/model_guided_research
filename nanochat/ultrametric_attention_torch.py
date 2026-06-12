@@ -165,6 +165,19 @@ class UltrametricCausalSelfAttention(AttentionCore):
         self.p = int(getattr(config, "ultrametric_p", 2))
         self.alpha = float(getattr(config, "ultrametric_alpha", 2.0))
         self.lcp_beta = float(getattr(config, "ultrametric_lcp_beta", 32.0))
+        # Digit-precision truncation (bead 8gk.4): evaluate with only the
+        # first k of the K digit channels - quantization as valuation
+        # truncation. The flat-error lemma (thm-flat-error) governs the
+        # p-adic-native path: truncation errors of valuation >= k cannot
+        # accumulate under the digit machinery's sums/products; the float V
+        # aggregation is the archimedean interface where guarantees end.
+        # None (the default) leaves every path bitwise unchanged.
+        digits_k = getattr(config, "ultrametric_digits_k", None)
+        self.digits_k: int | None = None if digits_k is None else int(digits_k)
+        if self.digits_k is not None and not (1 <= self.digits_k <= self.K):
+            raise ValueError(
+                f"ultrametric_digits_k must be in [1, K={self.K}] or None, got {self.digits_k}"
+            )
         mode = (
             str(getattr(config, "ultrametric_mode", os.environ.get("NANOCHAT_ULTRAMETRIC_MODE", "kernel")))
             .strip()
@@ -212,6 +225,17 @@ class UltrametricCausalSelfAttention(AttentionCore):
             self.to_digits_q.weight.requires_grad_(False)
             self.to_digits_k.weight.requires_grad_(False)
 
+    @property
+    def K_eff(self) -> int:
+        """Active digit depth: ultrametric_digits_k when set, else K (8gk.4)."""
+        return self.digits_k if self.digits_k is not None else self.K
+
+    def _truncate_digits(self, raw: torch.Tensor) -> torch.Tensor:
+        """Valuation truncation: keep the first K_eff digit channels. The
+        slice is the identity at full precision, so every path is bitwise
+        unchanged when the knob is off."""
+        return raw if self.digits_k is None else raw[..., : self.digits_k]
+
     def _digits_soft(self, raw: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(raw) * (self.p - 1)
 
@@ -225,7 +249,7 @@ class UltrametricCausalSelfAttention(AttentionCore):
             if len(state.tries) == B and (B == 0 or len(state.tries[0]) == H):
                 return state
         tries = [
-            [_PackedPrefixTrie(p=self.p, K=self.K, head_dim=self.head_dim, device=device) for _ in range(H)]
+            [_PackedPrefixTrie(p=self.p, K=self.K_eff, head_dim=self.head_dim, device=device) for _ in range(H)]
             for _ in range(B)
         ]
         state = _TrieCacheState(tries=tries, seen_Tk=0)
@@ -247,7 +271,7 @@ class UltrametricCausalSelfAttention(AttentionCore):
 
         k_new = k[:, :, state.seen_Tk : Tk]
         v_new = v[:, :, state.seen_Tk : Tk]
-        digits = self._digits_hard_int(self.to_digits_k(k_new))  # (B, H, Tnew, K)
+        digits = self._digits_hard_int(self._truncate_digits(self.to_digits_k(k_new)))  # (B, H, Tnew, K_eff)
         B = int(k.size(0))
         H = int(k.size(1))
         Tnew = int(k_new.size(2))
@@ -260,7 +284,7 @@ class UltrametricCausalSelfAttention(AttentionCore):
 
     def _trie_decode(self, state: _TrieCacheState, q: torch.Tensor, *, out_dtype: torch.dtype) -> torch.Tensor:
         # q: (B, H, 1, D)
-        q_digits = self._digits_hard_int(self.to_digits_q(q))  # (B, H, 1, K)
+        q_digits = self._digits_hard_int(self._truncate_digits(self.to_digits_q(q)))  # (B, H, 1, K_eff)
         B = int(q.size(0))
         H = int(q.size(1))
         y = torch.empty((B, H, self.head_dim), dtype=torch.float32, device=q.device)
@@ -285,8 +309,9 @@ class UltrametricCausalSelfAttention(AttentionCore):
         D = v.size(-1)
         G = B * H
         device = q.device
-        q_dig = self._digits_hard_int(self.to_digits_q(q)).reshape(G, Tq, self.K)
-        k_dig = self._digits_hard_int(self.to_digits_k(k)).reshape(G, Tk, self.K)
+        K_eff = self.K_eff
+        q_dig = self._digits_hard_int(self._truncate_digits(self.to_digits_q(q))).reshape(G, Tq, K_eff)
+        k_dig = self._digits_hard_int(self._truncate_digits(self.to_digits_k(k))).reshape(G, Tk, K_eff)
         vv = v.reshape(G, Tk, D).to(torch.float32)
 
         n_ev = Tk + Tq
@@ -309,7 +334,7 @@ class UltrametricCausalSelfAttention(AttentionCore):
         S_total = torch.zeros(G, Tq, D, device=device)
         C_total = torch.zeros(G, Tq, device=device)
         time_kind = ev_time * 2 + ev_kind  # constant across depths
-        for d in range(self.K + 1):
+        for d in range(K_eff + 1):
             if d > 0:
                 # radix prefix codes, +1-shifted so depth-d codes are unique
                 qc = qc * (self.p + 1) + q_dig[:, :, d - 1] + 1
@@ -364,8 +389,8 @@ class UltrametricCausalSelfAttention(AttentionCore):
         # We map queries/keys to K "digits" in base p, then compute a differentiable proxy
         # for the longest-common-prefix (LCP) depth. Attention weights are derived from
         # the ultrametric similarity kernel w(q,k) ∝ alpha^{LCP(q,k)} (alpha > 1).
-        q_dig_raw = self.to_digits_q(q)  # (B, H, Tq, K)
-        k_dig_raw = self.to_digits_k(k)  # (B, H, Tk, K)
+        q_dig_raw = self._truncate_digits(self.to_digits_q(q))  # (B, H, Tq, K_eff)
+        k_dig_raw = self._truncate_digits(self.to_digits_k(k))  # (B, H, Tk, K_eff)
 
         if self.ultrametric_hard_digits:
             q_dig = self._digits_hard_int(q_dig_raw).to(dtype=torch.float32)

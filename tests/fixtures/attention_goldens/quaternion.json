@@ -32,6 +32,7 @@
     "tropical_score_center": true,
     "ultrametric_K": 8,
     "ultrametric_alpha": 2.0,
+    "ultrametric_digits_k": null,
     "ultrametric_hard_digits": false,
     "ultrametric_lcp_beta": 32.0,
     "ultrametric_mode": "kernel",

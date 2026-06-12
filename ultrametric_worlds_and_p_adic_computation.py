@@ -101,6 +101,10 @@ class HeadTrie:
         self.p, self.K, self.m, self.r = p, K, m, r
         self.pow = np.array(p_pow(p, K), dtype=np.int64)
         self.levels = [DepthArrays.empty(m) for _ in range(K)]
+        # Hensel-lift freeze marks (bead 8gk.4): frozen_mark[d] = number of
+        # nodes at depth d whose (S, R) are immutable - the lifted residue.
+        # None (the default) disables freezing entirely (zero behavior change).
+        self.frozen_mark: list[int] | None = None
         key = jax.random.PRNGKey(0 if U_seed is None else int(U_seed))
         mats = []
         for _d in range(K):
@@ -158,6 +162,14 @@ class HeadTrie:
         bad = opp & (jnp.abs(R_vec) >= maj_thresh)
         return not bool(jnp.any(bad))
 
+    def _is_frozen(self, d: int, idx: int) -> bool:
+        """A node is frozen iff it existed at Hensel-lift time (8gk.4): its
+        (S, R) carry the lifted residue and may never be modified. Nodes
+        CREATED after the lift (idx beyond the mark) remain writable even at
+        shallow depths - new coarse structure on unseen inputs refines the
+        function without touching the lifted solution."""
+        return self.frozen_mark is not None and d < len(self.frozen_mark) and idx < self.frozen_mark[d]
+
     def volf_update(self, digits, y_star):
         y = self.read_contrib(digits)
         e = mod_sub(y_star, y, self.p)
@@ -171,6 +183,8 @@ class HeadTrie:
         for d, res in enumerate(path_res):
             L = self.levels[d]
             idx = L.res2idx[res]
+            if self._is_frozen(d, idx):
+                continue  # the lift fixes this residue exactly
             if self.compatible(L.R[idx], e_sign, self.r):
                 chosen = (d, idx)
                 break
@@ -181,8 +195,10 @@ class HeadTrie:
                 idx_new = self.ensure(d_star + 1, res_next)
                 chosen = (d_star + 1, idx_new)
                 created = 1
-            elif d_star >= 0:
+            elif d_star >= 0 and not self._is_frozen(d_star, idx_star):
                 chosen = (d_star, idx_star)
+            elif d_star >= 0:
+                return 0  # every writable spot on the path is frozen: no-op
             else:
                 idx0 = self.ensure(0, self.path_residues(digits, upto=1)[-1])
                 chosen = (0, idx0)
@@ -1112,6 +1128,17 @@ def demo():
     except Exception as err:
         print(f"[ultrametric] Valued-attention section failed: {err}")
 
+    # Hensel-lift curriculum section (bead 8gk.4): residue-preserving digit
+    # refinement with the exact-preservation invariant asserted loudly.
+    try:
+        hensel = run_hensel_curriculum_section()
+        try:
+            last_diagnostics["hensel_curriculum"] = hensel
+        except (NameError, TypeError):
+            last_diagnostics = {"hensel_curriculum": hensel}
+    except Exception as err:
+        print(f"[ultrametric] Hensel-curriculum section failed: {err}")
+
 
 # --- Minimal p‑adic helpers for tests ---
 
@@ -1456,6 +1483,125 @@ def run_valued_attention_section() -> dict:
         "balltree_exact": exact_ok,
     }
     return section
+
+
+# ---------------------------------------------------------------------------
+# Hensel-lift curriculum (bead 8gk.4): train coarse digits first, then lift.
+#
+# Solving f(x) = 0 mod p and lifting to mod p^2, p^3, ... is the p-adic Newton
+# method; each lift PRESERVES the previous residue exactly. Training
+# translation: learn digit-0..j-1 structure (a K=j trie), then lift to K=j+1
+# with the stage-j node data FROZEN (the lift fixes the residue) and only
+# deeper/new structure trainable. The invariant is EXACT and asserted loudly:
+# every node that existed at lift time keeps bit-identical (S, R) through all
+# later training - float curricula have no such guarantee (early learning is
+# routinely overwritten). Theory note: markdown_documentation/padic_precision.md.
+# ---------------------------------------------------------------------------
+
+
+def hensel_lift_model(src: "LCPTreeAttention", K_new: int) -> "LCPTreeAttention":
+    """Lift a K=j LCPTreeAttention to K_new > j, freezing the stage-j residue.
+
+    The lifted heads share the source's U seeds (the per-depth maps for the
+    first j levels are bit-identical by construction) and copy the node data;
+    frozen_mark records the lift boundary per depth.
+    """
+    if K_new <= src.K:
+        raise ValueError(f"K_new must exceed the source depth, got {K_new} <= {src.K}")
+    if src.packed:
+        raise ValueError("hensel_lift_model supports the dict-backed HeadTrie reference")
+    lifted = LCPTreeAttention(p=src.p, K=K_new, H=src.H, m=src.m, r=src.heads[0].r,
+                              superdiag=False, seeds=None, packed=False)
+    for h in range(src.H):
+        src_head, new_head = src.heads[h], lifted.heads[h]
+        new_head.U = list(src_head.U) + list(new_head.U[src.K:])  # reuse stage maps verbatim
+        for d in range(src.K):
+            L = src_head.levels[d]
+            new_head.levels[d] = DepthArrays(dict(L.res2idx), list(L.residues), L.S, L.R)
+        new_head.frozen_mark = [len(src_head.levels[d].residues) for d in range(src.K)]
+    return lifted
+
+
+def _frozen_snapshot(model: "LCPTreeAttention", upto_K: int) -> list[list[tuple]]:
+    """Bit-exact snapshot of every node's (residue, S, R) at depths < upto_K."""
+    snap = []
+    for head in model.heads:
+        levels = []
+        for d in range(upto_K):
+            L = head.levels[d]
+            n = head.frozen_mark[d] if head.frozen_mark else len(L.residues)
+            levels.append((list(L.residues[:n]), np.asarray(L.S[:n]).copy(), np.asarray(L.R[:n]).copy()))
+        snap.append(levels)
+    return snap
+
+
+def _assert_residues_preserved(model: "LCPTreeAttention", snap: list[list[tuple]], upto_K: int) -> None:
+    """A single violated residue fails the run loudly (the bead's contract)."""
+    for h, head in enumerate(model.heads):
+        for d in range(upto_K):
+            residues, S, R = snap[h][d]
+            L = head.levels[d]
+            n = len(residues)
+            assert list(L.residues[:n]) == residues, f"head {h} depth {d}: residue set mutated"
+            assert np.array_equal(np.asarray(L.S[:n]), S), f"head {h} depth {d}: S residue violated"
+            assert np.array_equal(np.asarray(L.R[:n]), R), f"head {h} depth {d}: R counters violated"
+
+
+def run_hensel_curriculum_section(*, K_coarse: int = 2, K_full: int = 4, epochs: int = 6,
+                                  n_train: int = 3000, n_test: int = 800, seed: int = 17) -> dict:
+    """Hensel curriculum vs end-to-end at equal total budget, on Task A."""
+    print("\n[Hensel-Lift Curriculum - residue-preserving digit refinement (8gk.4)]")
+    p, m = 5, 8
+    qs, ys, qst, yst = taskA_dataset(n_train, n_test, p, K_full, m, seed=seed)
+    qs_coarse = [q[:K_coarse] for q in qs]
+
+    # stage 1: coarse model on truncated digits (half the budget)
+    random.seed(seed)
+    stage1 = LCPTreeAttention(p=p, K=K_coarse, H=1, m=m, r=4, superdiag=False, seeds=None)
+    for _ in range(epochs // 2):
+        acc1, _ = stage1.train_epoch(qs_coarse, ys, shuffle=True)
+
+    # lift: freeze the stage-1 residue, refine with full digits (other half)
+    lifted = hensel_lift_model(stage1, K_full)
+    snap = _frozen_snapshot(lifted, K_coarse)
+    for _ in range(epochs - epochs // 2):
+        acc2, _ = lifted.train_epoch(qs, ys, shuffle=True)
+    _assert_residues_preserved(lifted, snap, K_coarse)
+    acc_curr = lifted.eval_acc(qst, yst)
+
+    # control: end-to-end full-depth training at the SAME total budget
+    random.seed(seed)
+    e2e = LCPTreeAttention(p=p, K=K_full, H=1, m=m, r=4, superdiag=False, seeds=None)
+    acc_curve = []
+    for _ in range(epochs):
+        a, _ = e2e.train_epoch(qs, ys, shuffle=True)
+        acc_curve.append(a)
+    acc_e2e = e2e.eval_acc(qst, yst)
+
+    print("residue preservation: EXACT (every lift-time node bit-identical through stage 2)")
+    print(f"curriculum test acc {acc_curr:.3f} vs end-to-end {acc_e2e:.3f} (equal budget, {epochs} epochs)")
+    try:
+        from rich.console import Console as _Console
+        from rich.table import Table as _Table
+
+        tab = _Table(title=f"Hensel curriculum (K {K_coarse} -> {K_full}, p={p})",
+                     show_header=True, header_style="bold magenta")
+        for col in ("arm", "test acc", "residue invariant"):
+            tab.add_column(col, justify="right")
+        tab.add_row("curriculum (lift)", f"{acc_curr:.3f}", "EXACT (asserted)")
+        tab.add_row("end-to-end", f"{acc_e2e:.3f}", "-")
+        _Console().print(tab)
+    except Exception as err:
+        print(f"[ultrametric] Hensel table skipped: {err}")
+
+    return {
+        "K_coarse": K_coarse,
+        "K_full": K_full,
+        "epochs": epochs,
+        "curriculum_test_acc": acc_curr,
+        "end_to_end_test_acc": acc_e2e,
+        "residues_preserved_exactly": True,  # the assert above fails the run otherwise
+    }
 
 
 if __name__ == "__main__":

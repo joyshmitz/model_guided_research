@@ -1035,3 +1035,92 @@ hypotheses:
     evidence: []
     verdict_history:
       - {date: "2026-06-11", verdict: inconclusive, artifacts: ["artifacts/probes/charges/e1-chargeprobe-rmatrix-s0-clean2/summary.json", "artifacts/probes/charges/e1-chargeprobe-rmatrix-s1-clean/summary.json", "artifacts/probes/charges/e1-chargeprobe-rmatrix-s2-clean/summary.json"], adjudicator: "engine:ci-v3", policy_version: "ci-v3", arms: {"braid": {"budget_flops": 100000000000000.0, "ci95": [-0.267550901136967, 2.6008842377816697], "effect": 1.1666666683223512, "n_baseline": 0, "n_candidate": 3, "single_arm": true, "verdict": "inconclusive"}}}
+
+  # ---------------------------------------------------------------------------
+  # p-adic precision (bead 8gk.4). The mathematical content is thm-flat-error
+  # and thm-hensel-residue-preservation (exact tests landed with the bead);
+  # these entries are the EMPIRICAL precision-axis claims, registered before
+  # any campaign. Theory note: markdown_documentation/padic_precision.md.
+  # ---------------------------------------------------------------------------
+  - id: hyp-padic-truncation-graceful
+    statement: >-
+      Digit-truncation quality-vs-k curves for hard-digit ultrametric
+      checkpoints degrade more GRACEFULLY than float-quantization
+      quality-vs-bits curves for the standard baseline at matched memory:
+      quantization as valuation truncation inherits the flat-error lemma on
+      the p-adic-native path (errors below digit k cannot accumulate), while
+      float rounding compounds - quantified as area-under-quality-curve over
+      the precision sweep, cliff-vs-graceful as the qualitative signature.
+    mechanisms: [ultrametric]
+    source:
+      kind: model
+      provenance: "EPIC THEORY-I 8gk.4; theory note padic_precision.md sections 1-2"
+    date_registered: "2026-06-11"
+    theorem_refs: [thm-flat-error]
+    prediction: null
+    operationalization_note: >-
+      The digit-truncation half of the harness EXISTS (ultrametric_digits_k +
+      mgr eval-tasks --model-override, recorded in meta.checkpoint.model_config
+      so per-k arms are variant-selectable; bitwise parity at k=K asserted).
+      Blocked on (a) hard-digit trained ultrametric checkpoints (the e1
+      checkpoints are soft-digit: truncation there is a channel drop, not a
+      valuation truncation - exploratory perplexity-vs-k sweeps on them exist
+      under run-ids trunc-hier-ultra-*), and (b) a float-quantization
+      quality-vs-bits baseline harness for the standard arm plus an
+      area-under-curve aggregate the engine can read.
+    status: blocked
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-hensel-curriculum-parity
+    statement: >-
+      Hensel-lift digit curricula (train digit-0..j-1 structure, freeze the
+      residue exactly, refine deeper digits) match end-to-end training's final
+      quality at equal budget, with monotone coarse-metric improvement - the
+      lift invariant guarantees refinement can never destroy learned coarse
+      structure, which float curricula cannot promise. The residue invariant
+      itself is not a prediction: it is exact by construction and asserted
+      loudly in the prototype (a single violated residue fails the run).
+    mechanisms: [ultrametric]
+    source:
+      kind: model
+      provenance: "EPIC THEORY-I 8gk.4; theory note padic_precision.md section 3; prototype run_hensel_curriculum_section (first toy reading: curriculum 0.160 vs end-to-end 0.177 at 4 epochs, residues EXACT)"
+    date_registered: "2026-06-11"
+    theorem_refs: [thm-hensel-residue-preservation, thm-flat-error]
+    prediction: null
+    operationalization_note: >-
+      The prototype lives in the JAX demo (diagnostics, not engine-readable
+      artifacts) and the first toy reading is mildly BELOW parity - disclosed
+      here at registration. Blocked on a schema'd curriculum-vs-end-to-end
+      harness at a scale where the comparison has power (the demo's Task A at
+      a few epochs does not), with per-stage coarse-metric logging for the
+      monotonicity half of the claim.
+    status: blocked
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-padic-truncation-depth-independent
+    statement: >-
+      The flat-error lemma's signature is visible end-to-end: quality
+      degradation at digit-k truncation is INDEPENDENT of model depth for the
+      p-adic-native path, because per-layer truncation errors live below digit
+      k and cannot accumulate through depth - while float-quantized baselines
+      degrade with depth as per-layer rounding compounds. The experimentally
+      striking signature separating valuation truncation from float rounding.
+    mechanisms: [ultrametric]
+    source:
+      kind: model
+      provenance: "EPIC THEORY-I 8gk.4; theory note padic_precision.md section 5 item 3"
+    date_registered: "2026-06-11"
+    theorem_refs: [thm-flat-error]
+    prediction: null
+    operationalization_note: >-
+      Needs a depth sweep (n_layer in {2, 4, 8} at matched width/budget) of
+      hard-digit ultrametric checkpoints evaluated across k, plus the float
+      baseline at matched depths - the per-depth quality-delta-vs-k slopes are
+      the observable (predict: ~0 slope w.r.t. depth for digit truncation,
+      positive for float). Same blockers as hyp-padic-truncation-graceful plus
+      the depth-sweep training campaign.
+    status: blocked
+    evidence: []
+    verdict_history: []

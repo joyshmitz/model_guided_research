@@ -4321,13 +4321,22 @@ def gen_tasks(
     console.print(f"[bold green]Generated {len(names)} task(s)[/bold green] in {time.perf_counter() - t0:.1f}s")
 
 
-def _load_eval_checkpoint(checkpoint_dir: Path, step: int | None, device: Any) -> tuple[Any, dict[str, Any], int]:
+def _load_eval_checkpoint(
+    checkpoint_dir: Path, step: int | None, device: Any, *, model_overrides: dict[str, Any] | None = None
+) -> tuple[Any, dict[str, Any], int]:
     """Load a nanochat GPT checkpoint for evaluation.
 
     Deliberately NOT checkpoint_manager.build_model: that helper asserts the
     tokenizer vocab matches the model config, but nanochat training configs
     use the padded default (50304) with the 50257-token GPT-2 tokenizer -
     a deliberate mismatch (every tokenizer id is still a valid input).
+
+    model_overrides (bead 8gk.4): eval-time config knobs (e.g.
+    ultrametric_digits_k for valuation-truncation sweeps) merged into the
+    checkpoint's recorded config BEFORE construction; the caller must record
+    the merged config in the artifact so override arms are variant-selectable.
+    The override may not change any parameter-shaping field (the state dict
+    must still load strictly).
     """
     import torch
 
@@ -4339,7 +4348,20 @@ def _load_eval_checkpoint(checkpoint_dir: Path, step: int | None, device: Any) -
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     if meta.get("model_type", "gpt") != "gpt":
         raise ValueError(f"eval-tasks supports model_type=gpt checkpoints, got {meta.get('model_type')!r}")
-    config = GPTConfig(**meta["model_config"])
+    config_dict = dict(meta["model_config"])
+    if model_overrides:
+        # validate against the CURRENT GPTConfig schema, not the checkpoint's
+        # recorded dict: eval-time knobs (ultrametric_digits_k) legitimately
+        # postdate old checkpoints, whose configs simply lack the field
+        import dataclasses
+
+        known_fields = {f.name for f in dataclasses.fields(GPTConfig)}
+        unknown = sorted(set(model_overrides) - known_fields)
+        if unknown:
+            raise ValueError(f"--model-override names unknown GPTConfig field(s): {unknown}")
+        config_dict.update(model_overrides)
+        meta = {**meta, "model_config": config_dict}
+    config = GPTConfig(**config_dict)
     model = GPT(config).to(device)
     if device.type in {"cpu", "mps"}:
         model_data = {k: v.float() if v.dtype == torch.bfloat16 else v for k, v in model_data.items()}
@@ -4498,6 +4520,16 @@ def eval_tasks(
         list[str] | None,
         typer.Option(help="Difficulty dial override name=value (repeatable; recorded in provenance)"),
     ] = None,
+    model_override: Annotated[
+        list[str] | None,
+        typer.Option(
+            help=(
+                "Eval-time model-config override key=value (repeatable; JSON-parsed scalars; e.g. "
+                "ultrametric_digits_k=4 for valuation-truncation sweeps, bead 8gk.4). Recorded in "
+                "meta.checkpoint.model_config, so override arms are variant-selectable evidence."
+            )
+        ),
+    ] = None,
     artifacts_dir: Annotated[Path, typer.Option(help="Artifacts root")] = Path("artifacts"),
     run_id: Annotated[str | None, typer.Option(help="Run identifier (default: timestamp)")] = None,
 ) -> None:
@@ -4555,7 +4587,20 @@ def eval_tasks(
             console.print(f"[bold red]--dial names {unknown_dials} match no dial of the selected tasks.[/bold red]")
             raise typer.Exit(code=2)
 
-    model, ckpt_meta, resolved_step = _load_eval_checkpoint(checkpoint, step, device)
+    model_overrides: dict[str, Any] = {}
+    for pair in model_override or []:
+        key, sep, value = pair.partition("=")
+        if not sep:
+            console.print(f"[bold red]--model-override expects key=value, got {pair!r}[/bold red]")
+            raise typer.Exit(code=2)
+        try:
+            model_overrides[key.strip()] = json.loads(value)
+        except json.JSONDecodeError:
+            model_overrides[key.strip()] = value  # bare strings pass through
+
+    model, ckpt_meta, resolved_step = _load_eval_checkpoint(
+        checkpoint, step, device, model_overrides=model_overrides or None
+    )
     tok = get_tokenizer()
     n_params = sum(p.numel() for p in model.parameters())
 

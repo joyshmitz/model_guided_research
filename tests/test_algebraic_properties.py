@@ -605,3 +605,63 @@ if __name__ == "__main__":
     import sys
 
     raise SystemExit(pytest.main(sys.argv[1:] or [__file__]))
+
+
+# ---------------------------------------------------------------------------
+# Flat-error lemma (bead 8gk.4): EXACT integer identities, no tolerances.
+# thm-flat-error: errors below digit k cannot accumulate under sums or
+# products. Theory note: markdown_documentation/padic_precision.md.
+# ---------------------------------------------------------------------------
+
+
+@given(
+    p=_primes,
+    k=st.integers(min_value=1, max_value=6),
+    coeffs=st.lists(st.integers(min_value=-9999, max_value=9999).filter(lambda c: c != 0), min_size=2, max_size=12),
+)
+def test_flat_error_lemma_sum_exact(p, k, coeffs):
+    # v(e_i) >= k for all i  =>  v(sum e_i) >= k, for ANY signs (adversarial
+    # cancellations only INCREASE the valuation - error stays below digit k).
+    es = [p**k * c for c in coeffs]
+    s = sum(es)
+    assert s == 0 or _vp(abs(s), p, 200) >= k
+
+
+@given(
+    p=_primes,
+    k=st.integers(min_value=1, max_value=5),
+    coeffs=st.lists(st.integers(min_value=-99, max_value=99).filter(lambda c: c != 0), min_size=2, max_size=8),
+)
+def test_flat_error_lemma_product_exact(p, k, coeffs):
+    # v(e_i) >= k (k >= 0!)  =>  v(prod(1 + e_i) - 1) >= k: relative errors do
+    # not compound either. The k >= 0 hypothesis is REQUIRED (see the rational
+    # counterexample below) and automatic in the digit-truncation setting.
+    prod = 1
+    for c in coeffs:
+        prod *= 1 + p**k * c
+    diff = prod - 1
+    assert diff == 0 or _vp(abs(diff), p, 200) >= k
+
+
+def test_flat_error_product_part_requires_nonnegative_k():
+    # k = -1 counterexample (the bead's precision note): with v(e1) = v(e2) =
+    # -1, the cross term e1*e2 has valuation -2 < -1 - the product part FAILS
+    # below k = 0, which is why the theorem (and vnl.2's formalization) carry
+    # the hypothesis explicitly.
+    from fractions import Fraction
+
+    p = 3
+    e1, e2 = Fraction(1, 3), Fraction(2, 3)
+    diff = (1 + e1) * (1 + e2) - 1
+
+    def vp_frac(q: Fraction) -> int:
+        num, den, v = q.numerator, q.denominator, 0
+        while num % p == 0:
+            num //= p
+            v += 1
+        while den % p == 0:
+            den //= p
+            v -= 1
+        return v
+
+    assert vp_frac(diff) == -2  # strictly below k = -1: the lemma's boundary

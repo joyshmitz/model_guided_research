@@ -183,6 +183,10 @@ class GPTConfig:
     ffn_beta: float | None = None
     # Ultrametric-specific options (see nanochat.ultrametric_attention_torch).
     ultrametric_mode: str = "kernel"  # "kernel" | "trie" | "balltree" (exact O(K T log T), bead 33dd)
+    # Eval-time digit-precision truncation (bead 8gk.4): use only the first k
+    # of the K digit channels - quantization as valuation truncation, with the
+    # flat-error lemma governing the p-adic-native path. None = full precision.
+    ultrametric_digits_k: int | None = None
     ultrametric_hard_digits: bool = False
     ultrametric_K: int = 8
     ultrametric_p: int = 2
