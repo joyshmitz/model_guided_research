@@ -926,3 +926,34 @@ def test_fake_quantize_weights_monotone_and_bounds():
         raise AssertionError("bits=1 must be rejected")
     except ValueError:
         pass
+
+
+def test_precision_curve_common_window_kills_span_bias(tmp_path):
+    """Arms swept to DIFFERENT depths must be compared on the common window
+    (matched memory): without it, the deeper-swept arm's AUC is penalized by
+    construction - the bias the fresh-eyes review caught pre-evidence."""
+    _precision_eval_artifact(tmp_path, "dfull2", ppl=2.0)
+    _precision_eval_artifact(tmp_path, "ffull2", ppl=2.0)
+    # digit arm swept SHALLOW (only k=4 of 8 -> fraction 0.5), no degradation
+    _precision_eval_artifact(tmp_path, "d2-k4", ppl=2.0, knob="ultrametric_digits_k", value=4)
+    # float arm swept DEEP (2 bits -> fraction 0.0625) where it collapses,
+    # but IDENTICAL quality (1.0) inside the common window [0.5, 1.0]
+    _precision_eval_artifact(tmp_path, "f2-b16", ppl=2.0, knob="eval_weight_quant_bits", value=16)
+    _precision_eval_artifact(tmp_path, "f2-b2", ppl=2.0e9, knob="eval_weight_quant_bits", value=2)
+
+    result = runner.invoke(cli.app, [
+        "precision-curve",
+        "--digit-run", "d2-k4",
+        "--float-run", "f2-b16", "--float-run", "f2-b2",
+        "--digit-full", "dfull2", "--float-full", "ffull2",
+        "--task", "hier", "--seed", "1",
+        "--artifacts-dir", str(tmp_path), "--run-id", "pc-window",
+    ])
+    assert result.exit_code == 0, result.output
+    r = json.loads((tmp_path / "bench" / "precision_curves" / "pc-window" / "summary.json").read_text())["results"]
+    assert abs(r["common_window_lo"] - 0.5) < 1e-9
+    # inside [0.5, 1.0] both arms are flat at quality 1.0: the ratio must be
+    # ~1 (no advantage), NOT inflated by the float arm's deep-sweep collapse
+    assert abs(r["auc_digit"] - 1.0) < 1e-9
+    assert abs(r["auc_float"] - 1.0) < 1e-6, r["auc_float"]
+    assert abs(r["auc_ratio"] - 1.0) < 1e-6

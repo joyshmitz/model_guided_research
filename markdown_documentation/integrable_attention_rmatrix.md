@@ -298,7 +298,7 @@ task's algebraic structure even though the ceiling does not move. The
 preregistered observables (`hyp-rmatrix-s5-length-slope`,
 `hyp-rmatrix-solvable-control-specificity`) are doc-level OLS slopes of
 held-out exact-match against word length (`length_slope` in
-mgr.evaltasks.v2), with the solvable controls required to *shrink* the gap —
+mgr.evaltasks.v2+), with the solvable controls required to *shrink* the gap —
 if the win does not track non-solvability, the story is wrong and the
 registry will say so.
 

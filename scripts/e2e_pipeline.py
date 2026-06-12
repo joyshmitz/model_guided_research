@@ -345,7 +345,7 @@ def scenario_full_loop(work: Path) -> bool:
             summary = work / "artifacts" / "evals" / "tasks" / f"e2e-eval-{arm}" / "summary.json"
             rec = json.loads(summary.read_text())
             r.assert_true(f"eval-{arm}-contract",
-                          rec["schema_version"] == "mgr.evaltasks.v2" and "answer_prior" in rec["tasks"]["arith"]
+                          rec["schema_version"] == "mgr.evaltasks.v3" and "answer_prior" in rec["tasks"]["arith"]
                           and (summary.parent / "generations.jsonl").exists(),
                           f"{summary.name}: v2 schema + answer_prior + receipts present")
         out = r.run("sample", CLI + ["sample", "--checkpoint", str(_run_dir(work, "e2e-standard") / "checkpoints"),

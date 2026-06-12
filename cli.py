@@ -4586,7 +4586,7 @@ def eval_tasks(
     Headline output: extrapolation curves (accuracy vs difficulty, in-range vs
     held-out marked) per task, exact-match via the vdc.1 brute-force format,
     per-task perplexity as the secondary metric. Writes summary.json (schema
-    mgr.evaltasks.v2 - a versioned contract), per-example receipts
+    mgr.evaltasks.v3 - a versioned contract), per-example receipts
     (generations.jsonl), run.md, and curve PNGs.
     """
     import statistics as stats_mod
@@ -4980,7 +4980,7 @@ def eval_tasks(
         f"- seeds: {seed_list} · examples/seed: {examples} · decode: {[m for m, _ in decode_modes]}\n\n"
         "| task | EM in-range | EM held-out | ppl in/held | slope held-out [CI95] | curve |\n|---|---|---|---|---|---|\n"
         + "\n".join(md_rows)
-        + "\n\nSee `summary.json` (schema mgr.evaltasks.v2) for the full contract output and "
+        + "\n\nSee `summary.json` (schema mgr.evaltasks.v3) for the full contract output and "
         "`generations.jsonl` for per-example receipts.\n"
     )
     (run_dir / "run.md").write_text(report_md)
@@ -5339,16 +5339,36 @@ def precision_curve(
     digit_pts = _points(digit_run, "ultrametric_digits_k", lambda mc: float(mc.get("ultrametric_K", 8)))
     float_pts = _points(float_run, "eval_weight_quant_bits", lambda mc: 32.0)
 
-    def _auc(pts: list[tuple[float, float]], anchor_ppl: float) -> tuple[float, list[dict[str, float]]]:
-        curve = sorted([(f, anchor_ppl / p if p > 0 else 0.0) for f, p in pts] + [(1.0, 1.0)])
-        area = 0.0
-        for (f0, q0), (f1, q1) in zip(curve, curve[1:]):
-            area += (f1 - f0) * (q0 + q1) / 2.0
-        span = curve[-1][0] - curve[0][0]
-        return (area / span if span > 0 else 0.0), [{"fraction": f, "quality": q} for f, q in curve]
+    def _quality_curve(pts: list[tuple[float, float]], anchor_ppl: float) -> list[tuple[float, float]]:
+        return sorted([(f, anchor_ppl / p if p > 0 else 0.0) for f, p in pts] + [(1.0, 1.0)])
 
-    auc_digit, curve_digit = _auc(digit_pts, digit_anchor)
-    auc_float, curve_float = _auc(float_pts, float_anchor)
+    curve_digit_pts = _quality_curve(digit_pts, digit_anchor)
+    curve_float_pts = _quality_curve(float_pts, float_anchor)
+    # "At matched memory" (the registered phrase): both AUCs integrate over
+    # the COMMON fraction window [max(arm minima), 1.0]. Normalizing each arm
+    # over its OWN span would penalize whichever arm was swept deeper into
+    # compression - a bias in the registered direction, caught in review
+    # before any evidence was produced.
+    window_lo = max(curve_digit_pts[0][0], curve_float_pts[0][0])
+
+    def _interp(curve: list[tuple[float, float]], f: float) -> float:
+        for (f0, q0), (f1, q1) in zip(curve, curve[1:]):
+            if f0 <= f <= f1:
+                return q0 if f1 == f0 else q0 + (q1 - q0) * (f - f0) / (f1 - f0)
+        return curve[0][1] if f < curve[0][0] else curve[-1][1]
+
+    def _auc(curve: list[tuple[float, float]]) -> float:
+        clipped = [(window_lo, _interp(curve, window_lo))] + [(f, q) for f, q in curve if f > window_lo]
+        area = 0.0
+        for (f0, q0), (f1, q1) in zip(clipped, clipped[1:]):
+            area += (f1 - f0) * (q0 + q1) / 2.0
+        span = clipped[-1][0] - clipped[0][0]
+        return area / span if span > 0 else 0.0
+
+    auc_digit = _auc(curve_digit_pts)
+    auc_float = _auc(curve_float_pts)
+    curve_digit = [{"fraction": f, "quality": q} for f, q in curve_digit_pts]
+    curve_float = [{"fraction": f, "quality": q} for f, q in curve_float_pts]
     ratio = auc_digit / auc_float if auc_float > 0 else float("inf")
 
     table = Table(title=f"precision curves — {task} (seed pairing {seed})", box=box.SIMPLE_HEAVY)
@@ -5376,7 +5396,11 @@ def precision_curve(
             "float_runs": list(float_run),
             "digit_full": digit_full,
             "float_full": float_full,
-            "normalization": "digits: k/K of the digit path; float: bits/32 of weights; quality = ppl_full/ppl_point; AUC normalized by fraction span, anchored at (1,1)",
+            "normalization": (
+                "digits: k/K of the digit path; float: bits/32 of weights; quality = ppl_full/ppl_point; "
+                "both AUCs integrate over the COMMON fraction window [max(arm minima), 1.0] (matched memory), "
+                "anchored at (1,1), normalized by the window span"
+            ),
             "git": _get_git_info(),
         },
         "provenance": build_provenance(
@@ -5386,6 +5410,7 @@ def precision_curve(
             "auc_digit": auc_digit,
             "auc_float": auc_float,
             "auc_ratio": ratio,
+            "common_window_lo": window_lo,
             "curve_digit": curve_digit,
             "curve_float": curve_float,
         },
