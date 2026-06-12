@@ -123,3 +123,100 @@ def test_report_handles_empty_tree(tmp_path):
     assert result.exit_code == 0, result.output
     payload = json.loads((tmp_path / "reports" / "empty" / "report.json").read_text())
     assert payload["counts"] == {} and payload["train_groups"] == [] and payload["eval_groups"] == []
+
+
+def _cert_summary(root: Path, name: str, *, mechanism: str) -> Path:
+    run_dir = root / "certs" / name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    p = run_dir / "summary.json"
+    p.write_text(json.dumps({
+        "schema_version": 1, "kind": "certify",
+        "git": {"dirty": False, "sha": "deadbeef"},
+        "checks": [{"mechanism": mechanism, "name": f"{mechanism}.smoke", "measured": 0.0}],
+    }))
+    return p
+
+
+def test_status_reports_staleness_and_engine_view(tmp_path, monkeypatch):
+    """2vs: mgr status answers existence (kinds + ages), cert freshness
+    (mtime vs mechanism source), and what the engine would rule on today
+    (planted: one adjudicable hypothesis, one blocked for missing
+    artifacts); --json is schema-versioned; --write-index persists it."""
+    import os
+    import time as time_mod
+
+    arts = tmp_path / "artifacts"
+    _train_summary(arts, "dyck-braid-s0", mechanism="braid", task="dyck", seed=0, ce=0.9)
+    _eval_summary(arts, "e-ultra-0", mechanism="ultrametric", task="hier", em=0.8, flops=1e14)
+    _eval_summary(arts, "e-ultra-1", mechanism="ultrametric", task="hier", em=0.82, flops=1e14)
+    _eval_summary(arts, "e-std-0", mechanism="standard", task="hier", em=0.50, flops=1e14)
+    _eval_summary(arts, "e-std-1", mechanism="standard", task="hier", em=0.51, flops=1e14)
+    stale_cert = _cert_summary(arts, "trop-old", mechanism="tropical")
+    os.utime(stale_cert, (time_mod.time() - 10 * 86400,) * 2)  # cert predates source
+    fresh_cert = _cert_summary(arts, "ultra-new", mechanism="ultrametric")
+    os.utime(fresh_cert, (time_mod.time() + 3600,) * 2)  # newer than any source file
+
+    registry = tmp_path / "registry.yaml"
+    blocked = _hyp_status()
+    blocked["id"] = "hyp-status-blocked"
+    blocked["mechanisms"] = ["braid"]  # no braid eval artifacts -> blocked
+    registry.write_text(
+        "schema_version: 1\nhypotheses:\n" + _yaml_entry_status(_hyp_status())
+        + _yaml_entry_status(blocked)
+    )
+    monkeypatch.setattr(cli, "_hypotheses_registry_path", lambda: registry)
+
+    result = runner.invoke(cli.app, [
+        "status", "--artifacts-dir", str(arts), "--json", "--write-index",
+    ])
+    assert result.exit_code == 0, result.output
+    payload = json.loads((arts / "index.json").read_text())
+    assert payload["schema_version"] == "mgr.status.v1"
+    assert payload["artifact_kinds"]["campaigns"]["count"] == 1
+    assert payload["artifact_kinds"]["evals"]["count"] == 4
+    assert payload["evidence_pool"]["indexed"] == 7
+    certs = {c["mechanism"]: c for c in payload["certificates"]}
+    assert certs["tropical"]["stale"] is True
+    assert certs["ultrametric"]["stale"] is False
+    eng = payload["engine_today"]
+    assert eng["would_rule"] == 1 and eng["blocked"] == 1
+    states = {h["id"]: h for h in eng["hypotheses"]}
+    assert states["hyp-status-ok"]["state"] == "would_rule"
+    assert states["hyp-status-blocked"]["state"] == "blocked"
+    assert (arts / "index.md").read_text().startswith("# Artifacts index")
+
+
+def _hyp_status():
+    return {
+        "id": "hyp-status-ok",
+        "statement": "status test claim",
+        "mechanisms": ["ultrametric"],
+        "prediction": {
+            "metric_path": "evaltasks:tasks.hier.exact_match.greedy.held_out.mean",
+            "comparator": ">=", "threshold_kind": "absolute_delta", "threshold": 0.05,
+            "baseline": {"mechanism": "standard", "equal_flops": True}, "min_seeds": 1,
+        },
+        "status": "open",
+    }
+
+
+def _yaml_entry_status(h) -> str:
+    pred = h["prediction"]
+    return "\n".join([
+        f"  - id: {h['id']}",
+        f"    statement: {json.dumps(h['statement'])}",
+        f"    mechanisms: [{', '.join(h['mechanisms'])}]",
+        "    source: {kind: human, provenance: test}",
+        '    date_registered: "2026-06-12"',
+        "    prediction:",
+        f"      metric_path: {json.dumps(pred['metric_path'])}",
+        f"      comparator: \"{pred['comparator']}\"",
+        f"      threshold_kind: {pred['threshold_kind']}",
+        f"      threshold: {pred['threshold']}",
+        f"      baseline: {{mechanism: {pred['baseline']['mechanism']}, equal_flops: true}}",
+        f"      min_seeds: {pred['min_seeds']}",
+        "    status: open",
+        "    evidence: []",
+        "    verdict_history: []",
+        "",
+    ])

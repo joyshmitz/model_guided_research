@@ -8218,6 +8218,172 @@ def report(
     console.print(Panel(f"report → [bold]{run_dir}[/bold]", border_style="blue"))
 
 
+def _status_age(ts: float, now: float) -> str:
+    mins = max(0.0, (now - ts) / 60.0)
+    if mins < 90:
+        return f"{mins:.0f}m"
+    if mins < 48 * 60:
+        return f"{mins / 60:.1f}h"
+    return f"{mins / 1440:.1f}d"
+
+
+@app.command("status")
+def status(
+    artifacts_dir: Annotated[Path, typer.Option(help="Artifacts root")] = Path("artifacts"),
+    json_out: Annotated[bool, typer.Option("--json", help="Machine-readable payload only")] = False,
+    write_index: Annotated[
+        bool, typer.Option("--write-index", help="Persist the payload as artifacts/index.json (+ index.md)")
+    ] = False,
+) -> None:
+    """Project state in one call (bead 2vs): what exists, how old it is, and
+    what is stale - so sessions stop spelunking artifacts/. Latest artifact
+    per kind with ages; per-mechanism certificate freshness (a cert older
+    than its mechanism's source file is STALE); which registered hypotheses
+    the engine would rule on TODAY vs refuse (and why). --json is the agent
+    schema; --write-index persists the same payload as the durable manifest."""
+    now = time.time()
+    repo_root = Path(__file__).resolve().parent
+
+    # ---- latest artifact per top-level kind ----
+    kinds: dict[str, dict[str, Any]] = {}
+    if artifacts_dir.exists():
+        for kind_dir in sorted(p for p in artifacts_dir.iterdir() if p.is_dir()):
+            newest: tuple[float, Path] | None = None
+            count = 0
+            for s in kind_dir.rglob("summary.json"):
+                count += 1
+                mt = s.stat().st_mtime
+                if newest is None or mt > newest[0]:
+                    newest = (mt, s)
+            if newest is None:
+                continue
+            kinds[kind_dir.name] = {
+                "count": count,
+                "newest_path": str(newest[1].parent),
+                "newest_age": _status_age(newest[0], now),
+                "newest_mtime": newest[0],
+            }
+
+    # ---- certificate freshness per mechanism ----
+    index = _adj_collect_artifacts([artifacts_dir])
+    cert_state: dict[str, dict[str, Any]] = {}
+    for art in index:
+        if art["schema"] != "certify":
+            continue
+        mt = Path(art["path"]).stat().st_mtime
+        for c in art["data"].get("checks") or []:
+            mech = c.get("mechanism") if isinstance(c, dict) else None
+            if not isinstance(mech, str):
+                continue
+            cur = cert_state.get(mech)
+            if cur is None or mt > cur["cert_mtime"]:
+                cert_state[mech] = {"cert_mtime": mt, "cert_path": art["path"]}
+    certs: list[dict[str, Any]] = []
+    for mech in sorted(cert_state):
+        st = cert_state[mech]
+        mech_file = repo_root / "nanochat" / f"{mech}_attention_torch.py"
+        stale: bool | None = None
+        if mech_file.exists():
+            stale = mech_file.stat().st_mtime > st["cert_mtime"]
+        certs.append({
+            "mechanism": mech,
+            "cert_age": _status_age(st["cert_mtime"], now),
+            "stale": stale,  # null = no per-mechanism source file to compare
+            "cert_path": st["cert_path"],
+        })
+
+    # ---- what would the engine rule on today? ----
+    reg_data, _load_errors = _load_hypothesis_registry(_hypotheses_registry_path())
+    entries = [h for h in (reg_data or {}).get("hypotheses", []) if isinstance(h, dict)]
+    adjudicable: list[dict[str, Any]] = []
+    blocked_reasons: dict[str, int] = {}
+    for h in entries:
+        v = _adjudicate_hypothesis(h, index)
+        if v["verdict"] == "blocked":
+            blocked_reasons[v["reason_code"]] = blocked_reasons.get(v["reason_code"], 0) + 1
+            adjudicable.append({"id": str(v["id"]), "state": "blocked", "reason": v["reason_code"]})
+        else:
+            adjudicable.append({"id": str(v["id"]), "state": "would_rule", "reason": v["verdict"]})
+    ledger_counts: dict[str, int] = {}
+    for h in entries:
+        st_h = str(h.get("status", "?"))
+        ledger_counts[st_h] = ledger_counts.get(st_h, 0) + 1
+
+    payload: dict[str, Any] = {
+        "kind": "status",
+        "schema_version": "mgr.status.v1",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "git": _get_git_info(),
+        "artifact_kinds": {k: {kk: vv for kk, vv in v.items() if kk != "newest_mtime"} for k, v in kinds.items()},
+        "evidence_pool": {
+            "indexed": len(index),
+            "tainted": sum(1 for a in index if a["tainted"]),
+            "by_schema": {
+                s: sum(1 for a in index if a["schema"] == s)
+                for s in sorted({a["schema"] for a in index})
+            },
+        },
+        "certificates": certs,
+        "ledger": ledger_counts,
+        "engine_today": {
+            "would_rule": sum(1 for a in adjudicable if a["state"] == "would_rule"),
+            "blocked": sum(1 for a in adjudicable if a["state"] == "blocked"),
+            "blocked_reasons": blocked_reasons,
+            "hypotheses": adjudicable,
+        },
+    }
+
+    if write_index:
+        (artifacts_dir / "index.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        md_lines = [
+            f"# Artifacts index — {payload['generated_at']}",
+            "",
+            "| kind | artifacts | newest | age |",
+            "|---|---|---|---|",
+        ]
+        for k in sorted(kinds):
+            v = kinds[k]
+            md_lines.append(f"| {k} | {v['count']} | {v['newest_path']} | {v['newest_age']} |")
+        md_lines += ["", f"Evidence pool: {payload['evidence_pool']['indexed']} indexed, "
+                         f"{payload['evidence_pool']['tainted']} tainted.", ""]
+        (artifacts_dir / "index.md").write_text("\n".join(md_lines))
+
+    if json_out:
+        console.print_json(json.dumps(payload))
+        return
+
+    kt = Table(title="artifacts", box=box.SIMPLE_HEAVY)
+    for col in ("kind", "n", "newest", "age"):
+        kt.add_column(col)
+    for k in sorted(kinds):
+        v = kinds[k]
+        kt.add_row(k, str(v["count"]), v["newest_path"], v["newest_age"])
+    console.print(kt)
+
+    if certs:
+        ct = Table(title="certificates (stale = cert predates mechanism source)", box=box.SIMPLE_HEAVY)
+        for col in ("mechanism", "age", "fresh?"):
+            ct.add_column(col)
+        for c in certs:
+            mark = "?" if c["stale"] is None else ("[red]STALE[/red]" if c["stale"] else "[green]fresh[/green]")
+            ct.add_row(c["mechanism"], c["cert_age"], mark)
+        console.print(ct)
+
+    eng = payload["engine_today"]
+    reasons = ", ".join(f"{k}: {n}" for k, n in sorted(blocked_reasons.items())) or "-"
+    console.print(
+        Panel(
+            f"ledger: {' · '.join(f'{k}: {n}' for k, n in sorted(ledger_counts.items()))}\n"
+            f"evidence pool: {payload['evidence_pool']['indexed']} artifacts "
+            f"({payload['evidence_pool']['tainted']} tainted)\n"
+            f"engine today: would rule on [bold]{eng['would_rule']}[/bold], "
+            f"refuses [bold]{eng['blocked']}[/bold] ({reasons})"
+            + ("\nindex written → artifacts/index.json" if write_index else ""),
+            border_style="blue",
+        )
+    )
+
+
 @app.command("adjudicate")
 def adjudicate(
     hypothesis: Annotated[list[str] | None, typer.Option("--hypothesis", "-H", help="Hypothesis id (repeatable)")] = None,
