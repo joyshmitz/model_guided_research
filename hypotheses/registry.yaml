@@ -898,9 +898,11 @@ hypotheses:
         {braid_crossing_law: rmatrix}; evaltasks artifacts must record
         meta.checkpoint.model_config for the selector to resolve.
       candidate_variant: {braid_crossing_law: "rmatrix"}
-    status: open
+    status: inconclusive
     evidence: []
-    verdict_history: []
+    verdict_history:
+      - {date: "2026-06-11", verdict: supported, artifacts: ["artifacts/evals/tasks/e1-group-rmatrix-s0-v3/summary.json", "artifacts/evals/tasks/e1-group-rmatrix-s1-v2/summary.json", "artifacts/evals/tasks/e1-group-rmatrix-s2-v2/summary.json", "artifacts/evals/tasks/e1-group-standard-s0/summary.json", "artifacts/evals/tasks/e1-group-standard-s1/summary.json", "artifacts/evals/tasks/e1-group-standard-s2/summary.json"], adjudicator: "engine:ci-v3", policy_version: "ci-v3", arms: {"braid": {"budget_flops": 100000000000000.0, "ci95": [-0.0, 0.0], "effect": -0.0, "n_baseline": 3, "n_candidate": 3, "verdict": "supported"}}}
+      - {date: "2026-06-11", verdict: inconclusive, adjudicator: "human:CyanCreek (the floor-precondition hand-check the registered scale_caveats mandate for slope paths)", policy_version: "ci-v3", floor_effect: true, reason: "baseline held-out EM per seed [0.0069, 0.0069, 0.0139] sits BELOW the recorded answer prior 0.0972: both arms are at the best-constant floor at held-out lengths, the candidate's zero s5 slope is floor-flatness (flat because dead, not flat because robust), and the experiment has no power to witness the slope claim at the E1 rung - the mechanical SUPPORTED is downgraded per the registered precondition", artifacts: ["artifacts/evals/tasks/e1-group-standard-s0/summary.json", "artifacts/evals/tasks/e1-group-standard-s1/summary.json", "artifacts/evals/tasks/e1-group-standard-s2/summary.json"]}
 
   - id: hyp-rmatrix-solvable-control-specificity
     statement: >-
@@ -935,9 +937,11 @@ hypotheses:
         this entry is the predicted pattern, supporting both means the
         advantage is not mechanism-specific.
       candidate_variant: {braid_crossing_law: "rmatrix"}
-    status: open
+    status: inconclusive
     evidence: []
-    verdict_history: []
+    verdict_history:
+      - {date: "2026-06-11", verdict: refuted, artifacts: ["artifacts/evals/tasks/e1-group-rmatrix-s0-v3/summary.json", "artifacts/evals/tasks/e1-group-rmatrix-s1-v2/summary.json", "artifacts/evals/tasks/e1-group-rmatrix-s2-v2/summary.json", "artifacts/evals/tasks/e1-group-standard-s0/summary.json", "artifacts/evals/tasks/e1-group-standard-s1/summary.json", "artifacts/evals/tasks/e1-group-standard-s2/summary.json"], adjudicator: "engine:ci-v3", policy_version: "ci-v3", arms: {"braid": {"budget_flops": 100000000000000.0, "ci95": [-4.288503253796096, 0.0], "effect": -2.7071583514099777, "n_baseline": 3, "n_candidate": 3, "verdict": "refuted"}}}
+      - {date: "2026-06-11", verdict: inconclusive, adjudicator: "human:CyanCreek (the floor-precondition hand-check the registered scale_caveats mandate for slope paths)", policy_version: "ci-v3", floor_effect: true, reason: "same floor regime as the s5 entry: baseline held-out EM [0.0069, 0.0069, 0.0139] below the recorded answer prior 0.0972, and the negative ratio is sign-noise of near-zero slopes - no power to witness the control claim at the E1 rung; the mechanical REFUTED is downgraded per the registered precondition", artifacts: ["artifacts/evals/tasks/e1-group-standard-s0/summary.json", "artifacts/evals/tasks/e1-group-standard-s1/summary.json", "artifacts/evals/tasks/e1-group-standard-s2/summary.json"]}
 
   - id: hyp-rmatrix-charge-drift-separation
     statement: >-

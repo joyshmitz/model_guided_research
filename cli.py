@@ -5004,7 +5004,13 @@ def probe_charges(
             with torch.inference_mode():
                 model(torch.tensor([ids], dtype=torch.long, device=device))
                 x = captured["x"]  # (1, T, C)
-                v = final_attn.c_v(x).view(x.size(1), n_head, head_dim)
+                # c_v projects to n_kv_head value heads (GQA); repeat them to
+                # the n_head query heads exactly as the attention layer does,
+                # so charge features pair each query head's (eta, rapidities)
+                # with the value sequence it actually transports
+                n_kv = int(model.config.n_kv_head)
+                v_kv = final_attn.c_v(x).view(x.size(1), n_kv, head_dim)
+                v = v_kv.repeat_interleave(n_head // n_kv, dim=1)
                 feats = charge_features(v)
             by_cat.setdefault(cat, []).append((feats, expected))
     hook.remove()
