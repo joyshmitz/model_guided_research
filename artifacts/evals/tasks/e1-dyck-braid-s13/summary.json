@@ -1,0 +1,144 @@
+{
+  "kind": "eval-tasks",
+  "meta": {
+    "checkpoint": {
+      "attention_type": "braid",
+      "budget": {
+        "flops_consumed_est": 100049163386880,
+        "flops_per_step_est": 91202519040,
+        "max_steps": 1097,
+        "target_flops": 100000000000000.0
+      },
+      "dir": "artifacts/campaigns/e1/dyck-braid-s13/checkpoints",
+      "lineage": {
+        "parent_run_ids": [],
+        "run_id": "dyck-braid-s13"
+      },
+      "n_params": 13598848,
+      "step": 1096
+    },
+    "decode_modes": [
+      "greedy"
+    ],
+    "device": "cpu",
+    "examples_per_seed": 32,
+    "generated_at": "2026-06-11T18:38:34Z",
+    "git": {
+      "branch": "main",
+      "commit": "c17ec9e",
+      "commit_full": "c17ec9ebbe7955da35b3385dc0593b5963fa0483",
+      "dirty": false
+    },
+    "receipts": "generations.jsonl",
+    "run_id": "e1-dyck-braid-s13",
+    "seeds": [
+      0,
+      1,
+      2
+    ]
+  },
+  "provenance": {
+    "config_hash": "7e269dd95175c4686a7814dd0ef50683291c9f4aa7d56c91d94451d29354c97b",
+    "data_snapshot_hash": null,
+    "git_dirty": false,
+    "git_sha": "c17ec9ebbe7955da35b3385dc0593b5963fa0483",
+    "schema_version": "mgr.metrics.v1",
+    "tainted": false
+  },
+  "schema_version": "mgr.evaltasks.v2",
+  "tasks": {
+    "dyck": {
+      "answer_prior": {
+        "held_out": {
+          "majority_answer": "valid",
+          "mean": 0.625,
+          "per_seed": [
+            0.625,
+            0.71875,
+            0.53125
+          ]
+        },
+        "in_range": {
+          "majority_answer": "valid",
+          "mean": 0.5625,
+          "per_seed": [
+            0.5,
+            0.625,
+            0.5625
+          ]
+        }
+      },
+      "curve": {
+        "accuracy": [
+          0.3333333333333333,
+          0.65,
+          0.8181818181818182,
+          0.7123287671232876,
+          0.65,
+          0.35714285714285715,
+          0.3333333333333333,
+          0.45454545454545453,
+          1.0
+        ],
+        "buckets": [
+          1.0,
+          2.0,
+          3.0,
+          4.0,
+          5.0,
+          6.0,
+          7.0,
+          8.0,
+          10.0
+        ],
+        "counts": [
+          3,
+          20,
+          44,
+          73,
+          20,
+          14,
+          6,
+          11,
+          1
+        ]
+      },
+      "difficulty_axis": "nesting_depth",
+      "exact_match": {
+        "greedy": {
+          "held_out": {
+            "ci95": [
+              0.47085754694655546,
+              0.7791424530534445
+            ],
+            "mean": 0.625,
+            "per_seed": [
+              0.6875,
+              0.46875,
+              0.71875
+            ]
+          },
+          "in_range": {
+            "ci95": [
+              0.6193391465693779,
+              0.7973275200972888
+            ],
+            "mean": 0.7083333333333334,
+            "per_seed": [
+              0.78125,
+              0.625,
+              0.71875
+            ]
+          }
+        }
+      },
+      "in_range_max": 6.0,
+      "n_examples_per_seed": 32,
+      "perplexity": {
+        "held_out": 4.1035939790308475,
+        "in_range": 2.807509619742632
+      },
+      "skipped_too_long": 0
+    }
+  }
+}

@@ -1,0 +1,167 @@
+{
+  "kind": "eval-tasks",
+  "meta": {
+    "checkpoint": {
+      "attention_type": "standard",
+      "budget": {
+        "flops_consumed_est": 100047437955072,
+        "flops_per_step_est": 91200946176,
+        "max_steps": 1097,
+        "target_flops": 100000000000000.0
+      },
+      "dir": "artifacts/campaigns/e1/dyck-standard-s21/checkpoints",
+      "lineage": {
+        "parent_run_ids": [],
+        "run_id": "dyck-standard-s21"
+      },
+      "n_params": 13598720,
+      "step": 1096
+    },
+    "decode_modes": [
+      "greedy"
+    ],
+    "device": "cpu",
+    "dials": null,
+    "examples_per_seed": 32,
+    "generated_at": "2026-06-11T20:41:10Z",
+    "git": {
+      "branch": "main",
+      "commit": "d311753",
+      "commit_full": "d311753faa466eceb9b4f59881546d25e64fffea",
+      "dirty": true
+    },
+    "receipts": "generations.jsonl",
+    "run_id": "e1-dyck-standard-s21",
+    "seeds": [
+      0,
+      1,
+      2
+    ]
+  },
+  "provenance": {
+    "config_hash": "4cb1fba347aa36be2107b63e603d9bd1d15db2355510293ae558ab79d7dcea73",
+    "data_snapshot_hash": null,
+    "git_dirty": true,
+    "git_sha": "d311753faa466eceb9b4f59881546d25e64fffea",
+    "schema_version": "mgr.metrics.v1",
+    "tainted": true
+  },
+  "schema_version": "mgr.evaltasks.v2",
+  "tasks": {
+    "dyck": {
+      "answer_prior": {
+        "held_out": {
+          "majority_answer": "valid",
+          "mean": 0.625,
+          "per_seed": [
+            0.625,
+            0.71875,
+            0.53125
+          ]
+        },
+        "in_range": {
+          "majority_answer": "valid",
+          "mean": 0.5625,
+          "per_seed": [
+            0.5,
+            0.625,
+            0.5625
+          ]
+        }
+      },
+      "curve": {
+        "accuracy": [
+          0.3333333333333333,
+          0.5,
+          0.45454545454545453,
+          0.3835616438356164,
+          0.25,
+          0.42857142857142855,
+          0.3333333333333333,
+          0.45454545454545453,
+          1.0
+        ],
+        "buckets": [
+          1.0,
+          2.0,
+          3.0,
+          4.0,
+          5.0,
+          6.0,
+          7.0,
+          8.0,
+          10.0
+        ],
+        "counts": [
+          3,
+          20,
+          44,
+          73,
+          20,
+          14,
+          6,
+          11,
+          1
+        ]
+      },
+      "difficulty_axis": "nesting_depth",
+      "exact_match": {
+        "greedy": {
+          "held_out": {
+            "ci95": [
+              0.26891188803640625,
+              0.48108811196359375
+            ],
+            "mean": 0.375,
+            "per_seed": [
+              0.375,
+              0.28125,
+              0.46875
+            ]
+          },
+          "in_range": {
+            "ci95": [
+              0.3667745920242709,
+              0.5082254079757291
+            ],
+            "mean": 0.4375,
+            "per_seed": [
+              0.5,
+              0.375,
+              0.4375
+            ]
+          }
+        }
+      },
+      "in_range_max": 6.0,
+      "length_slope": {
+        "all": {
+          "basis": "doc-level OLS of greedy exact-match on the difficulty axis",
+          "ci95": [
+            -0.05051388061343495,
+            0.03687273620216083
+          ],
+          "intercept": 0.43434933653468183,
+          "n_docs": 192,
+          "slope": -0.006820572205637058
+        },
+        "held_out": {
+          "basis": "doc-level OLS of greedy exact-match on the difficulty axis",
+          "ci95": [
+            -0.044342427109717905,
+            0.063249990134928
+          ],
+          "intercept": 0.32930672268907557,
+          "n_docs": 96,
+          "slope": 0.009453781512605052
+        }
+      },
+      "n_examples_per_seed": 32,
+      "perplexity": {
+        "held_out": 2.95401539777716,
+        "in_range": 2.3624653903146586
+      },
+      "skipped_too_long": 0
+    }
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "kind": "eval-tasks",
+  "meta": {
+    "checkpoint": {
+      "attention_type": "standard",
+      "budget": {
+        "flops_consumed_est": 100047437955072,
+        "flops_per_step_est": 91200946176,
+        "max_steps": 1097,
+        "target_flops": 100000000000000.0
+      },
+      "dir": "/data/projects/model_guided_research/artifacts/campaigns/e1/placebo-standard-s6/checkpoints",
+      "lineage": {
+        "parent_run_ids": [],
+        "run_id": "placebo-standard-s6"
+      },
+      "n_params": 13598720,
+      "step": 1096
+    },
+    "decode_modes": [
+      "greedy"
+    ],
+    "device": "cpu",
+    "examples_per_seed": 32,
+    "generated_at": "2026-06-11T23:17:06Z",
+    "git": {
+      "branch": "HEAD",
+      "commit": "ed2664a",
+      "commit_full": "ed2664a28d4f339d10c13b3305c3d852e5a3ffe1",
+      "dirty": false
+    },
+    "receipts": "generations.jsonl",
+    "run_id": "e1-placebo-standard-s6",
+    "seeds": [
+      0,
+      1,
+      2
+    ]
+  },
+  "provenance": {
+    "config_hash": "a7feb223b447c1971c600c065ecae6425fe4d25b54bd924b9d07c25f249695a1",
+    "data_snapshot_hash": null,
+    "git_dirty": false,
+    "git_sha": "ed2664a28d4f339d10c13b3305c3d852e5a3ffe1",
+    "schema_version": "mgr.metrics.v1",
+    "tainted": false
+  },
+  "schema_version": "mgr.evaltasks.v2",
+  "tasks": {
+    "placebo": {
+      "answer_prior": null,
+      "curve": null,
+      "difficulty_axis": null,
+      "exact_match": null,
+      "in_range_max": null,
+      "n_examples_per_seed": 32,
+      "perplexity": {
+        "held_out": 65.40501008431117,
+        "in_range": 4.153718928496043
+      },
+      "skipped_too_long": 0
+    }
+  }
+}
