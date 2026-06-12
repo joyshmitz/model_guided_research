@@ -665,3 +665,45 @@ def test_flat_error_product_part_requires_nonnegative_k():
         return v
 
     assert vp_frac(diff) == -2  # strictly below k = -1: the lemma's boundary
+
+
+# ---------------------------------------------------------------------------
+# Mahler basis (bead 92jp): exact transform roundtrip + truncation certificate.
+# ---------------------------------------------------------------------------
+
+
+@given(
+    p=_primes,
+    values=st.lists(st.integers(min_value=0, max_value=10**6), min_size=2, max_size=20),
+)
+def test_mahler_transform_roundtrip_exact(p, values):
+    # coefficients -> evaluation reproduces f on its interpolation domain,
+    # exactly mod p^prec (the forward-difference transform is the inverse).
+    from ultrametric_worlds_and_p_adic_computation import mahler_coefficients, mahler_eval
+
+    modulus = p**6
+    coeffs = mahler_coefficients(values, modulus)
+    assert all(mahler_eval(coeffs, x, modulus) == v % modulus for x, v in enumerate(values))
+
+
+@given(
+    p=_primes,
+    decay=st.integers(min_value=1, max_value=3),
+    n_terms=st.integers(min_value=6, max_value=16),
+    cut=st.integers(min_value=1, max_value=8),
+)
+def test_mahler_truncation_certificate_exact(p, decay, n_terms, cut):
+    # ||f - f_N||_sup over the sampled domain has valuation >= the certified
+    # min valuation of the dropped coefficients (Mahler's ultrametric bound).
+    from ultrametric_worlds_and_p_adic_computation import mahler_eval
+
+    if cut >= n_terms - 1:
+        return
+    prec = 8
+    modulus = p**prec
+    coeffs = [(p ** min(n // decay, prec - 1)) for n in range(n_terms)]
+    cert = min(min(n // decay, prec - 1) for n in range(cut + 1, n_terms))
+    for x in range(n_terms + 4):
+        err = (mahler_eval(coeffs[: cut + 1], x, modulus) - mahler_eval(coeffs, x, modulus)) % modulus
+        if err:
+            assert _vp(err, p, prec) >= cert

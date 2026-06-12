@@ -1139,6 +1139,17 @@ def demo():
     except Exception as err:
         print(f"[ultrametric] Hensel-curriculum section failed: {err}")
 
+    # Mahler-basis section (bead 92jp): canonical compression on Z_p addresses
+    # with the certified ultrametric truncation error, all exact.
+    try:
+        mahler = run_mahler_section()
+        try:
+            last_diagnostics["mahler"] = mahler
+        except (NameError, TypeError):
+            last_diagnostics = {"mahler": mahler}
+    except Exception as err:
+        print(f"[ultrametric] Mahler section failed: {err}")
+
 
 # --- Minimal p‑adic helpers for tests ---
 
@@ -1601,6 +1612,96 @@ def run_hensel_curriculum_section(*, K_coarse: int = 2, K_full: int = 4, epochs:
         "curriculum_test_acc": acc_curr,
         "end_to_end_test_acc": acc_e2e,
         "residues_preserved_exactly": True,  # the assert above fails the run otherwise
+    }
+
+
+# ---------------------------------------------------------------------------
+# Mahler-basis heads (bead 92jp; design in padic_precision.md section 4).
+#
+# Mahler's theorem: every continuous f: Z_p -> Q_p has a canonical expansion
+# f(x) = sum_n a_n * C(x, n) with |a_n|_p -> 0, and truncation at N is
+# CANONICAL COMPRESSION with a certified ultrametric error:
+#     ||f - f_N||_sup = max_{n > N} |a_n|_p.
+# Trie addresses ARE elements of Z_p, so heads on hierarchical addresses can
+# be truncated Mahler series instead of MLPs - the function class whose
+# compression knob carries a certificate that COMPOSES with the flat-error
+# lemma instead of fighting it. Everything below is exact integer arithmetic.
+# ---------------------------------------------------------------------------
+
+
+def mahler_coefficients(f_values: list[int], modulus: int) -> list[int]:
+    """Mahler coefficients a_n = (Delta^n f)(0) mod modulus, from f on 0..N.
+
+    The forward-difference transform is the exact inverse of evaluation:
+    f(x) = sum_n a_n C(x, n) for all 0 <= x <= N (tested as a roundtrip).
+    """
+    diffs = [v % modulus for v in f_values]
+    coeffs = []
+    while diffs:
+        coeffs.append(diffs[0])
+        diffs = [(b - a) % modulus for a, b in zip(diffs, diffs[1:])]
+    return coeffs
+
+
+def mahler_eval(coeffs: list[int], x: int, modulus: int) -> int:
+    """Evaluate the (truncated) Mahler series at x: sum_n a_n C(x, n) mod modulus."""
+    total = 0
+    binom = 1  # C(x, 0)
+    for n, a in enumerate(coeffs):
+        total = (total + a * binom) % modulus
+        binom = binom * (x - n) // (n + 1)  # C(x, n+1), exact integer division
+    return total
+
+
+def run_mahler_section(*, p: int = 3, prec: int = 6, N: int = 24, seed: int = 23) -> dict:
+    """Mahler truncation certificate + roundtrip, exact mod p^prec."""
+    print("\n[Mahler-Basis Heads - canonical compression with certified error (92jp)]")
+    rng = random.Random(seed)
+    modulus = p**prec
+
+    def vp_of(n: int) -> int:
+        return vp_int(n % modulus or modulus, p, prec)
+
+    # construct f FROM a coefficient sequence with known valuation growth
+    # (a_n divisible by p^(n//4): continuity made quantitative), then verify
+    # the truncation error certificate exactly
+    true_coeffs = [(p ** min(n // 4, prec - 1)) * rng.randrange(1, p) for n in range(N + 1)]
+    f_vals = [mahler_eval(true_coeffs, x, modulus) for x in range(N + 1)]
+
+    rec = mahler_coefficients(f_vals, modulus)
+    roundtrip_ok = all(mahler_eval(rec, x, modulus) == f_vals[x] % modulus for x in range(N + 1))
+    coeff_ok = all((rec[n] - true_coeffs[n]) % modulus == 0 for n in range(N + 1))
+
+    rows = []
+    for cut in (4, 8, 16):
+        cert = min(vp_of(c) for c in true_coeffs[cut + 1 :])  # certified min valuation of dropped terms
+        worst = prec
+        for x in range(N + 1):
+            err = (mahler_eval(true_coeffs[: cut + 1], x, modulus) - f_vals[x]) % modulus
+            if err:
+                worst = min(worst, vp_of(err))
+        rows.append((cut, cert, worst, worst >= cert))
+    try:
+        from rich.console import Console as _Console
+        from rich.table import Table as _Table
+
+        tab = _Table(title=f"Mahler truncation certificate (p={p}, mod p^{prec})",
+                     show_header=True, header_style="bold magenta")
+        for col in ("truncate at N", "certified v_p(error) >=", "measured min v_p(error)", "certificate holds"):
+            tab.add_column(col, justify="right")
+        for cut, cert, worst, ok in rows:
+            tab.add_row(str(cut), str(cert), str(worst), str(ok))
+        _Console().print(tab)
+    except Exception as err:
+        print(f"[ultrametric] Mahler table skipped: {err}")
+    print(f"roundtrip exact: {roundtrip_ok} | coefficient recovery exact: {coeff_ok}")
+
+    return {
+        "roundtrip_exact": roundtrip_ok,
+        "coefficients_recovered_exactly": coeff_ok,
+        "certificate_rows": [
+            {"truncate_at": c, "certified_vp": ce, "measured_vp": w, "holds": ok} for c, ce, w, ok in rows
+        ],
     }
 
 

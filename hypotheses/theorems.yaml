@@ -827,3 +827,29 @@ theorems:
         ref: ultrametric.causality_no_future_grad
     used_by: [model_guided_research-5ki.1, model_guided_research-7b0.8]
     depends_on: []
+
+  - id: thm-mahler-truncation-certificate
+    statement: >-
+      Mahler's theorem: every continuous f: Z_p -> Q_p has the canonical
+      expansion f(x) = sum_n a_n C(x, n) with |a_n|_p -> 0, the coefficients
+      are the forward differences a_n = (Delta^n f)(0) (the transform is the
+      exact inverse of evaluation on the interpolation domain), and truncation
+      at N is canonical compression with the certified ultrametric error
+      ||f - f_N||_sup = max_{n>N} |a_n|_p. Heads on trie addresses (which are
+      elements of Z_p) built from truncated Mahler series therefore carry a
+      compression certificate that composes with the flat-error lemma.
+    status: proved-on-paper
+    mechanisms: [ultrametric]
+    source_note:
+      path: markdown_documentation/padic_precision.md
+      anchor: "Mahler-basis heads"
+    proof_location: "classical (Mahler 1958); implementation + exact verification in ultrametric_worlds_and_p_adic_computation.py (run_mahler_section: certificate holds with equality at every cut)"
+    numerical_checks:
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_mahler_transform_roundtrip_exact
+      - kind: pytest
+        ref: tests/test_algebraic_properties.py::test_mahler_truncation_certificate_exact
+      - kind: demo
+        ref: "ultrametric Mahler section: roundtrip + coefficient recovery + certificate table"
+    used_by: [model_guided_research-92jp, model_guided_research-8gk.4]
+    depends_on: [thm-flat-error]
