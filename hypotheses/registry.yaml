@@ -1125,14 +1125,34 @@ hypotheses:
       provenance: "EPIC THEORY-I 8gk.4; theory note padic_precision.md section 5 item 3"
     date_registered: "2026-06-11"
     theorem_refs: [thm-flat-error]
-    prediction: null
-    operationalization_note: >-
-      Needs a depth sweep (n_layer in {2, 4, 8} at matched width/budget) of
-      hard-digit ultrametric checkpoints evaluated across k, plus the float
-      baseline at matched depths - the per-depth quality-delta-vs-k slopes are
-      the observable (predict: ~0 slope w.r.t. depth for digit truncation,
-      positive for float). Same blockers as hyp-padic-truncation-graceful plus
-      the depth-sweep training campaign.
-    status: blocked
+    prediction:
+      metric_path: "bench:results.digit_depth_auc_absdev"
+      comparator: "<="
+      threshold_kind: absolute_delta
+      threshold: 0.05
+      baseline: null
+      min_seeds: 3
+      scale_caveats: >-
+        PROMOTED 2026-06-12 BEFORE any depth-contrast evidence existed (the
+        wave-2 L2/L8 checkpoints were mid-training; zero depth-sweep evals had
+        been run). Single-arm bench prediction on mgr.bench.depth_curves.v1:
+        digit_depth_auc_absdev = |AUC_digit(L8)/AUC_digit(L2) - 1|, within-arm
+        AUCs (each depth normalized to its own full-precision anchor, common
+        window across depths), one artifact per training-seed pairing
+        (>= 3). Threshold 0.05 is ~5x the cross-seed digit-AUC spread observed
+        at L4 in the tcuy campaign (1.002-1.019) - tolerant of seed noise,
+        tight against real depth dependence. The L4 (wave-1) data is
+        DELIBERATELY EXCLUDED from the observable: its flat digit curve was
+        already seen when this prediction was registered, so the contrast uses
+        only the unseen L2/L8 depths (statement says {2,4,8}; L4 appears in
+        diagnostics only). The float-compounding clause of the statement is
+        recorded as results.float_depth_auc_absdev - a diagnostic, not
+        adjudicated. Protocol: hard-digit ultrametric L2/L8 checkpoints
+        (e1-hard-l2/-l8 campaigns, frozen worktrees) swept over
+        ultrametric_digits_k in {6,4,2,1} + full anchors; standard L2/L8
+        (e1-depth-l2/-l8) swept over eval_weight_quant_bits in {8,6,4,3,2} +
+        full anchors for the diagnostic; examples=24 x 3 eval seeds on hier;
+        evidence from a clean tree.
+    status: open
     evidence: []
     verdict_history: []

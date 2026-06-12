@@ -856,10 +856,16 @@ def test_training_taint_propagates_through_eval_artifacts(tmp_path):
 
 
 def _precision_eval_artifact(root: Path, rid: str, *, ppl: float, knob: str | None = None,
-                             value: float | None = None, K: int = 8) -> None:
+                             value: float | None = None, K: int = 8,
+                             attention: str = "ultrametric", hard_digits: bool | None = None,
+                             n_layer: int | None = None) -> None:
     run = root / "evals" / "tasks" / rid
     run.mkdir(parents=True, exist_ok=True)
-    mc: dict = {"attention_type": "ultrametric", "ultrametric_K": K}
+    mc: dict = {"attention_type": attention, "ultrametric_K": K}
+    if hard_digits is not None:
+        mc["ultrametric_hard_digits"] = hard_digits
+    if n_layer is not None:
+        mc["n_layer"] = n_layer
     if knob:
         mc[knob] = value
     (run / "summary.json").write_text(json.dumps({
@@ -957,3 +963,117 @@ def test_precision_curve_common_window_kills_span_bias(tmp_path):
     assert abs(r["auc_digit"] - 1.0) < 1e-9
     assert abs(r["auc_float"] - 1.0) < 1e-6, r["auc_float"]
     assert abs(r["auc_ratio"] - 1.0) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# 9qeq: depth-curve artifacts (hyp-padic-truncation-depth-independent)
+
+
+def _depth_eval_set(root: Path, prefix: str, *, n_layer: int, ppl_full: float, ppl_k: float) -> None:
+    """One depth's digit-arm eval set: full anchor + k = 4, 2 of K = 8."""
+    _precision_eval_artifact(root, f"{prefix}-full", ppl=ppl_full, hard_digits=True, n_layer=n_layer)
+    for k in (4, 2):
+        _precision_eval_artifact(root, f"{prefix}-k{k}", ppl=ppl_k, knob="ultrametric_digits_k",
+                                 value=k, hard_digits=True, n_layer=n_layer)
+
+
+def test_depth_curve_flat_across_depths_and_engine_ingestion(tmp_path):
+    """Depth-independent digit arm (flat quality 1.0 at both depths) ->
+    absdev 0; the artifact is engine-readable bench evidence exposing the
+    digit_depth_auc_absdev observable and NOT the precision-curve one."""
+    _depth_eval_set(tmp_path, "l2", n_layer=2, ppl_full=2.0, ppl_k=2.0)
+    _depth_eval_set(tmp_path, "l8", n_layer=8, ppl_full=2.0, ppl_k=2.0)
+
+    result = runner.invoke(cli.app, [
+        "depth-curve",
+        "--shallow-run", "l2-k4", "--shallow-run", "l2-k2", "--shallow-full", "l2-full",
+        "--deep-run", "l8-k4", "--deep-run", "l8-k2", "--deep-full", "l8-full",
+        "--task", "hier", "--seed", "0",
+        "--artifacts-dir", str(tmp_path), "--run-id", "dc-flat",
+    ])
+    assert result.exit_code == 0, result.output
+    r = json.loads((tmp_path / "bench" / "depth_curves" / "dc-flat" / "summary.json").read_text())["results"]
+    assert (r["n_layer_shallow"], r["n_layer_deep"]) == (2, 8)
+    assert abs(r["auc_digit_shallow"] - 1.0) < 1e-9
+    assert abs(r["auc_digit_deep"] - 1.0) < 1e-9
+    assert r["digit_depth_auc_absdev"] < 1e-9
+    assert r["float_depth_auc_absdev"] is None  # diagnostic absent unless float runs supplied
+
+    arts = cli._adj_collect_artifacts([tmp_path / "bench"])
+    assert len(arts) == 1 and arts[0]["schema"] == "bench"
+    assert cli._adj_artifact_matches_arm(arts[0], "ultrametric", None)
+    assert cli._adj_observations(arts[0], "results.digit_depth_auc_absdev") == [0.0]
+    # cross-schema hygiene: the graceful hypothesis's observable must NOT
+    # resolve against depth-curve artifacts (and the engine skips them)
+    assert cli._adj_observations(arts[0], "results.auc_ratio") is None
+
+
+def test_depth_curve_detects_depth_dependence_with_float_diagnostic(tmp_path):
+    """Hand-computable contrast: shallow flat (AUC 1.0); deep degrades to
+    quality 0.5 at k = 4, 2 -> AUC 0.5/0.75 = 2/3 -> absdev 1/3. Float
+    diagnostic: shallow flat, deep collapses at 8 bits -> absdev 1/6."""
+    _depth_eval_set(tmp_path, "s", n_layer=2, ppl_full=2.0, ppl_k=2.0)
+    _depth_eval_set(tmp_path, "d", n_layer=8, ppl_full=2.0, ppl_k=4.0)
+    for prefix, nl, b8_ppl in (("fs", 2, 2.0), ("fd", 8, 2.0e9)):
+        _precision_eval_artifact(tmp_path, f"{prefix}-full", ppl=2.0, attention="standard", n_layer=nl)
+        _precision_eval_artifact(tmp_path, f"{prefix}-b16", ppl=2.0, knob="eval_weight_quant_bits",
+                                 value=16, attention="standard", n_layer=nl)
+        _precision_eval_artifact(tmp_path, f"{prefix}-b8", ppl=b8_ppl, knob="eval_weight_quant_bits",
+                                 value=8, attention="standard", n_layer=nl)
+
+    result = runner.invoke(cli.app, [
+        "depth-curve",
+        "--shallow-run", "s-k4", "--shallow-run", "s-k2", "--shallow-full", "s-full",
+        "--deep-run", "d-k4", "--deep-run", "d-k2", "--deep-full", "d-full",
+        "--float-shallow-run", "fs-b16", "--float-shallow-run", "fs-b8", "--float-shallow-full", "fs-full",
+        "--float-deep-run", "fd-b16", "--float-deep-run", "fd-b8", "--float-deep-full", "fd-full",
+        "--task", "hier", "--seed", "1",
+        "--artifacts-dir", str(tmp_path), "--run-id", "dc-contrast",
+    ])
+    assert result.exit_code == 0, result.output
+    r = json.loads((tmp_path / "bench" / "depth_curves" / "dc-contrast" / "summary.json").read_text())["results"]
+    # deep curve (0.25, 0.5), (0.5, 0.5), (1.0, 1.0) over window [0.25, 1.0]:
+    # 0.25*0.5 + 0.5*0.75 = 0.5 of area over span 0.75 -> 2/3
+    assert abs(r["auc_digit_deep"] - 2.0 / 3.0) < 1e-9
+    assert abs(r["digit_depth_auc_absdev"] - 1.0 / 3.0) < 1e-9
+    # float deep curve (0.25, ~0), (0.5, 1.0), (1.0, 1.0): area 0.125 + 0.5
+    # over span 0.75 -> 5/6 -> absdev 1/6
+    assert abs(r["float_depth_auc_absdev"] - 1.0 / 6.0) < 1e-6
+
+
+def test_depth_curve_hygiene_rejects_mislabeled_groups(tmp_path):
+    """Group hygiene: mixed depths in one group, soft-digit checkpoints in
+    the digit arm, and shallow >= deep all refuse loudly - a mislabeled
+    run-id must not silently corrupt the registered observable."""
+    _depth_eval_set(tmp_path, "g2", n_layer=2, ppl_full=2.0, ppl_k=2.0)
+    _depth_eval_set(tmp_path, "g8", n_layer=8, ppl_full=2.0, ppl_k=2.0)
+
+    # mixed depths inside the shallow group
+    result = runner.invoke(cli.app, [
+        "depth-curve",
+        "--shallow-run", "g2-k4", "--shallow-run", "g8-k2", "--shallow-full", "g2-full",
+        "--deep-run", "g8-k4", "--deep-full", "g8-full",
+        "--artifacts-dir", str(tmp_path), "--run-id", "dc-mixed",
+    ])
+    assert result.exit_code != 0
+
+    # soft-digit checkpoint in the digit arm (the wave-1 trap: a soft-digit
+    # eval is a channel drop, not a valuation truncation)
+    _precision_eval_artifact(tmp_path, "soft-k4", ppl=2.0, knob="ultrametric_digits_k",
+                             value=4, hard_digits=False, n_layer=2)
+    result = runner.invoke(cli.app, [
+        "depth-curve",
+        "--shallow-run", "soft-k4", "--shallow-full", "g2-full",
+        "--deep-run", "g8-k4", "--deep-full", "g8-full",
+        "--artifacts-dir", str(tmp_path), "--run-id", "dc-soft",
+    ])
+    assert result.exit_code != 0
+
+    # shallow depth must be strictly less than deep
+    result = runner.invoke(cli.app, [
+        "depth-curve",
+        "--shallow-run", "g8-k4", "--shallow-full", "g8-full",
+        "--deep-run", "g2-k4", "--deep-full", "g2-full",
+        "--artifacts-dir", str(tmp_path), "--run-id", "dc-inverted",
+    ])
+    assert result.exit_code != 0

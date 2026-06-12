@@ -5288,6 +5288,69 @@ def probe_charges(
     console.print(f"[bold green]Wrote charge-probe artifacts[/bold green] → {run_dir}")
 
 
+# ---------------------------------------------------------------------------
+# Shared curve math for the precision-axis bench commands (precision-curve,
+# depth-curve). Quality = ppl_full/ppl_point per sweep point, curves anchored
+# at (1.0, 1.0), trapezoid AUC over an explicit window normalized by span.
+# ---------------------------------------------------------------------------
+
+
+def _curve_eval_summary(artifacts_dir: Path, rid: str) -> dict[str, Any]:
+    path = artifacts_dir / "evals" / "tasks" / rid / "summary.json"
+    loaded: dict[str, Any] = json.loads(path.read_text())
+    return loaded
+
+
+def _curve_task_ppl(summary: dict[str, Any], task: str) -> float:
+    return float(summary["tasks"][task]["perplexity"]["in_range"])
+
+
+def _curve_model_config(summary: dict[str, Any], rid: str) -> dict[str, Any]:
+    mc = summary["meta"]["checkpoint"].get("model_config")
+    if not isinstance(mc, dict):
+        raise ValueError(f"{rid}: artifact does not record meta.checkpoint.model_config")
+    return mc
+
+
+def _curve_knob_points(
+    artifacts_dir: Path,
+    runs: list[str],
+    task: str,
+    knob: str,
+    denom_from: Any,
+) -> list[tuple[float, float]]:
+    pts = []
+    for rid in runs:
+        d = _curve_eval_summary(artifacts_dir, rid)
+        mc = _curve_model_config(d, rid)
+        val = mc.get(knob)
+        if val is None:
+            raise ValueError(f"{rid}: artifact does not record {knob} (run with --model-override)")
+        denom = denom_from(mc)
+        pts.append((float(val) / denom, _curve_task_ppl(d, task)))
+    return pts
+
+
+def _curve_quality(pts: list[tuple[float, float]], anchor_ppl: float) -> list[tuple[float, float]]:
+    return sorted([(f, anchor_ppl / p if p > 0 else 0.0) for f, p in pts] + [(1.0, 1.0)])
+
+
+def _curve_interp(curve: list[tuple[float, float]], f: float) -> float:
+    for (f0, q0), (f1, q1) in zip(curve, curve[1:]):
+        if f0 <= f <= f1:
+            return q0 if f1 == f0 else q0 + (q1 - q0) * (f - f0) / (f1 - f0)
+    return curve[0][1] if f < curve[0][0] else curve[-1][1]
+
+
+def _curve_auc(curve: list[tuple[float, float]], window_lo: float) -> float:
+    clipped = [(window_lo, _curve_interp(curve, window_lo))] + [(f, q) for f, q in curve if f > window_lo]
+    area = 0.0
+    for (f0, q0), (f1, q1) in zip(clipped, clipped[1:]):
+        area += (f1 - f0) * (q0 + q1) / 2.0
+    span = clipped[-1][0] - clipped[0][0]
+    return area / span if span > 0 else 0.0
+
+
 @app.command("precision-curve")
 def precision_curve(
     digit_run: Annotated[list[str], typer.Option(help="eval-tasks run-id of one digit-truncation sweep point (repeatable)")],
@@ -5314,36 +5377,15 @@ def precision_curve(
     """
     from nanochat.report import build_provenance
 
-    def _load(rid: str) -> dict[str, Any]:
-        path = artifacts_dir / "evals" / "tasks" / rid / "summary.json"
-        loaded: dict[str, Any] = json.loads(path.read_text())
-        return loaded
+    digit_anchor = _curve_task_ppl(_curve_eval_summary(artifacts_dir, digit_full), task)
+    float_anchor = _curve_task_ppl(_curve_eval_summary(artifacts_dir, float_full), task)
+    digit_pts = _curve_knob_points(
+        artifacts_dir, digit_run, task, "ultrametric_digits_k", lambda mc: float(mc.get("ultrametric_K", 8))
+    )
+    float_pts = _curve_knob_points(artifacts_dir, float_run, task, "eval_weight_quant_bits", lambda mc: 32.0)
 
-    def _ppl(d: dict[str, Any]) -> float:
-        return float(d["tasks"][task]["perplexity"]["in_range"])
-
-    def _points(runs: list[str], knob: str, denom_from: Any) -> list[tuple[float, float]]:
-        pts = []
-        for rid in runs:
-            d = _load(rid)
-            mc = (d["meta"]["checkpoint"].get("model_config") or {})
-            val = mc.get(knob)
-            if val is None:
-                raise ValueError(f"{rid}: artifact does not record {knob} (run with --model-override)")
-            denom = denom_from(mc)
-            pts.append((float(val) / denom, _ppl(d)))
-        return pts
-
-    digit_anchor = _ppl(_load(digit_full))
-    float_anchor = _ppl(_load(float_full))
-    digit_pts = _points(digit_run, "ultrametric_digits_k", lambda mc: float(mc.get("ultrametric_K", 8)))
-    float_pts = _points(float_run, "eval_weight_quant_bits", lambda mc: 32.0)
-
-    def _quality_curve(pts: list[tuple[float, float]], anchor_ppl: float) -> list[tuple[float, float]]:
-        return sorted([(f, anchor_ppl / p if p > 0 else 0.0) for f, p in pts] + [(1.0, 1.0)])
-
-    curve_digit_pts = _quality_curve(digit_pts, digit_anchor)
-    curve_float_pts = _quality_curve(float_pts, float_anchor)
+    curve_digit_pts = _curve_quality(digit_pts, digit_anchor)
+    curve_float_pts = _curve_quality(float_pts, float_anchor)
     # "At matched memory" (the registered phrase): both AUCs integrate over
     # the COMMON fraction window [max(arm minima), 1.0]. Normalizing each arm
     # over its OWN span would penalize whichever arm was swept deeper into
@@ -5351,22 +5393,8 @@ def precision_curve(
     # before any evidence was produced.
     window_lo = max(curve_digit_pts[0][0], curve_float_pts[0][0])
 
-    def _interp(curve: list[tuple[float, float]], f: float) -> float:
-        for (f0, q0), (f1, q1) in zip(curve, curve[1:]):
-            if f0 <= f <= f1:
-                return q0 if f1 == f0 else q0 + (q1 - q0) * (f - f0) / (f1 - f0)
-        return curve[0][1] if f < curve[0][0] else curve[-1][1]
-
-    def _auc(curve: list[tuple[float, float]]) -> float:
-        clipped = [(window_lo, _interp(curve, window_lo))] + [(f, q) for f, q in curve if f > window_lo]
-        area = 0.0
-        for (f0, q0), (f1, q1) in zip(clipped, clipped[1:]):
-            area += (f1 - f0) * (q0 + q1) / 2.0
-        span = clipped[-1][0] - clipped[0][0]
-        return area / span if span > 0 else 0.0
-
-    auc_digit = _auc(curve_digit_pts)
-    auc_float = _auc(curve_float_pts)
+    auc_digit = _curve_auc(curve_digit_pts, window_lo)
+    auc_float = _curve_auc(curve_float_pts, window_lo)
     curve_digit = [{"fraction": f, "quality": q} for f, q in curve_digit_pts]
     curve_float = [{"fraction": f, "quality": q} for f, q in curve_float_pts]
     ratio = auc_digit / auc_float if auc_float > 0 else float("inf")
@@ -5430,6 +5458,204 @@ def precision_curve(
             md.append(f"| {name} | {pt['fraction']:.3f} | {pt['quality']:.4f} |")
     (run_dir / "run.md").write_text("\n".join(md) + "\n")
     console.print(f"[bold green]Wrote precision-curve artifacts[/bold green] → {run_dir}")
+
+
+@app.command("depth-curve")
+def depth_curve(
+    shallow_run: Annotated[
+        list[str], typer.Option(help="digit-truncation eval run-id at the SHALLOW depth (repeatable)")
+    ],
+    deep_run: Annotated[list[str], typer.Option(help="digit-truncation eval run-id at the DEEP depth (repeatable)")],
+    shallow_full: Annotated[str, typer.Option(help="run-id of the shallow depth's FULL-precision eval (anchor)")],
+    deep_full: Annotated[str, typer.Option(help="run-id of the deep depth's FULL-precision eval (anchor)")],
+    float_shallow_run: Annotated[
+        list[str] | None, typer.Option(help="OPTIONAL float-quant eval run-id at the shallow depth (diagnostic)")
+    ] = None,
+    float_deep_run: Annotated[
+        list[str] | None, typer.Option(help="OPTIONAL float-quant eval run-id at the deep depth (diagnostic)")
+    ] = None,
+    float_shallow_full: Annotated[
+        str | None, typer.Option(help="run-id of the shallow float arm's FULL-precision eval (anchor)")
+    ] = None,
+    float_deep_full: Annotated[
+        str | None, typer.Option(help="run-id of the deep float arm's FULL-precision eval (anchor)")
+    ] = None,
+    task: Annotated[str, typer.Option(help="Task whose in-range perplexity is the quality metric")] = "hier",
+    seed: Annotated[int, typer.Option(help="Checkpoint-seed pairing this artifact represents")] = 0,
+    artifacts_dir: Annotated[Path, typer.Option(help="Artifacts root")] = Path("artifacts"),
+    run_id: Annotated[str | None, typer.Option(help="Run identifier (default: timestamp)")] = None,
+) -> None:
+    """Depth contrast of digit-truncation curves (bead 9qeq).
+
+    The flat-error lemma predicts the digit-truncation quality curve is
+    INDEPENDENT of model depth on the hard-digit path (per-layer truncation
+    errors live below digit k and cannot accumulate through depth). The
+    headline scalar is results.digit_depth_auc_absdev =
+    |AUC_digit(deep)/AUC_digit(shallow) - 1| - the preregistered observable
+    of hyp-padic-truncation-depth-independent (comparator <=). AUCs are
+    within-arm (each depth normalized to its own full-precision anchor) over
+    the common fraction window across the two depths. The float-quantization
+    depth contrast, when float runs are supplied, is recorded as
+    results.float_depth_auc_absdev - a DIAGNOSTIC for the compounding
+    contrast clause, deliberately not the adjudicated scalar. One artifact
+    per checkpoint-seed pairing (bench schema, budget-exempt).
+    """
+    from nanochat.report import build_provenance
+
+    def _digit_group(runs: list[str], full: str, label: str) -> tuple[list[tuple[float, float]], float, int]:
+        """(quality curve, anchor ppl, n_layer) for one depth's digit arm, with hygiene checks."""
+        n_layers = set()
+        for rid in [*runs, full]:
+            mc = _curve_model_config(_curve_eval_summary(artifacts_dir, rid), rid)
+            if mc.get("attention_type") != "ultrametric" or not mc.get("ultrametric_hard_digits"):
+                raise ValueError(f"{rid}: digit arm requires a hard-digit ultrametric checkpoint ({label})")
+            if not isinstance(mc.get("n_layer"), int):
+                raise ValueError(f"{rid}: artifact does not record n_layer")
+            n_layers.add(int(mc["n_layer"]))
+        if len(n_layers) != 1:
+            raise ValueError(f"{label} digit arm mixes depths {sorted(n_layers)} - one depth per group")
+        anchor = _curve_task_ppl(_curve_eval_summary(artifacts_dir, full), task)
+        pts = _curve_knob_points(
+            artifacts_dir, runs, task, "ultrametric_digits_k", lambda mc: float(mc.get("ultrametric_K", 8))
+        )
+        return _curve_quality(pts, anchor), anchor, n_layers.pop()
+
+    def _float_group(runs: list[str], full: str, label: str) -> tuple[list[tuple[float, float]], int]:
+        n_layers = set()
+        for rid in [*runs, full]:
+            mc = _curve_model_config(_curve_eval_summary(artifacts_dir, rid), rid)
+            if mc.get("attention_type") != "standard":
+                raise ValueError(f"{rid}: float arm requires a standard checkpoint ({label})")
+            if not isinstance(mc.get("n_layer"), int):
+                raise ValueError(f"{rid}: artifact does not record n_layer")
+            n_layers.add(int(mc["n_layer"]))
+        if len(n_layers) != 1:
+            raise ValueError(f"{label} float arm mixes depths {sorted(n_layers)} - one depth per group")
+        anchor = _curve_task_ppl(_curve_eval_summary(artifacts_dir, full), task)
+        pts = _curve_knob_points(artifacts_dir, runs, task, "eval_weight_quant_bits", lambda mc: 32.0)
+        return _curve_quality(pts, anchor), n_layers.pop()
+
+    curve_shallow, _, n_shallow = _digit_group(shallow_run, shallow_full, "shallow")
+    curve_deep, _, n_deep = _digit_group(deep_run, deep_full, "deep")
+    if not n_shallow < n_deep:
+        raise ValueError(f"shallow n_layer {n_shallow} must be strictly less than deep n_layer {n_deep}")
+    digit_window_lo = max(curve_shallow[0][0], curve_deep[0][0])
+    auc_digit_shallow = _curve_auc(curve_shallow, digit_window_lo)
+    auc_digit_deep = _curve_auc(curve_deep, digit_window_lo)
+    digit_absdev = abs(auc_digit_deep / auc_digit_shallow - 1.0) if auc_digit_shallow > 0 else float("inf")
+
+    float_results: dict[str, Any] = {
+        "auc_float_shallow": None,
+        "auc_float_deep": None,
+        "float_depth_auc_absdev": None,
+        "float_window_lo": None,
+    }
+    have_float = bool(float_shallow_run) and bool(float_deep_run)
+    if have_float:
+        if float_shallow_full is None or float_deep_full is None:
+            raise ValueError("float diagnostic requires both --float-shallow-full and --float-deep-full anchors")
+        fcurve_shallow, fn_shallow = _float_group(float_shallow_run or [], float_shallow_full, "shallow")
+        fcurve_deep, fn_deep = _float_group(float_deep_run or [], float_deep_full, "deep")
+        if (fn_shallow, fn_deep) != (n_shallow, n_deep):
+            raise ValueError(
+                f"float arm depths ({fn_shallow}, {fn_deep}) do not match digit arm depths ({n_shallow}, {n_deep})"
+            )
+        float_window_lo = max(fcurve_shallow[0][0], fcurve_deep[0][0])
+        auc_float_shallow = _curve_auc(fcurve_shallow, float_window_lo)
+        auc_float_deep = _curve_auc(fcurve_deep, float_window_lo)
+        float_results = {
+            "auc_float_shallow": auc_float_shallow,
+            "auc_float_deep": auc_float_deep,
+            "float_depth_auc_absdev": (
+                abs(auc_float_deep / auc_float_shallow - 1.0) if auc_float_shallow > 0 else float("inf")
+            ),
+            "float_window_lo": float_window_lo,
+        }
+
+    table = Table(title=f"depth curves — {task} (seed pairing {seed}, L{n_shallow} vs L{n_deep})", box=box.SIMPLE_HEAVY)
+    for col in ("arm", "AUC shallow", "AUC deep", "|deep/shallow - 1|"):
+        table.add_column(col, justify="right")
+    table.add_row("digit truncation", f"{auc_digit_shallow:.4f}", f"{auc_digit_deep:.4f}", f"{digit_absdev:.4f}")
+    if have_float:
+        table.add_row(
+            "float quantization (diagnostic)",
+            f"{float_results['auc_float_shallow']:.4f}",
+            f"{float_results['auc_float_deep']:.4f}",
+            f"{float_results['float_depth_auc_absdev']:.4f}",
+        )
+    console.print(table)
+
+    resolved_run_id = run_id or time.strftime("%Y%m%d_%H%M%S")
+    run_dir = artifacts_dir / "bench" / "depth_curves" / resolved_run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "schema_version": "mgr.bench.depth_curves.v1",
+        "kind": "depth-curve",
+        "mechanism": "ultrametric",
+        "meta": {
+            "run_id": resolved_run_id,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "task": task,
+            "seed": seed,
+            "device": "cpu",
+            "shallow_runs": list(shallow_run),
+            "deep_runs": list(deep_run),
+            "shallow_full": shallow_full,
+            "deep_full": deep_full,
+            "float_shallow_runs": list(float_shallow_run or []),
+            "float_deep_runs": list(float_deep_run or []),
+            "float_shallow_full": float_shallow_full,
+            "float_deep_full": float_deep_full,
+            "normalization": (
+                "within-arm: each depth's quality = own ppl_full/ppl_point over digit fractions k/K, "
+                "anchored at (1,1); AUCs integrate over the common fraction window across the two depths, "
+                "normalized by the window span; headline |AUC_deep/AUC_shallow - 1| on the digit arm only"
+            ),
+            "git": _get_git_info(),
+        },
+        "provenance": build_provenance(
+            {
+                "depth_curve": {
+                    "task": task,
+                    "seed": seed,
+                    "shallow_runs": list(shallow_run),
+                    "deep_runs": list(deep_run),
+                    "n_layer_shallow": n_shallow,
+                    "n_layer_deep": n_deep,
+                }
+            }
+        ),
+        "results": {
+            "n_layer_shallow": n_shallow,
+            "n_layer_deep": n_deep,
+            "auc_digit_shallow": auc_digit_shallow,
+            "auc_digit_deep": auc_digit_deep,
+            "digit_depth_auc_absdev": digit_absdev,
+            "digit_window_lo": digit_window_lo,
+            "curve_digit_shallow": [{"fraction": f, "quality": q} for f, q in curve_shallow],
+            "curve_digit_deep": [{"fraction": f, "quality": q} for f, q in curve_deep],
+            **float_results,
+        },
+    }
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    md = [
+        f"# depth-curve — {resolved_run_id}",
+        "",
+        f"- task {task} · seed pairing {seed} · L{n_shallow} vs L{n_deep}",
+        f"- digit AUC {auc_digit_shallow:.4f} (L{n_shallow}) vs {auc_digit_deep:.4f} (L{n_deep}) "
+        f"-> |deep/shallow - 1| = {digit_absdev:.4f}",
+    ]
+    if have_float:
+        md.append(
+            f"- float diagnostic AUC {float_results['auc_float_shallow']:.4f} vs "
+            f"{float_results['auc_float_deep']:.4f} -> absdev {float_results['float_depth_auc_absdev']:.4f}"
+        )
+    md += ["", "| arm | depth | fraction | quality |", "|---|---|---|---|"]
+    for name, nl, curve in (("digit", n_shallow, curve_shallow), ("digit", n_deep, curve_deep)):
+        for f, q in curve:
+            md.append(f"| {name} | L{nl} | {f:.3f} | {q:.4f} |")
+    (run_dir / "run.md").write_text("\n".join(md) + "\n")
+    console.print(f"[bold green]Wrote depth-curve artifacts[/bold green] → {run_dir}")
 
 
 @app.command("bench-ultrametric")
@@ -6996,7 +7222,7 @@ def _adj_collect_artifacts(roots: list[Path]) -> list[dict[str, Any]]:
                 schema = "train"
             elif sv == "mgr.chargeprobe.v1":
                 schema = "chargeprobe"
-            elif sv in ("mgr.bench.ultrametric_paths.v1", "mgr.bench.precision_curves.v1"):
+            elif sv in ("mgr.bench.ultrametric_paths.v1", "mgr.bench.precision_curves.v1", "mgr.bench.depth_curves.v1"):
                 schema = "bench"
             elif sv == 1 and data.get("kind") == "certify":
                 schema = "certify"
