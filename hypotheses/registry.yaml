@@ -1057,18 +1057,28 @@ hypotheses:
       provenance: "EPIC THEORY-I 8gk.4; theory note padic_precision.md sections 1-2"
     date_registered: "2026-06-11"
     theorem_refs: [thm-flat-error]
-    prediction: null
-    operationalization_note: >-
-      The digit-truncation half of the harness EXISTS (ultrametric_digits_k +
-      mgr eval-tasks --model-override, recorded in meta.checkpoint.model_config
-      so per-k arms are variant-selectable; bitwise parity at k=K asserted).
-      Blocked on (a) hard-digit trained ultrametric checkpoints (the e1
-      checkpoints are soft-digit: truncation there is a channel drop, not a
-      valuation truncation - exploratory perplexity-vs-k sweeps on them exist
-      under run-ids trunc-hier-ultra-*), and (b) a float-quantization
-      quality-vs-bits baseline harness for the standard arm plus an
-      area-under-curve aggregate the engine can read.
-    status: blocked
+    prediction:
+      metric_path: "bench:results.auc_ratio"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 1.1
+      baseline: null
+      min_seeds: 3
+      scale_caveats: >-
+        PROMOTED 2026-06-12 BEFORE any precision-curve artifact existed (the
+        hard-digit checkpoints were still training at promotion time; no AUC
+        had been computed for either arm). Single-arm bench prediction on
+        mgr.bench.precision_curves.v1: auc_ratio = AUC_digit / AUC_float,
+        both integrated over the COMMON memory-fraction window (matched
+        memory; window recorded per artifact), quality = ppl_full/ppl_point,
+        one artifact per checkpoint-seed pairing (>= 3 pairings). Threshold
+        1.1: the digit arm must retain at least 10% more area - a real
+        margin, not noise. Protocol: hard-digit ultrametric checkpoints
+        (e1-hard campaign) swept over ultrametric_digits_k in {6,4,2,1}, e1
+        standard checkpoints swept over eval_weight_quant_bits in {8,6,4,3,2},
+        both at examples=24 x 3 eval seeds on hier; evidence runs from a
+        clean tree.
+    status: open
     evidence: []
     verdict_history: []
 
