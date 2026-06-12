@@ -5342,8 +5342,12 @@ def _curve_interp(curve: list[tuple[float, float]], f: float) -> float:
     return curve[0][1] if f < curve[0][0] else curve[-1][1]
 
 
-def _curve_auc(curve: list[tuple[float, float]], window_lo: float) -> float:
-    clipped = [(window_lo, _curve_interp(curve, window_lo))] + [(f, q) for f, q in curve if f > window_lo]
+def _curve_auc(curve: list[tuple[float, float]], window_lo: float, window_hi: float = 1.0) -> float:
+    clipped = (
+        [(window_lo, _curve_interp(curve, window_lo))]
+        + [(f, q) for f, q in curve if window_lo < f < window_hi]
+        + [(window_hi, _curve_interp(curve, window_hi))]
+    )
     area = 0.0
     for (f0, q0), (f1, q1) in zip(clipped, clipped[1:]):
         area += (f1 - f0) * (q0 + q1) / 2.0
@@ -5359,6 +5363,16 @@ def precision_curve(
     float_full: Annotated[str, typer.Option(help="run-id of the float arm's FULL-precision eval (the anchor)")],
     task: Annotated[str, typer.Option(help="Task whose in-range perplexity is the quality metric")] = "hier",
     seed: Annotated[int, typer.Option(help="Checkpoint-seed pairing this artifact represents (one artifact per seed)")] = 0,
+    window_hi: Annotated[
+        float,
+        typer.Option(
+            help=(
+                "Upper edge of the AUC window (default 1.0 = full axis). A registered sub-1.0 edge isolates the "
+                "deep-compression region where graceful-vs-cliff actually discriminates (bead kgj1: the tcuy "
+                "refutation showed full-axis AUC dilutes a narrow cliff with the wide near-lossless region)."
+            )
+        ),
+    ] = 1.0,
     artifacts_dir: Annotated[Path, typer.Option(help="Artifacts root")] = Path("artifacts"),
     run_id: Annotated[str | None, typer.Option(help="Run identifier (default: timestamp)")] = None,
 ) -> None:
@@ -5371,7 +5385,8 @@ def precision_curve(
     the weights), computes quality = ppl_full / ppl_point per point, and the
     trapezoid AUC per arm anchored at (1.0, 1.0). The headline scalar is
     results.auc_ratio = AUC_digit / AUC_float - the preregistered
-    graceful-vs-cliff observable of hyp-padic-truncation-graceful. One
+    graceful-vs-cliff observable of hyp-padic-truncation-graceful (and, over
+    the registered deep window via --window-hi, of its K=16 successor). One
     artifact per checkpoint-seed pairing: the verdict engine counts each as
     one observation (bench schema, budget-exempt).
     """
@@ -5387,14 +5402,16 @@ def precision_curve(
     curve_digit_pts = _curve_quality(digit_pts, digit_anchor)
     curve_float_pts = _curve_quality(float_pts, float_anchor)
     # "At matched memory" (the registered phrase): both AUCs integrate over
-    # the COMMON fraction window [max(arm minima), 1.0]. Normalizing each arm
-    # over its OWN span would penalize whichever arm was swept deeper into
-    # compression - a bias in the registered direction, caught in review
-    # before any evidence was produced.
+    # the COMMON fraction window [max(arm minima), window_hi]. Normalizing
+    # each arm over its OWN span would penalize whichever arm was swept
+    # deeper into compression - a bias in the registered direction, caught
+    # in review before any evidence was produced.
     window_lo = max(curve_digit_pts[0][0], curve_float_pts[0][0])
+    if not window_lo < window_hi <= 1.0:
+        raise ValueError(f"window must satisfy lo < hi <= 1.0, got [{window_lo}, {window_hi}]")
 
-    auc_digit = _curve_auc(curve_digit_pts, window_lo)
-    auc_float = _curve_auc(curve_float_pts, window_lo)
+    auc_digit = _curve_auc(curve_digit_pts, window_lo, window_hi)
+    auc_float = _curve_auc(curve_float_pts, window_lo, window_hi)
     curve_digit = [{"fraction": f, "quality": q} for f, q in curve_digit_pts]
     curve_float = [{"fraction": f, "quality": q} for f, q in curve_float_pts]
     ratio = auc_digit / auc_float if auc_float > 0 else float("inf")
@@ -5426,19 +5443,33 @@ def precision_curve(
             "float_full": float_full,
             "normalization": (
                 "digits: k/K of the digit path; float: bits/32 of weights; quality = ppl_full/ppl_point; "
-                "both AUCs integrate over the COMMON fraction window [max(arm minima), 1.0] (matched memory), "
-                "anchored at (1,1), normalized by the window span"
+                f"both AUCs integrate over the COMMON fraction window [max(arm minima), {window_hi}] "
+                "(matched memory), anchored at (1,1), normalized by the window span"
             ),
             "git": _get_git_info(),
         },
         "provenance": build_provenance(
-            {"precision_curve": {"task": task, "seed": seed, "digit_runs": list(digit_run), "float_runs": list(float_run)}}
+            {
+                "precision_curve": {
+                    "task": task,
+                    "seed": seed,
+                    "digit_runs": list(digit_run),
+                    "float_runs": list(float_run),
+                    "window_hi": window_hi,
+                }
+            }
         ),
         "results": {
             "auc_digit": auc_digit,
             "auc_float": auc_float,
-            "auc_ratio": ratio,
+            # The headline ratio's KEY encodes the window protocol: bench arm
+            # matching has no variant selectors (engine matches on mechanism
+            # only), so full-axis and deep-window artifacts must expose
+            # DISJOINT observables or re-adjudication would pool them across
+            # hypotheses - the campaign-killer caught at kgj1 registration.
+            ("auc_ratio" if window_hi >= 1.0 else "auc_ratio_deepwindow"): ratio,
             "common_window_lo": window_lo,
+            "common_window_hi": window_hi,
             "curve_digit": curve_digit,
             "curve_float": curve_float,
         },

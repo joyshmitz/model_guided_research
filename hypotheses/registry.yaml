@@ -1084,6 +1084,67 @@ hypotheses:
     verdict_history:
       - {date: "2026-06-12", verdict: refuted, artifacts: ["artifacts/bench/precision_curves/precision-curve-hier-s0/summary.json", "artifacts/bench/precision_curves/precision-curve-hier-s1/summary.json", "artifacts/bench/precision_curves/precision-curve-hier-s2/summary.json"], adjudicator: "engine:ci-v3", policy_version: "ci-v3", arms: {"ultrametric": {"budget_flops": null, "ci95": [0.9898370472716761, 1.0449290014920798], "effect": 1.017383024381878, "n_baseline": 0, "n_candidate": 3, "single_arm": true, "verdict": "refuted"}}}
 
+  - id: hyp-padic-truncation-graceful-k16
+    statement: >-
+      At DEEP compression (memory fractions in [1/16, 1/4]), digit truncation
+      on hard-digit ultrametric checkpoints trained with K=16 digits retains
+      quality while float weight quantization of the standard baseline
+      collapses below 4 bits: the flat-error lemma protects valuation
+      truncation at fine digit resolution exactly where float rounding
+      compounds catastrophically - quantified as the common-window AUC ratio
+      over the registered deep window.
+    mechanisms: [ultrametric]
+    source:
+      kind: model
+      provenance: >-
+        bead kgj1 (discovered-from tcuy's refutation: the K=8 digit floor 1/8
+        sat above the float cliff at 3/32 and 1/16, so the registered
+        full-axis window could not see the divergence)
+    date_registered: "2026-06-12"
+    theorem_refs: [thm-flat-error]
+    prediction:
+      metric_path: "bench:results.auc_ratio_deepwindow"
+      comparator: ">="
+      threshold_kind: absolute_delta
+      threshold: 1.2
+      baseline: null
+      min_seeds: 3
+      scale_caveats: >-
+        REGISTERED 2026-06-12 BEFORE any K=16 checkpoint or eval existed.
+        ASYMMETRIC-KNOWLEDGE DISCLOSURE: the float arm's cliff is ALREADY
+        KNOWN from the tcuy campaign (b3 ppl 17, b2 ppl 82k on the e1
+        standard checkpoints, whose clean artifacts quant-hier-std-sN-* and
+        -full anchors are REUSED here); the falsifiable content is the K=16
+        digit arm, fully unseen at registration: (1) hard-digit K=16
+        training must reach usable quality at the E1 rung, and (2)
+        truncation must stay graceful down to k=1 (fraction 1/16) where
+        float sits at its cliff. If digit truncation cliffs at fine K the
+        ratio lands near 1.0 and the 1.2 threshold refutes. Protocol: 3
+        hard-digit ultrametric seeds at L4/D128@1e14 with --ultrametric-K 16
+        (campaign topic e1-hard-k16, frozen worktree); digit sweep k in
+        {12,8,4,2,1} + full anchor at examples=24 x 3 eval seeds on hier;
+        precision-curve artifacts with --window-hi 0.25 (deep window
+        [max(arm minima)=1/16, 1/4], fixed a priori - the tcuy lesson is
+        that full-axis AUC dilutes a narrow cliff with the wide
+        near-lossless region). Threshold 1.2: the K=8 float data projects
+        ratio ~1.45 if the digit arm is flat and ~1.0 if it cliffs; 1.2
+        splits the modes with margin on both sides. Evidence from a clean
+        tree. POOL DISJOINTNESS: bench arm matching has no variant
+        selectors, so deep-window artifacts expose the ratio under the
+        DISTINCT key results.auc_ratio_deepwindow (and omit auc_ratio);
+        neither this hypothesis nor the refuted full-axis one can ingest
+        the other's artifacts under any re-adjudication. Run-ids
+        precision-curve-hier-k16-* for human disambiguation.
+    operationalization_note: >-
+      Harness complete at registration: --ultrametric-K (train),
+      ultrametric_digits_k override + model_config recording (eval),
+      precision-curve --window-hi (bench artifact), engine bench ingestion.
+      Float-arm artifacts exist and are clean; the digit arm awaits the
+      e1-hard-k16 campaign.
+    status: open
+    evidence: []
+    verdict_history: []
+
   - id: hyp-hensel-curriculum-parity
     statement: >-
       Hensel-lift digit curricula (train digit-0..j-1 structure, freeze the

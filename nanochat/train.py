@@ -627,6 +627,9 @@ def train(args) -> None:
             ultra_hard = getattr(args, "ultrametric_hard_digits", None)
             if ultra_hard is not None:
                 config.ultrametric_hard_digits = bool(ultra_hard)
+            ultra_k = getattr(args, "ultrametric_K", None)
+            if ultra_k is not None:
+                config.ultrametric_K = int(ultra_k)
         if config.attention_type == "braid":
             config.braid_mode = str(getattr(args, "braid_mode", config.braid_mode))
             config.braid_tau = float(getattr(args, "braid_tau", config.braid_tau))
@@ -1877,6 +1880,16 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Ultrametric attention only: quantize digits before computing LCP weights (default: off).",
+    )
+    parser.add_argument(
+        "--ultrametric-K",
+        dest="ultrametric_K",
+        type=int,
+        default=None,
+        help=(
+            "Ultrametric attention only: number of p-adic digits K (default: GPTConfig.ultrametric_K = 8). "
+            "Finer K extends the digit-truncation memory-fraction axis downward (k=1 reaches 1/K; bead kgj1)."
+        ),
     )
     parser.add_argument(
         "--tropical-gauge-fix",

@@ -965,6 +965,52 @@ def test_precision_curve_common_window_kills_span_bias(tmp_path):
     assert abs(r["auc_ratio"] - 1.0) < 1e-6
 
 
+def test_precision_curve_window_hi_isolates_deep_compression(tmp_path):
+    """kgj1: a registered sub-1.0 window edge keeps the wide near-lossless
+    region from diluting the cliff. Hand-computable: digit flat at 1.0 over
+    [0.25, 0.5] -> AUC 1; float collapses at 0.0625 and recovers by 0.5, so
+    over the window its interpolated AUC is 5/7 -> ratio exactly 7/5."""
+    _precision_eval_artifact(tmp_path, "dfull3", ppl=2.0)
+    _precision_eval_artifact(tmp_path, "ffull3", ppl=2.0)
+    _precision_eval_artifact(tmp_path, "d3-k4", ppl=2.0, knob="ultrametric_digits_k", value=4)
+    _precision_eval_artifact(tmp_path, "d3-k2", ppl=2.0, knob="ultrametric_digits_k", value=2)
+    _precision_eval_artifact(tmp_path, "f3-b16", ppl=2.0, knob="eval_weight_quant_bits", value=16)
+    _precision_eval_artifact(tmp_path, "f3-b2", ppl=2.0e9, knob="eval_weight_quant_bits", value=2)
+
+    result = runner.invoke(cli.app, [
+        "precision-curve",
+        "--digit-run", "d3-k4", "--digit-run", "d3-k2",
+        "--float-run", "f3-b16", "--float-run", "f3-b2",
+        "--digit-full", "dfull3", "--float-full", "ffull3",
+        "--task", "hier", "--seed", "2", "--window-hi", "0.5",
+        "--artifacts-dir", str(tmp_path), "--run-id", "pc-deepwin",
+    ])
+    assert result.exit_code == 0, result.output
+    r = json.loads((tmp_path / "bench" / "precision_curves" / "pc-deepwin" / "summary.json").read_text())["results"]
+    assert (r["common_window_lo"], r["common_window_hi"]) == (0.25, 0.5)
+    assert abs(r["auc_digit"] - 1.0) < 1e-9
+    assert abs(r["auc_float"] - 5.0 / 7.0) < 1e-6, r["auc_float"]
+    # deep-window artifacts expose a DISJOINT observable key: bench arm
+    # matching has no variant selectors, so the full-axis hypothesis and the
+    # deep-window one must not be able to ingest each other's artifacts
+    assert "auc_ratio" not in r
+    assert abs(r["auc_ratio_deepwindow"] - 7.0 / 5.0) < 1e-6
+    arts = cli._adj_collect_artifacts([tmp_path / "bench"])
+    assert cli._adj_observations(arts[0], "results.auc_ratio") is None
+    assert cli._adj_observations(arts[0], "results.auc_ratio_deepwindow")
+
+    # a window edge at or below the data-dependent lo refuses loudly
+    result = runner.invoke(cli.app, [
+        "precision-curve",
+        "--digit-run", "d3-k4", "--digit-run", "d3-k2",
+        "--float-run", "f3-b16", "--float-run", "f3-b2",
+        "--digit-full", "dfull3", "--float-full", "ffull3",
+        "--task", "hier", "--seed", "2", "--window-hi", "0.25",
+        "--artifacts-dir", str(tmp_path), "--run-id", "pc-badwin",
+    ])
+    assert result.exit_code != 0
+
+
 # ---------------------------------------------------------------------------
 # 9qeq: depth-curve artifacts (hyp-padic-truncation-depth-independent)
 
