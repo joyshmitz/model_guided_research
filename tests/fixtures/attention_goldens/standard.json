@@ -17,6 +17,7 @@
     "compile_flex_attention": false,
     "compile_fullgraph": false,
     "compile_mode": null,
+    "eval_weight_quant_bits": null,
     "ffn_beta": null,
     "ffn_type": "standard",
     "n_embd": 64,
