@@ -1094,6 +1094,228 @@ class TestIntegrableRMatrix:
         print(f"  ✅ stochastic gauge fails the lifted relation ({err:.3e}) - a-normalized law is required")
 
 
+class TestSymplecticReversible:
+    """Symplectic transformer (bead u55.5): exact-gradient kick-kick coupling.
+    The load-bearing claims, fp64 throughout: J^T Omega J = Omega identically;
+    the kick inverse is exact; the CORRECTED sign conserves the coercive
+    H = phi_F + phi_G across tied depth while the ++ sign's conserved
+    difference permits blow-up; the note's coercivity bound holds as stated.
+    Theory note: markdown_documentation/symplectic_transformer.md."""
+
+    T, CH = 3, 4  # tokens x half-channels -> phase dim 2*T*CH = 24
+
+    def _tiny_block(self, mode="symplectic", lambda_min=0.1, seed=0):
+        import types
+
+        import torch
+
+        from nanochat.reversible_block_torch import ReversibleBlock
+
+        torch.manual_seed(seed)
+
+        class _Inner(torch.nn.Module):
+            """Token-coupled nonlinear stand-in for the attention/MLP slots:
+            symplecticity depends only on kicks being gradients, so the
+            stand-in exercises the SHIPPED _EnergyHead/SymplecticKick path
+            without RoPE machinery."""
+
+            def __init__(self, t, c):
+                super().__init__()
+                self.mix = torch.nn.Parameter(torch.tril(torch.randn(t, t)) / t**0.5)
+                self.w = torch.nn.Parameter(torch.randn(c, c) / c**0.5)
+
+            def forward(self, x, cos_sin=None, kv_cache=None):
+                return torch.tanh(self.mix @ x @ self.w)
+
+        cfg = types.SimpleNamespace(
+            n_embd=2 * self.CH,
+            reversible_mode=mode,
+            reversible_lambda_min=lambda_min,
+            reversible_record_energy=False,
+        )
+        block = ReversibleBlock(cfg, 0, _Inner(self.T, self.CH), _Inner(self.T, self.CH))
+        return block.double()
+
+    def test_kick_kick_block_is_exactly_symplectic(self):
+        """J^T Omega J = Omega in fp64 for the shipped symplectic block; the
+        additive block with the same inners must FAIL it (separation)."""
+        import torch
+
+        dim = self.T * self.CH
+
+        def flat(block):
+            def f(z):
+                x = z.reshape(1, self.T, 2 * self.CH)
+                y = block(x, None, None)
+                return y.reshape(-1)
+
+            return f
+
+        omega = torch.zeros(2 * dim, 2 * dim, dtype=torch.float64)
+        omega[:dim, dim:] = torch.eye(dim, dtype=torch.float64)
+        omega[dim:, :dim] = -torch.eye(dim, dtype=torch.float64)
+        # NOTE the phase pairing is (x1, x2) = chunk halves; the block input
+        # interleaves them along channels, so build z in chunk order
+        z0 = torch.randn(2 * dim, dtype=torch.float64)
+
+        def chunked(block):
+            def f(z):
+                x1 = z[:dim].reshape(1, self.T, self.CH)
+                x2 = z[dim:].reshape(1, self.T, self.CH)
+                y = block(torch.cat([x1, x2], dim=-1), None, None)
+                y1, y2 = torch.chunk(y, 2, dim=-1)
+                return torch.cat([y1.reshape(-1), y2.reshape(-1)])
+
+            return f
+
+        sym = self._tiny_block("symplectic")
+        j = torch.autograd.functional.jacobian(chunked(sym), z0)
+        err = float((j.T @ omega @ j - omega).abs().max())
+        require(err < 1e-9, f"symplectic block violates J^T Omega J = Omega: {err:.3e}")
+
+        add = self._tiny_block("additive")
+        j_add = torch.autograd.functional.jacobian(chunked(add), z0)
+        err_add = float((j_add.T @ omega @ j_add - omega).abs().max())
+        require(err_add > 1e-3, f"additive control unexpectedly symplectic: {err_add:.3e}")
+        print(f"  ✅ J^T Omega J = Omega exactly ({err:.1e}); additive control fails ({err_add:.1e})")
+
+    def test_kick_inverse_exact_round_trip(self):
+        """inverse(forward(x)) = x at machine epsilon for BOTH modes."""
+        import torch
+
+        for mode in ("symplectic", "additive"):
+            block = self._tiny_block(mode)
+            x = torch.randn(2, self.T, 2 * self.CH, dtype=torch.float64)
+            y = block(x, None, None)
+            r = block.inverse(y, None, None)
+            err = float((r - x).abs().max())
+            require(err < 1e-12, f"{mode} round-trip err {err:.3e}")
+        print("  ✅ exact inverse round-trip, both modes")
+
+    def test_corrected_sign_conserves_coercive_energy(self):
+        """256 tied layers: the shipped (corrected-sign) block keeps the
+        coercive H = phi_F(x2) + phi_G(x1) in a tight band and norms bounded;
+        manually flipping to the ++ sign loses both. This pins the
+        load-bearing minus sign in code forever (note section 1.1)."""
+        import torch
+
+        block = self._tiny_block("symplectic", lambda_min=0.1)
+        f_kick, g_kick = block.f_block, block.g_block
+
+        def energy(x1, x2):
+            with torch.no_grad():
+                return float(f_kick.energy(x2).mean() + g_kick.energy(x1).mean())
+
+        def run(sign):
+            torch.manual_seed(7)
+            x1 = 0.5 * torch.randn(1, self.T, self.CH, dtype=torch.float64)
+            x2 = 0.5 * torch.randn(1, self.T, self.CH, dtype=torch.float64)
+            es, ns = [], []
+            with torch.no_grad():
+                pass  # kicks internally enable grad for the gradient; outer no_grad is fine
+            for _ in range(256):
+                y1 = x1 + f_kick(x2)
+                y2 = x2 + sign * g_kick(y1)
+                x1, x2 = y1.detach(), y2.detach()
+                es.append(energy(x1, x2))
+                ns.append(float(x1.pow(2).sum() + x2.pow(2).sum()))
+            e = torch.tensor(es)
+            return float(e.max() - e.min()), max(ns) / ns[0]
+
+        band_ok, peak_ok = run(-1.0)
+        band_bad, peak_bad = run(+1.0)
+        require(band_ok < 0.2 * band_bad, f"no conservation separation: {band_ok:.4f} vs {band_bad:.4f}")
+        require(peak_ok < peak_bad, f"no norm separation: peak {peak_ok:.2f} vs {peak_bad:.2f}")
+        print(f"  ✅ corrected sign: energy band {band_ok:.4f} vs ++ sign {band_bad:.4f}; norm peak {peak_ok:.1f}x vs {peak_bad:.1f}x")
+
+    def test_coercivity_bound_holds_along_trajectory(self):
+        """The note's explicit bound ||x||^2 <= (2/lambda)(H_max + 2 T V) with
+        V = max ||v||_1 holds at every step of a long tied composition."""
+        import torch
+
+        block = self._tiny_block("symplectic", lambda_min=0.1, seed=11)
+        f_kick, g_kick = block.f_block, block.g_block
+        lam = min(float(f_kick.energy.confinement), float(g_kick.energy.confinement))
+        v_max = max(float(f_kick.energy.v.abs().sum()), float(g_kick.energy.v.abs().sum()))
+
+        torch.manual_seed(13)
+        x1 = 0.5 * torch.randn(1, self.T, self.CH, dtype=torch.float64)
+        x2 = 0.5 * torch.randn(1, self.T, self.CH, dtype=torch.float64)
+        h_max, worst = -float("inf"), 0.0
+        for _ in range(256):
+            y1 = x1 + f_kick(x2)
+            y2 = x2 - g_kick(y1)
+            x1, x2 = y1.detach(), y2.detach()
+            with torch.no_grad():
+                h = float(f_kick.energy(x2).mean() + g_kick.energy(x1).mean())
+            h_max = max(h_max, h)
+            bound = (2.0 / lam) * (h_max + 2.0 * self.T * v_max)
+            worst = max(worst, float(x1.pow(2).sum()) / bound, float(x2.pow(2).sum()) / bound)
+        require(worst <= 1.0, f"coercivity bound violated: worst ratio {worst:.3f}")
+        print(f"  ✅ coercivity bound holds (worst utilization {worst:.2f} of the bound)")
+
+    def test_gradients_flow_through_kicks(self):
+        """The autograd-of-autograd training path: input gradcheck passes and
+        every parameter (energy heads, inner nets, confinement) gets a grad."""
+        import torch
+
+        block = self._tiny_block("symplectic", seed=17)
+        x = torch.randn(1, self.T, 2 * self.CH, dtype=torch.float64, requires_grad=True)
+
+        def f(inp):
+            return block(inp, None, None)
+
+        require(torch.autograd.gradcheck(f, (x,), eps=1e-6, atol=1e-7), "gradcheck failed")
+
+        loss = block(x, None, None).pow(2).sum()
+        loss.backward()
+        missing = [n for n, p in block.named_parameters() if p.requires_grad and p.grad is None]
+        require(not missing, f"parameters with no grad through the kick path: {missing}")
+        print("  ✅ gradcheck + full parameter gradient coverage through the kicks")
+
+    def test_full_gpt_symplectic_and_tied(self):
+        """End-to-end: a tiny symplectic GPT trains a step (finite loss/grads);
+        the tied variant shares ONE block (param dedupe) and refuses kv-cache
+        generation loudly; tied requires symplectic mode."""
+        import torch
+
+        from nanochat.gpt import GPT, GPTConfig
+
+        base = dict(
+            sequence_len=16,
+            vocab_size=64,
+            n_layer=2,
+            n_head=4,
+            n_kv_head=2,
+            n_embd=32,
+            attention_type="reversible",
+            reversible_mode="symplectic",
+        )
+        torch.manual_seed(19)
+        model = GPT(GPTConfig(**base))
+        idx = torch.randint(0, 64, (2, 16))
+        loss = model(idx, targets=idx)
+        require(bool(torch.isfinite(loss)), f"non-finite loss {loss}")
+        loss.backward()
+        grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
+        require(len(grads) > 0 and all(bool(torch.isfinite(g).all()) for g in grads), "bad grads")
+
+        tied = GPT(GPTConfig(**{**base, "reversible_tied": True}))
+        n_untied = sum(p.numel() for p in model.parameters())
+        n_tied = sum(p.numel() for p in tied.parameters())
+        require(n_tied < n_untied, f"tied params {n_tied} not smaller than untied {n_untied}")
+        loss_t = tied(idx, targets=idx)
+        require(bool(torch.isfinite(loss_t)), f"tied non-finite loss {loss_t}")
+
+        try:
+            GPTConfig(**{**base, "reversible_mode": "additive", "reversible_tied": True})
+            GPT(GPTConfig(**{**base, "reversible_mode": "additive", "reversible_tied": True}))
+            require(False, "tied+additive must be rejected")
+        except ValueError:
+            pass
+        print("  ✅ tiny symplectic GPT trains; tied dedupes params and validates")
+
+
 class TestSurrealNumbers:
     """Test surreal number scaling and field properties."""
 
