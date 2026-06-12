@@ -1158,9 +1158,10 @@ hypotheses:
       precision-curve --window-hi (bench artifact), engine bench ingestion.
       Float-arm artifacts exist and are clean; the digit arm awaits the
       e1-hard-k16 campaign.
-    status: open
+    status: supported
     evidence: []
-    verdict_history: []
+    verdict_history:
+      - {date: "2026-06-12", verdict: supported, artifacts: ["artifacts/bench/precision_curves/precision-curve-hier-k16-s0/summary.json", "artifacts/bench/precision_curves/precision-curve-hier-k16-s1/summary.json", "artifacts/bench/precision_curves/precision-curve-hier-k16-s2/summary.json"], adjudicator: "engine:ci-v4", policy_version: "ci-v4", arms: {"ultrametric": {"budget_flops": null, "ci95": [1.3709658652645031, 1.4956718227049985], "effect": 1.4333188439847508, "n_baseline": 0, "n_candidate": 3, "n_for_80pct": 2, "p_value": 0.0019178202073149952, "power": 1.0, "single_arm": true, "verdict": "supported"}}}
 
   - id: hyp-hensel-curriculum-parity
     statement: >-
