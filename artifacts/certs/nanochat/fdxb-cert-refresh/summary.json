@@ -1,0 +1,125 @@
+{
+  "checks": [
+    {
+      "check": "causality_no_future_grad",
+      "comparator": "le",
+      "detail": "max |d y[t] / d x[t+k]| over t in {0, T/2, T-2}, k >= 1 (must be exactly 0); inf = vacuity guard tripped (output has no input dependence at all)",
+      "duration_ms": 241.216,
+      "family": "causality",
+      "measured": 0.0,
+      "mechanism": "tropical",
+      "status": "pass",
+      "tolerance": 1e-12
+    },
+    {
+      "check": "causality_no_future_grad",
+      "comparator": "le",
+      "detail": "max |d y[t] / d x[t+k]| over t in {0, T/2, T-2}, k >= 1 (must be exactly 0); inf = vacuity guard tripped (output has no input dependence at all)",
+      "duration_ms": 113.091,
+      "family": "causality",
+      "measured": 0.0,
+      "mechanism": "ultrametric",
+      "status": "pass",
+      "tolerance": 1e-12
+    },
+    {
+      "check": "lipschitz_1_sup_norm_q",
+      "comparator": "le",
+      "detail": "sup-norm output change / eps under q-perturbation",
+      "duration_ms": 22.439,
+      "family": "classical",
+      "measured": 0.9885647892951965,
+      "mechanism": "tropical",
+      "status": "pass",
+      "tolerance": 1.000001
+    },
+    {
+      "check": "lipschitz_1_sup_norm_v",
+      "comparator": "le",
+      "detail": "sup-norm output change / eps under v-perturbation",
+      "duration_ms": 34.076,
+      "family": "classical",
+      "measured": 0.9885609149932861,
+      "mechanism": "tropical",
+      "status": "pass",
+      "tolerance": 1.000001
+    },
+    {
+      "check": "score_center_pure_gauge_shift",
+      "comparator": "le",
+      "detail": "centering must shift outputs by a per-query constant only",
+      "duration_ms": 14.475,
+      "family": "classical",
+      "measured": 4.76837158203125e-07,
+      "mechanism": "tropical",
+      "status": "pass",
+      "tolerance": 1e-05
+    },
+    {
+      "check": "margin_matches_bruteforce",
+      "comparator": "le",
+      "detail": "recorded gamma vs sort-based runner-up gap (+ count of inf mismatches)",
+      "duration_ms": 5.712,
+      "family": "classical",
+      "measured": 0.0,
+      "mechanism": "tropical",
+      "status": "pass",
+      "tolerance": 1e-06
+    },
+    {
+      "check": "ffn_lipschitz_1_sup_norm",
+      "comparator": "le",
+      "detail": "pure max-plus FFN, fp64: sup-norm output change / input change (thm-maxplus-ffn-lipschitz)",
+      "duration_ms": 3.808,
+      "family": "classical",
+      "measured": 0.95280694427139,
+      "mechanism": "tropical",
+      "status": "pass",
+      "tolerance": 1.000000001
+    },
+    {
+      "check": "ffn_collapse_single_layer",
+      "comparator": "le",
+      "detail": "two-stage pure stack equals its collapsed tropical-affine map, fp64 (thm-maxplus-ffn-collapse)",
+      "duration_ms": 11.138,
+      "family": "classical",
+      "measured": 2.220446049250313e-16,
+      "mechanism": "tropical",
+      "status": "pass",
+      "tolerance": 1e-09
+    },
+    {
+      "check": "strong_triangle_inequality_lcp",
+      "comparator": "le",
+      "detail": "lcp(x,z) >= min(lcp(x,y), lcp(y,z)) over all triples (exact, integer)",
+      "duration_ms": 33.567,
+      "family": "classical",
+      "measured": 0.0,
+      "mechanism": "ultrametric",
+      "status": "pass",
+      "tolerance": 0.0
+    }
+  ],
+  "counts": {
+    "error": 0,
+    "fail": 0,
+    "pass": 9
+  },
+  "device": "cpu",
+  "dtype": "fp32",
+  "duration_s": 2.71,
+  "git": {
+    "branch": "HEAD",
+    "commit": "043db2c",
+    "commit_full": "043db2c49c66edd02bee6fd2586e7737d1378c27",
+    "dirty": false
+  },
+  "kind": "certify",
+  "mechanisms": [
+    "tropical",
+    "ultrametric"
+  ],
+  "run_id": "fdxb-cert-refresh",
+  "schema_version": 1,
+  "seed": 42
+}
