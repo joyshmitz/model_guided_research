@@ -332,6 +332,35 @@ def _collect_braid_charge_stats(model: torch.nn.Module) -> dict[str, Any] | None
     return stats
 
 
+def _collect_symplectic_energy_stats(model: torch.nn.Module) -> dict[str, Any] | None:
+    """Drain the per-layer shadow-energy traces from reversible blocks (bead
+    u55.5). A TIED block appears once in modules() but its trace carries one
+    entry per layer call, so dedupe by identity and concatenate traces in
+    call order. The across-layer band of the shadow energy within one step is
+    the conservation observable (tied: the same symplectic map iterated)."""
+    seen: set[int] = set()
+    entries: list[dict[str, float]] = []
+    for module in model.modules():
+        drain = getattr(module, "drain_energy_trace", None)
+        if drain is None or id(module) in seen:
+            continue
+        seen.add(id(module))
+        entries.extend(drain())
+    finite = [e for e in entries if math.isfinite(e.get("shadow_energy", float("nan")))]
+    if not finite:
+        return None
+    energies = [e["shadow_energy"] for e in finite]
+    x_norms = [e["x1_norm"] + e["x2_norm"] for e in finite]
+    lams = [0.5 * (e["lambda_f"] + e["lambda_g"]) for e in finite]
+    return {
+        "shadow_energy_mean": sum(energies) / len(energies),
+        "energy_band_layers": max(energies) - min(energies),
+        "x_norm_mean": sum(x_norms) / len(x_norms),
+        "lambda_mean": sum(lams) / len(lams),
+        "layers_recorded": len(finite),
+    }
+
+
 def _collect_tropical_margin_stats(model: torch.nn.Module) -> dict[str, Any] | None:
     """Collect latest tropical margin stats from attention modules (if enabled)."""
     transformer = getattr(model, "transformer", None)
@@ -654,6 +683,17 @@ def train(args) -> None:
             ultra_k = getattr(args, "ultrametric_K", None)
             if ultra_k is not None:
                 config.ultrametric_K = int(ultra_k)
+        if config.attention_type == "reversible":
+            config.reversible_mode = str(getattr(args, "reversible_mode", config.reversible_mode))
+            rev_tied = getattr(args, "reversible_tied", None)
+            if rev_tied is not None:
+                config.reversible_tied = bool(rev_tied)
+            rev_lam = getattr(args, "reversible_lambda_min", None)
+            if rev_lam is not None:
+                config.reversible_lambda_min = float(rev_lam)
+            rev_energy = getattr(args, "reversible_record_energy", None)
+            if rev_energy is not None:
+                config.reversible_record_energy = bool(rev_energy)
         if config.attention_type == "braid":
             config.braid_mode = str(getattr(args, "braid_mode", config.braid_mode))
             config.braid_tau = float(getattr(args, "braid_tau", config.braid_tau))
@@ -1213,6 +1253,12 @@ def train(args) -> None:
     # train artifact alone (metrics.jsonl streams are not engine-readable).
     route_coverage_first: float | None = None
     route_coverage_last: float | None = None
+    # Shadow-energy trend trackers (bead u55.5): first/final mean shadow
+    # energy and final activation norm, promoted into the summary so the
+    # symplectic no-norm program's diagnostics are engine-readable.
+    symplectic_energy_first: float | None = None
+    symplectic_energy_last: float | None = None
+    symplectic_x_norm_last: float | None = None
     # Live semiring beta at the most recent step (bead y2h9): recorded into
     # every checkpoint meta (semiring_beta_live) and the summary
     # (results.semiring_beta_final) so post-hoc loaders reconstruct annealed
@@ -1518,6 +1564,24 @@ def train(args) -> None:
                                 record["braid_eta_per_layer"] = braid_stats["eta_per_layer"]
                             if "rapidity_span_per_layer" in braid_stats:
                                 record["braid_rapidity_span_per_layer"] = braid_stats["rapidity_span_per_layer"]
+                    if (
+                        model_type == "gpt"
+                        and getattr(config, "attention_type", None) == "reversible"
+                        and getattr(config, "reversible_record_energy", False)
+                    ):
+                        # D2 schema gains the shadow-energy telemetry (u55.5):
+                        # the across-layer band of the conserved H-tilde plus
+                        # activation norms and the live confinement lambda.
+                        sym_stats = _collect_symplectic_energy_stats(raw_model)
+                        if sym_stats is not None:
+                            record["symplectic_shadow_energy_mean"] = sym_stats["shadow_energy_mean"]
+                            record["symplectic_energy_band_layers"] = sym_stats["energy_band_layers"]
+                            record["symplectic_x_norm_mean"] = sym_stats["x_norm_mean"]
+                            record["symplectic_lambda_mean"] = sym_stats["lambda_mean"]
+                            if symplectic_energy_first is None:
+                                symplectic_energy_first = sym_stats["shadow_energy_mean"]
+                            symplectic_energy_last = sym_stats["shadow_energy_mean"]
+                            symplectic_x_norm_last = sym_stats["x_norm_mean"]
                     metrics_stream.write(record)
 
             # Periodic validation evaluation
@@ -1670,6 +1734,13 @@ def train(args) -> None:
     # the beta the model ended training at (y2h9): null = exact tropical
     # endpoint or a non-semiring model; mirrors checkpoint semiring_beta_live
     results["semiring_beta_final"] = last_semiring_beta
+    if symplectic_energy_first is not None:
+        # shadow-energy trend (u55.5): movement BETWEEN steps is learning
+        # (the potentials change); the conservation claim lives in the
+        # per-step across-layer band recorded in the metrics stream
+        results["symplectic_energy_first"] = symplectic_energy_first
+        results["symplectic_energy_final"] = symplectic_energy_last
+        results["symplectic_x_norm_final"] = symplectic_x_norm_last
     attn_entropy = _collect_attn_entropy_stats(raw_model)
     if attn_entropy is not None:
         results["attention_entropy"] = attn_entropy
@@ -1954,6 +2025,42 @@ def build_parser() -> argparse.ArgumentParser:
             "Ultrametric attention only: number of p-adic digits K (default: GPTConfig.ultrametric_K = 8). "
             "Finer K extends the digit-truncation memory-fraction axis downward (k=1 reaches 1/K; bead kgj1)."
         ),
+    )
+    parser.add_argument(
+        "--reversible-mode",
+        type=str,
+        default="additive",
+        choices=["additive", "symplectic"],
+        help=(
+            "Reversible attention only: additive coupling (any F, G; volume-preserving) vs symplectic "
+            "kick-kick coupling (exact-gradient kicks, corrected sign; conserves a coercive shadow "
+            "Hamiltonian - bead u55.5, theory note symplectic_transformer.md)."
+        ),
+    )
+    parser.add_argument(
+        "--reversible-tied",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Reversible+symplectic only: share ONE block across all layers (the regime where shadow "
+            "conservation is theory-backed; also a parameter-efficiency win). No kv-cache generation."
+        ),
+    )
+    parser.add_argument(
+        "--reversible-lambda-min",
+        dest="reversible_lambda_min",
+        type=float,
+        default=None,
+        help=(
+            "Reversible+symplectic only: coercivity floor for the learnable confinement lambda "
+            "(default GPTConfig 0.05; 0 = the registered unconfined falsification control)."
+        ),
+    )
+    parser.add_argument(
+        "--reversible-record-energy",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Reversible+symplectic only: stream shadow-energy/activation-norm telemetry into metrics.jsonl.",
     )
     parser.add_argument(
         "--tropical-gauge-fix",

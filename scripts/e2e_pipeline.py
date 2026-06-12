@@ -491,6 +491,63 @@ def scenario_word_problem(work: Path) -> bool:
     return r.report()
 
 
+def scenario_symplectic(work: Path) -> bool:
+    """Bead u55.5 acceptance stage: a symplectic-TIED no-norm mini-run (depth
+    8, tiny width, CPU) with shadow-energy/activation-norm telemetry and
+    drift assertions. The across-LAYER energy band within each step is the
+    conservation observable (tied = the same symplectic map iterated, so the
+    coercive H-tilde is conserved across depth by the shadow theorem)."""
+    r = Runner(work, "symplectic")
+    data_dir = work / "diag-hier" / "hier"
+    try:
+        r.run("gen-tasks", CLI + ["gen-tasks", "--task", "hier", "--out", str(work / "diag-hier"),
+                                  "--size", "300", "--seed", "11"])
+        argv = _train_argv(work, "e2e-symplectic", "reversible", max_steps=24, ckpt_interval=12,
+                           data_dir=data_dir) + [
+            "--n-layer", "8", "--n-head", "4", "--n-kv-head", "2",  # depth 8; reversible halves heads
+            "--reversible-mode", "symplectic", "--reversible-tied",
+            "--reversible-lambda-min", "0.05", "--reversible-record-energy",
+        ]
+        r.run("train-symplectic-tied", argv)
+        recs = [rec for rec in _metric_lines(_run_dir(work, "e2e-symplectic"))
+                if rec.get("type") == "step" and "symplectic_shadow_energy_mean" in rec]
+        r.assert_true("energy-telemetry-present",
+                      len(recs) >= 24,
+                      f"{len(recs)} step records carry shadow-energy telemetry")
+        finite = all(
+            rec["symplectic_shadow_energy_mean"] == rec["symplectic_shadow_energy_mean"]
+            and rec["symplectic_x_norm_mean"] == rec["symplectic_x_norm_mean"]
+            for rec in recs
+        )
+        r.assert_true("energy-telemetry-finite", finite, "all shadow-energy/norm readings finite")
+        # conservation-across-depth: the per-step across-layer band stays small
+        # relative to the energy scale (loose: training moves the potentials
+        # BETWEEN steps; the theorem speaks within each forward)
+        bands_ok = all(
+            rec["symplectic_energy_band_layers"] <= 0.10 * (1.0 + abs(rec["symplectic_shadow_energy_mean"]))
+            for rec in recs
+        )
+        worst = max(
+            rec["symplectic_energy_band_layers"] / (1.0 + abs(rec["symplectic_shadow_energy_mean"]))
+            for rec in recs
+        )
+        r.assert_true("across-layer-energy-band", bands_ok,
+                      f"across-layer shadow-energy band <= 10% of scale at every step (worst {worst:.4f})")
+        norms = [rec["symplectic_x_norm_mean"] for rec in recs]
+        r.assert_true("activation-norms-bounded",
+                      max(norms) <= 50.0 * max(norms[0], 1e-9),
+                      f"activation norms bounded: first {norms[0]:.4f}, max {max(norms):.4f}")
+        summary = json.loads((_run_dir(work, "e2e-symplectic") / "summary.json").read_text())
+        res = summary.get("results", {})
+        r.assert_true("summary-energy-aggregates",
+                      all(k in res for k in ("symplectic_energy_first", "symplectic_energy_final",
+                                             "symplectic_x_norm_final")),
+                      "summary records symplectic energy/norm aggregates")
+    except StageFailure:
+        pass
+    return r.report()
+
+
 def scenario_regression_gate(work: Path) -> bool:
     r = Runner(work, "regression-gate")
     try:
@@ -549,7 +606,8 @@ def scenario_regression_gate(work: Path) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scenario",
-                        choices=["full-loop", "resume", "determinism", "regression-gate", "word-problem", "all"],
+                        choices=["full-loop", "resume", "determinism", "regression-gate", "word-problem",
+                                 "symplectic", "all"],
                         default="all")
     parser.add_argument("--workdir", type=Path, default=None,
                         help="Working directory (default: a fresh temp dir OUTSIDE the repo; kept on failure)")
@@ -568,6 +626,7 @@ def main() -> int:
         "determinism": lambda: scenario_determinism(work),
         "regression-gate": lambda: scenario_regression_gate(work),
         "word-problem": lambda: scenario_word_problem(work),
+        "symplectic": lambda: scenario_symplectic(work),
     }
     wanted = list(runners) if args.scenario == "all" else [args.scenario]
     results = {name: runners[name]() for name in wanted}
