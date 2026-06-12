@@ -1315,6 +1315,31 @@ class TestSymplecticReversible:
             pass
         print("  ✅ tiny symplectic GPT trains; tied dedupes params and validates")
 
+    def test_disable_block_norms_falsification_arm(self):
+        """z4xx: the standard-no-norm control strips per-layer norms (outputs
+        diverge from the normed block on the same weights) and is refused for
+        any non-standard mechanism."""
+        import torch
+
+        from nanochat.gpt import GPT, GPTConfig
+
+        base = dict(sequence_len=16, vocab_size=64, n_layer=2, n_head=4, n_kv_head=2, n_embd=32)
+        torch.manual_seed(23)
+        normed = GPT(GPTConfig(**base, attention_type="standard"))
+        torch.manual_seed(23)
+        stripped = GPT(GPTConfig(**base, attention_type="standard", disable_block_norms=True))
+        idx = torch.randint(0, 64, (2, 16))
+        with torch.no_grad():
+            delta = float((normed(idx) - stripped(idx)).abs().max())
+        require(delta > 1e-6, f"no-norm arm did not change outputs (delta {delta:.2e})")
+
+        try:
+            GPT(GPTConfig(**base, attention_type="tropical", disable_block_norms=True))
+            require(False, "disable_block_norms must be standard-only")
+        except ValueError:
+            pass
+        print(f"  ✅ no-norm falsification arm diverges (delta {delta:.2e}) and validates standard-only")
+
 
 class TestSurrealNumbers:
     """Test surreal number scaling and field properties."""

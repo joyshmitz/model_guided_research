@@ -198,6 +198,11 @@ class GPTConfig:
     ultrametric_p: int = 2
     ultrametric_alpha: float = 2.0
     ultrametric_lcp_beta: float = 32.0
+    # Standard-attention falsification arm for the symplectic no-norm program
+    # (bead z4xx): strip the per-layer norms from the standard block - the
+    # expected-failure control of hyp-symplectic-nonorm-depth-tied/-untied.
+    # Standard attention only (validated); trunk-boundary norms retained.
+    disable_block_norms: bool = False
     # Reversible-specific options (see nanochat.reversible_block_torch; u55.5).
     # symplectic = kick-kick coupling with exact-gradient kicks (corrected
     # sign: conserves the coercive H = phi_G + phi_F; theory note
@@ -366,6 +371,12 @@ class Block(nn.Module):
         if self.config.attention_type == "reversible":
             return self.special_block(x, cos_sin, kv_cache)
 
+        if getattr(self.config, "disable_block_norms", False):
+            # the no-norm falsification arm (z4xx): identical block, norms
+            # stripped - drift is expected; that is the point of the control
+            x = x + self.attn(x, cos_sin, kv_cache)
+            x = x + self.mlp(x)
+            return x
         x = x + self.attn(norm(x), cos_sin, kv_cache)
         x = x + self.mlp(norm(x))
         return x
@@ -447,6 +458,11 @@ class GPT(nn.Module):
             self.config, "reversible_tied", False
         ):
             raise ValueError("reversible_mode/reversible_tied require attention_type=reversible")
+        if getattr(self.config, "disable_block_norms", False) and self.config.attention_type != "standard":
+            raise ValueError(
+                "disable_block_norms is the standard-attention falsification arm only (z4xx); "
+                f"got attention_type {self.config.attention_type!r}"
+            )
         ffn_type = getattr(self.config, "ffn_type", "standard")
         if ffn_type not in ("standard", "tropical", "tropical-rational"):
             raise ValueError(f"ffn_type must be standard | tropical | tropical-rational, got {ffn_type!r}")

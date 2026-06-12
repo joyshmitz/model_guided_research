@@ -683,6 +683,10 @@ def train(args) -> None:
             ultra_k = getattr(args, "ultrametric_K", None)
             if ultra_k is not None:
                 config.ultrametric_K = int(ultra_k)
+        if config.attention_type == "standard":
+            no_norms = getattr(args, "disable_block_norms", None)
+            if no_norms is not None:
+                config.disable_block_norms = bool(no_norms)
         if config.attention_type == "reversible":
             config.reversible_mode = str(getattr(args, "reversible_mode", config.reversible_mode))
             rev_tied = getattr(args, "reversible_tied", None)
@@ -2061,6 +2065,15 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Reversible+symplectic only: stream shadow-energy/activation-norm telemetry into metrics.jsonl.",
+    )
+    parser.add_argument(
+        "--disable-block-norms",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Standard attention only: strip the per-layer norms - the expected-failure falsification "
+            "arm of the symplectic no-norm program (bead z4xx)."
+        ),
     )
     parser.add_argument(
         "--tropical-gauge-fix",
