@@ -547,3 +547,163 @@ def test_dequantization_annealing_schedule_telemetry(monkeypatch, tmp_path):
         (tmp_path / "artifacts" / "baseline" / "nanochat" / "anneal-smoke" / "summary.json").read_text()
     )
     assert summary["hparams"]["semiring_beta_spec"] == "linear:1:32"
+
+
+def test_coverage_beta_controller_transitions_exact():
+    """9jzb closed-loop controller: raise/hold/back-off transitions are exact,
+    bounds are respected, and beta is NEVER raised on a below-floor or missing
+    reading (the preregistration's checkable-from-logs invariant)."""
+    ctl = train_mod._CoverageBetaController(1.0, 64.0, 0.7)
+    up, down = ctl.UP, ctl.DOWN
+
+    assert ctl.step(None) == 1.0                      # no reading -> hold
+    assert ctl.step(0.9) == 1.0 * up                  # covered -> raise
+    assert ctl.step(0.7) == 1.0 * up * up             # floor is inclusive
+    b = ctl.beta
+    assert ctl.step(0.69) == max(b / down, ctl.b0)    # dip -> back off, clamped at B0
+    held = ctl.beta
+    assert ctl.step(None) == held                     # missing -> hold
+
+    # never-raise-below-floor invariant over an adversarial random stream
+    import random as _random
+
+    rng = _random.Random(9362)
+    ctl = train_mod._CoverageBetaController(1.0, 64.0, 0.7)
+    prev = ctl.beta
+    for _ in range(500):
+        cov = rng.choice([None, rng.random()])
+        beta = ctl.step(cov)
+        assert 1.0 <= beta <= 64.0
+        if beta > prev:
+            assert cov is not None and cov >= 0.7, "raised beta without floor-clearing coverage"
+        prev = beta
+
+    # saturation at BMAX under sustained coverage
+    ctl = train_mod._CoverageBetaController(1.0, 4.0, 0.5)
+    for _ in range(200):
+        ctl.step(1.0)
+    assert ctl.beta == 4.0
+
+
+def test_semiring_beta_spec_parser_coverage_mode():
+    assert train_mod._parse_semiring_beta_spec("coverage:1:64:0.7") == ("coverage", 1.0, 64.0, 0.7)
+    for bad in ("coverage:1:64", "coverage:0:64:0.7", "coverage:8:4:0.7", "coverage:1:64:1.5", "sigmoid:1:2"):
+        with pytest.raises(ValueError):
+            train_mod._parse_semiring_beta_spec(bad)
+
+
+def test_closed_loop_schedule_e2e_invariant(monkeypatch, tmp_path):
+    """Closed-loop e2e smoke: metrics stream shows beta never raised on a
+    step whose PREVIOUS coverage reading was below the floor."""
+    import json as json_mod
+
+    monkeypatch.setattr(
+        train_mod, "tokenizing_distributed_data_loader_with_state", _fake_loader_factory()
+    )
+    monkeypatch.setattr(train_mod, "list_parquet_files", lambda data_dir=None: ["a.parquet", "b.parquet"])
+    args = _train_args(
+        tmp_path, "coverage-smoke",
+        attention_type="tropical",
+        semiring_beta="coverage:1:16:0.5",
+        tropical_record_margins=None,
+        log_interval="1",
+    )
+    train_mod.train(args)
+    metrics = tmp_path / "artifacts" / "baseline" / "nanochat" / "coverage-smoke" / "metrics.jsonl"
+    rows = []
+    for line in metrics.read_text().splitlines():
+        rec = json_mod.loads(line)
+        if "semiring_beta" in rec:
+            rows.append((rec["semiring_beta"], rec.get("route_coverage")))
+    assert len(rows) >= 10, f"expected per-step telemetry, got {len(rows)}"
+    assert all(1.0 <= b <= 16.0 for b, _ in rows)
+    for (b_prev, cov_prev), (b_next, _) in zip(rows, rows[1:], strict=False):
+        if b_next > b_prev:
+            assert cov_prev is not None and cov_prev >= 0.5, (
+                f"beta raised {b_prev} -> {b_next} after coverage {cov_prev}"
+            )
+
+
+def test_coverage_spec_requires_margins(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        train_mod, "tokenizing_distributed_data_loader_with_state", _fake_loader_factory()
+    )
+    monkeypatch.setattr(train_mod, "list_parquet_files", lambda data_dir=None: ["a.parquet", "b.parquet"])
+    args = _train_args(
+        tmp_path, "coverage-no-margins",
+        attention_type="tropical",
+        semiring_beta="coverage:1:16:0.5",
+    )
+    with pytest.raises(ValueError, match="tropical-record-margins"):
+        train_mod.train(args)
+
+
+def test_ordinal_beta_ladder_transitions_exact():
+    """9jzb ordinal mode: beta doubles (capped) exactly on (A, B) descents -
+    the ordinal scheduler's anneal/restart events - and holds otherwise."""
+    ladder = train_mod._OrdinalBetaLadder(1.0, 8.0)
+    assert ladder.step(2, 3) == 1.0      # first observation initializes, no event
+    assert ladder.step(2, 3) == 1.0      # no descent -> hold
+    assert ladder.step(2, 2) == 2.0      # anneal (B descent) -> double
+    assert ladder.step(2, 2) == 2.0      # hold
+    assert ladder.step(1, 3) == 4.0      # restart (A descent, B reset) -> double
+    assert ladder.step(1, 2) == 8.0      # anneal -> double, hits cap
+    assert ladder.step(1, 1) == 8.0      # capped at BMAX
+    assert train_mod._parse_semiring_beta_spec("ordinal:1:8") == ("ordinal", 1.0, 8.0)
+
+
+def test_ordinal_beta_mode_requires_ordinal_scheduler(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        train_mod, "tokenizing_distributed_data_loader_with_state", _fake_loader_factory()
+    )
+    monkeypatch.setattr(train_mod, "list_parquet_files", lambda data_dir=None: ["a.parquet", "b.parquet"])
+    args = _train_args(tmp_path, "ord-beta-no-sched", attention_type="tropical", semiring_beta="ordinal:1:8")
+    with pytest.raises(ValueError, match="scheduler-type ordinal"):
+        train_mod.train(args)
+
+
+def test_ordinal_beta_mode_e2e_holds_absent_transitions(monkeypatch, tmp_path):
+    """With default patience no ordinal event fires in 12 steps: beta must
+    hold at B0 the whole run (the transfinite clock, not the step clock)."""
+    import json as json_mod
+
+    monkeypatch.setattr(
+        train_mod, "tokenizing_distributed_data_loader_with_state", _fake_loader_factory()
+    )
+    monkeypatch.setattr(train_mod, "list_parquet_files", lambda data_dir=None: ["a.parquet", "b.parquet"])
+    args = _train_args(
+        tmp_path, "ord-beta-smoke",
+        attention_type="tropical",
+        semiring_beta="ordinal:2:16",
+        scheduler_type="ordinal",
+        log_interval="1",
+    )
+    train_mod.train(args)
+    metrics = tmp_path / "artifacts" / "baseline" / "nanochat" / "ord-beta-smoke" / "metrics.jsonl"
+    betas, saw_ordinal = [], False
+    for line in metrics.read_text().splitlines():
+        rec = json_mod.loads(line)
+        if "semiring_beta" in rec:
+            betas.append(rec["semiring_beta"])
+            saw_ordinal = saw_ordinal or "ordinal" in rec
+    assert len(betas) >= 10 and all(b == 2.0 for b in betas), betas[:5]
+    assert saw_ordinal, "ordinal scheduler telemetry must accompany the beta stream"
+
+
+def test_stateful_beta_modes_refuse_resume(monkeypatch, tmp_path):
+    """Fresh-eyes audit finding: controller/ladder state is not checkpointed,
+    so resuming a coverage/ordinal beta run would silently restart the beta
+    trajectory and break the bitwise-resume guarantee. Until the state
+    round-trips, resume must be refused LOUDLY for those modes."""
+    _run_train(monkeypatch, tmp_path, "stateful-parent", checkpoint_interval=6,
+               attention_type="tropical", semiring_beta="linear:1:8")  # stateless: resumable
+    for spec, extra in (("coverage:1:8:0.5", {"tropical_record_margins": None}),
+                        ("ordinal:1:8", {"scheduler_type": "ordinal"})):
+        args = _train_args(
+            tmp_path, f"stateful-resume-{spec.split(':')[0]}",
+            attention_type="tropical", semiring_beta=spec,
+            resume_from=str(_ckpt_dir(tmp_path, "stateful-parent")), resume_step=5,
+            **extra,
+        )
+        with pytest.raises(ValueError, match="cannot resume yet"):
+            train_mod.train(args)

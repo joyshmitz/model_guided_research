@@ -151,29 +151,105 @@ def _load_synaptic_config(path: Path) -> SynapticConfig:
     return cfg
 
 
-def _parse_semiring_beta_spec(spec: str) -> tuple[str, float, float]:
-    """--semiring-beta spec -> (mode, b0, b1): a plain float is ('const', b, b);
-    'linear:B0:B1' / 'exp:B0:B1' anneal beta from B0 to B1 over the run (the
-    dequantization-annealing schedules of bead 8gk.1)."""
+_SemiringSpec = tuple[str, float, float] | tuple[str, float, float, float]
+
+
+def _parse_semiring_beta_spec(spec: str) -> _SemiringSpec:
+    """--semiring-beta spec parser (beads 8gk.1 + 9jzb).
+
+    'B'                      -> ('const', B, B)
+    'linear:B0:B1'           -> open-loop linear anneal B0 -> B1
+    'exp:B0:B1'              -> open-loop exponential anneal
+    'coverage:B0:BMAX:FLOOR' -> CLOSED-LOOP certificate-driven control: raise
+        beta only while measured route-stability coverage stays >= FLOOR,
+        back off otherwise (requires --tropical-record-margins for the
+        coverage telemetry). The schedule anneals as fast as the certificate
+        allows instead of on a clock.
+    'ordinal:B0:B1'          -> ORDINAL-ORCHESTRATED (T3.3 client): beta
+        doubles toward B1 at each ordinal-scheduler transition (any (A, B)
+        descent - an anneal or a restart, i.e. the scheduler's limit-ordinal
+        events). Requires --scheduler-type ordinal.
+    """
     s = str(spec).strip()
     if ":" in s:
         mode, _, rest = s.partition(":")
         mode = mode.strip().lower()
-        b0_s, _, b1_s = rest.partition(":")
-        if mode not in ("linear", "exp"):
-            raise ValueError(f"--semiring-beta schedule mode must be linear | exp, got {mode!r}")
-        b0, b1 = float(b0_s), float(b1_s)
-        if not (b0 > 0 and b1 > 0):
-            raise ValueError(f"--semiring-beta schedule endpoints must be > 0, got {b0}, {b1}")
-        return mode, b0, b1
+        parts = rest.split(":")
+        if mode in ("linear", "exp", "ordinal"):
+            if len(parts) != 2:
+                raise ValueError(f"--semiring-beta {mode} schedule needs B0:B1, got {rest!r}")
+            b0, b1 = float(parts[0]), float(parts[1])
+            if not (b0 > 0 and b1 > 0):
+                raise ValueError(f"--semiring-beta schedule endpoints must be > 0, got {b0}, {b1}")
+            return mode, b0, b1
+        if mode == "coverage":
+            if len(parts) != 3:
+                raise ValueError(f"--semiring-beta coverage schedule needs B0:BMAX:FLOOR, got {rest!r}")
+            b0, bmax, floor = float(parts[0]), float(parts[1]), float(parts[2])
+            if not (b0 > 0 and bmax >= b0):
+                raise ValueError(f"--semiring-beta coverage needs 0 < B0 <= BMAX, got {b0}, {bmax}")
+            if not (0.0 < floor < 1.0):
+                raise ValueError(f"--semiring-beta coverage FLOOR must be in (0, 1), got {floor}")
+            return "coverage", b0, bmax, floor
+        raise ValueError(f"--semiring-beta schedule mode must be linear | exp | ordinal | coverage, got {mode!r}")
     b = float(s)
     if not (b > 0):
         raise ValueError(f"--semiring-beta must be > 0, got {b}")
     return "const", b, b
 
 
-def _semiring_beta_at(schedule: tuple[str, float, float], step: int, max_steps: int) -> float:
-    mode, b0, b1 = schedule
+class _OrdinalBetaLadder:
+    """Ordinal-orchestrated dequantization annealing (9jzb, T3.3 client):
+    beta doubles toward BMAX at each ordinal-scheduler transition - any
+    descent of the (A, B) counters, i.e. an anneal or a restart, the
+    scheduler's limit-ordinal events. Between events beta holds: the
+    transfinite clock, not the step clock, drives the homotopy.
+    """
+
+    RATIO = 2.0  # one beta doubling per ordinal event
+
+    def __init__(self, b0: float, bmax: float):
+        self.beta = float(b0)
+        self.bmax = float(bmax)
+        self._last_ab: tuple[int, int] | None = None
+
+    def step(self, a: int, b: int) -> float:
+        ab = (int(a), int(b))
+        if self._last_ab is not None and ab != self._last_ab:
+            self.beta = min(self.beta * self.RATIO, self.bmax)
+        self._last_ab = ab
+        return self.beta
+
+
+class _CoverageBetaController:
+    """Closed-loop dequantization annealing (9jzb): certificate-driven beta
+    control. Per step, given the PREVIOUS forward's route-stability coverage:
+    raise beta multiplicatively while coverage holds at or above the floor,
+    back off when it dips, hold while there is no reading. INVARIANT (the
+    preregistration's checkable-from-logs clause): beta is never RAISED on a
+    step whose observed coverage is below the floor or missing.
+    """
+
+    UP = 1.02     # multiplicative climb per covered step (~35 steps per beta doubling)
+    DOWN = 1.05   # divisor per uncovered step (back-off is faster than climb)
+
+    def __init__(self, b0: float, bmax: float, floor: float):
+        self.beta = float(b0)
+        self.b0 = float(b0)
+        self.bmax = float(bmax)
+        self.floor = float(floor)
+
+    def step(self, coverage: float | None) -> float:
+        if coverage is not None and coverage >= self.floor:
+            self.beta = min(self.beta * self.UP, self.bmax)
+        elif coverage is not None:
+            self.beta = max(self.beta / self.DOWN, self.b0)
+        # coverage None -> hold (first step, or margins momentarily silent)
+        return self.beta
+
+
+def _semiring_beta_at(schedule: _SemiringSpec, step: int, max_steps: int) -> float:
+    mode, b0, b1 = str(schedule[0]), float(schedule[1]), float(schedule[2])
     frac = min(max(step / max(max_steps - 1, 1), 0.0), 1.0)
     if mode == "linear":
         return b0 + (b1 - b0) * frac
@@ -526,7 +602,9 @@ def train(args) -> None:
 
     # Dequantization-annealing schedule (8gk.1): set while wiring the tropical
     # config below; consumed once per step in the training loop.
-    semiring_schedule: tuple[str, float, float] | None = None
+    semiring_schedule: _SemiringSpec | None = None
+    semiring_controller: _CoverageBetaController | None = None
+    semiring_ladder: _OrdinalBetaLadder | None = None
 
     if model_type == "gpt":
         config = GPTConfig()
@@ -638,13 +716,37 @@ def train(args) -> None:
             if tropical_log_margins:
                 config.tropical_record_margins = True
             if semiring_beta_arg is not None:
-                # Dequantization annealing (8gk.1): constant beta lands in the
-                # config; schedules start at b0 and update live modules per
-                # step (see the semiring_schedule hook in the training loop).
-                mode, b0, b1 = _parse_semiring_beta_spec(semiring_beta_arg)
-                config.semiring_beta = b0
-                if mode != "const":
-                    semiring_schedule = (mode, b0, b1)
+                # Dequantization annealing (8gk.1/9jzb): constant beta lands
+                # in the config; schedules start at b0 and update live modules
+                # per step (see the semiring_schedule hook in the training loop).
+                parsed = _parse_semiring_beta_spec(semiring_beta_arg)
+                config.semiring_beta = float(parsed[1])
+                if parsed[0] in ("coverage", "ordinal") and getattr(args, "resume_from", None) is not None:
+                    # the controller/ladder state is NOT in the checkpoint yet:
+                    # resuming would silently restart the beta trajectory and
+                    # break the bitwise-resume guarantee. Refuse loudly until
+                    # the state round-trips (follow-up bead).
+                    raise ValueError(
+                        f"--semiring-beta {parsed[0]}:... cannot resume yet: the schedule controller's "
+                        "state is not checkpointed, so a resumed run would restart its beta trajectory. "
+                        "Use linear/exp (stateless in step) for resumable runs."
+                    )
+                if parsed[0] == "coverage" and len(parsed) == 4:
+                    if not config.tropical_record_margins:
+                        raise ValueError(
+                            "--semiring-beta coverage:... is certificate-driven control: it needs the "
+                            "coverage telemetry, so pass --tropical-record-margins as well."
+                        )
+                    semiring_controller = _CoverageBetaController(parsed[1], parsed[2], parsed[3])
+                if parsed[0] == "ordinal":
+                    if str(args.scheduler_type) != "ordinal":
+                        raise ValueError(
+                            "--semiring-beta ordinal:... is driven by the ordinal scheduler's "
+                            "transitions, so pass --scheduler-type ordinal as well."
+                        )
+                    semiring_ladder = _OrdinalBetaLadder(float(parsed[1]), float(parsed[2]))
+                if parsed[0] != "const":
+                    semiring_schedule = parsed
     else:
         if args.optimizer_type == "hoss":
             raise ValueError("--optimizer-type hoss is not supported for --model-type synaptic (no HVP closure).")
@@ -1103,9 +1205,19 @@ def train(args) -> None:
 
             current_semiring_beta: float | None
             if semiring_schedule is not None:
-                # dequantization annealing (8gk.1): one scalar with algebraic
-                # meaning, updated on the live modules - never model state
-                current_semiring_beta = _semiring_beta_at(semiring_schedule, step, max_steps)
+                # dequantization annealing (8gk.1/9jzb): one scalar with
+                # algebraic meaning, updated on the live modules - never state
+                if semiring_controller is not None:
+                    # closed-loop: consume the PREVIOUS forward's certificate
+                    # coverage; the controller never raises beta below the floor
+                    current_semiring_beta = semiring_controller.step(
+                        _collect_tropical_route_coverage(raw_model)
+                    )
+                elif semiring_ladder is not None and schedulers:
+                    # ordinal-orchestrated: the transfinite clock drives beta
+                    current_semiring_beta = semiring_ladder.step(schedulers[0].A, schedulers[0].B)
+                else:
+                    current_semiring_beta = _semiring_beta_at(semiring_schedule, step, max_steps)
                 set_semiring_beta(raw_model, current_semiring_beta)
             else:
                 config_beta = getattr(config, "semiring_beta", None)
