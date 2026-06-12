@@ -4393,12 +4393,27 @@ def _eval_tasks_provenance(
     )
 
 
-_EVAL_TASKS_SCHEMA_VERSION = "mgr.evaltasks.v2"
+def _read_train_provenance(checkpoint_dir: Path) -> dict[str, Any] | None:
+    """The TRAINING run's provenance block, from the run summary train.py
+    writes beside the checkpoints directory (dz9i: training taint must
+    propagate through eval artifacts). None when absent or unreadable."""
+    summary_path = Path(checkpoint_dir).resolve().parent / "summary.json"
+    if not summary_path.exists():
+        return None
+    try:
+        prov = json.loads(summary_path.read_text(encoding="utf-8")).get("provenance")
+    except (OSError, json.JSONDecodeError):
+        return None
+    return prov if isinstance(prov, dict) else None
+
+
+_EVAL_TASKS_SCHEMA_VERSION = "mgr.evaltasks.v3"
 # SCHEMA CONTRACT (consumed by C4 scorecards and the G2 verdict engine):
 # {"schema_version", "kind": "eval-tasks",
 #  "meta": {run_id, generated_at, checkpoint{dir, step, attention_type, n_params,
 #           budget, lineage}, device, seeds, examples_per_seed, decode_modes, git,
 #           receipts},
+#  "train_provenance": {<the TRAINING run's provenance block>} | null,
 #  "tasks": {<name>: {
 #     "difficulty_axis": str|null, "in_range_max": float|null,
 #     "exact_match": {<mode>: {"in_range"|"held_out":
@@ -4421,6 +4436,13 @@ _EVAL_TASKS_SCHEMA_VERSION = "mgr.evaltasks.v2"
 # generations.jsonl (meta.receipts), so behavioral claims about checkpoints
 # (e.g. "every arm answers 'lt' on every prompt") are committed evidence, not
 # session lore. v1 artifacts remain readable by the verdict engine.
+# v2 -> v3 (2026-06-11, bead dz9i): adds train_provenance - the TRAINING
+# run's provenance block, read from the run summary beside the checkpoint.
+# The hqwi audit found that a clean-time eval of a TAINTED-TRAINING
+# checkpoint looked clean to the verdict engine (eval artifacts only carried
+# eval-time provenance); the engine now refuses an evaltasks artifact when
+# EITHER provenance is tainted. null = no train summary found (legacy /
+# synthetic checkpoints): engine falls back to eval-time provenance only.
 # 2026-06-11 (bead u55.3, additive within v2 - no consumer reads break): adds
 # per-task length_slope, the doc-level OLS slope (with CI95) of greedy
 # exact-match against the difficulty axis, fit separately on held-out docs and
@@ -4889,6 +4911,11 @@ def eval_tasks(
             decode_modes=[m for m, _ in decode_modes],
             dials=dial_overrides or None,
         ),
+        # dz9i: a checkpoint trained on a dirty tree must taint its evals even
+        # when the EVAL itself runs on a clean tree - carry the TRAINING run's
+        # provenance (the summary train.py writes beside the checkpoints dir);
+        # null = no train summary found (legacy / synthetic checkpoints).
+        "train_provenance": _read_train_provenance(checkpoint),
         "tasks": results,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
@@ -6793,7 +6820,7 @@ def _adj_collect_artifacts(roots: list[Path]) -> list[dict[str, Any]]:
             if not isinstance(data, dict):
                 continue
             sv = data.get("schema_version")
-            if sv in ("mgr.evaltasks.v1", "mgr.evaltasks.v2"):
+            if sv in ("mgr.evaltasks.v1", "mgr.evaltasks.v2", "mgr.evaltasks.v3"):
                 schema = "evaltasks"
             elif sv == "mgr.telemetry.v1":
                 schema = "train"
@@ -6813,6 +6840,14 @@ def _adj_collect_artifacts(roots: list[Path]) -> list[dict[str, Any]]:
             else:
                 prov = data.get("provenance")
                 tainted = (not isinstance(prov, dict)) or bool(prov.get("tainted", True))
+                if schema == "evaltasks":
+                    # dz9i: training taint propagates - a clean-time eval of a
+                    # dirty-trained checkpoint is still tainted evidence. Only
+                    # enforceable when the artifact carries train_provenance
+                    # (v3); legacy artifacts keep eval-time-only semantics.
+                    train_prov = data.get("train_provenance")
+                    if isinstance(train_prov, dict):
+                        tainted = tainted or bool(train_prov.get("tainted", True))
             index.append({"path": str(path), "schema": schema, "data": data, "tainted": tainted})
     return index
 
