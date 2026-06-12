@@ -7296,7 +7296,10 @@ def _adj_variant_matches(art: dict[str, Any], variant: dict[str, Any] | None) ->
     arm), so 'exact tropical' (semiring_beta_spec: null) matches both new
     artifacts that record the field and pre-rgyl artifacts that predate it.
     This is what lets annealed / fixed-beta / endpoint runs of the SAME
-    mechanism be distinguished as evidence (hyp-maslov-anneal-loss-retention)."""
+    mechanism be distinguished as evidence (hyp-maslov-anneal-loss-retention).
+    For bench artifacts (bhjf) knobs are looked up in results then meta, so
+    two bench-backed hypotheses sharing a metric path stay disjoint via
+    selectors rather than per-protocol observable keys."""
     if not variant:
         return True
     data = art["data"]
@@ -7307,6 +7310,12 @@ def _adj_variant_matches(art: dict[str, Any], variant: dict[str, Any] | None) ->
         # knob - braid_crossing_law, ultrametric_mode, ...)
         model_cfg = ckpt.get("model_config")
         sources: list[dict[str, Any]] = [ckpt, model_cfg if isinstance(model_cfg, dict) else {}]
+    elif art["schema"] == "bench":
+        # bench protocols (bhjf): window bounds and derived knobs land in
+        # results; task/seed/run parameters land in meta
+        res = data.get("results")
+        bench_meta = data.get("meta")
+        sources = [res if isinstance(res, dict) else {}, bench_meta if isinstance(bench_meta, dict) else {}]
     else:
         sources = [data.get("hparams") or {}, data.get("config") or {}]
     for key, wanted in variant.items():
@@ -7335,8 +7344,10 @@ def _adj_artifact_matches_arm(art: dict[str, Any], mechanism: str, variant: dict
             isinstance(c, dict) and c.get("mechanism") == mechanism for c in checks
         )
     if art["schema"] == "bench":
-        # path benchmarks record the mechanism they exercise top-level
-        return bool(data.get("mechanism") == mechanism)
+        # path benchmarks record the mechanism they exercise top-level; the
+        # variant selector separates protocol variants sharing a metric path
+        # (bhjf - previously selectors were silently ignored here)
+        return bool(data.get("mechanism") == mechanism) and _adj_variant_matches(art, variant)
     if art["schema"] in ("evaltasks", "chargeprobe"):
         attn = ((data.get("meta") or {}).get("checkpoint") or {}).get("attention_type")
         return attn == (mechanism if mechanism in _ADJ_ATTENTION_MECHS else "standard") and _adj_variant_matches(

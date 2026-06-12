@@ -990,9 +990,10 @@ def test_precision_curve_window_hi_isolates_deep_compression(tmp_path):
     assert (r["common_window_lo"], r["common_window_hi"]) == (0.25, 0.5)
     assert abs(r["auc_digit"] - 1.0) < 1e-9
     assert abs(r["auc_float"] - 5.0 / 7.0) < 1e-6, r["auc_float"]
-    # deep-window artifacts expose a DISJOINT observable key: bench arm
-    # matching has no variant selectors, so the full-axis hypothesis and the
-    # deep-window one must not be able to ingest each other's artifacts
+    # deep-window artifacts expose a DISJOINT observable key as
+    # defense-in-depth (bench variant selectors landed later, bhjf): the
+    # full-axis hypothesis and the deep-window one must not be able to
+    # ingest each other's artifacts even without selectors
     assert "auc_ratio" not in r
     assert abs(r["auc_ratio_deepwindow"] - 7.0 / 5.0) < 1e-6
     arts = cli._adj_collect_artifacts([tmp_path / "bench"])
@@ -1009,6 +1010,46 @@ def test_precision_curve_window_hi_isolates_deep_compression(tmp_path):
         "--artifacts-dir", str(tmp_path), "--run-id", "pc-badwin",
     ])
     assert result.exit_code != 0
+
+
+def test_bench_arm_matching_honors_variant_selectors():
+    """bhjf: bench-backed hypotheses sharing a metric path must be separable
+    by variant selectors - knobs are looked up in results then meta. Before
+    this, the bench branch ignored selectors entirely and disjointness relied
+    on per-protocol observable keys (kgj1's auc_ratio_deepwindow workaround)."""
+    def bench_art(task: str, window_hi: float | None = None) -> dict:
+        results: dict = {"auc_ratio": 1.5}
+        if window_hi is not None:
+            results["common_window_hi"] = window_hi
+        return {
+            "path": f"mem://{task}-{window_hi}", "schema": "bench", "tainted": False,
+            "data": {
+                "schema_version": "mgr.bench.precision_curves.v1", "kind": "precision_curve",
+                "mechanism": "ultrametric",
+                "meta": {"task": task, "seed": 0},
+                "results": results,
+            },
+        }
+
+    coarse = bench_art("hier")
+    deep = bench_art("hier", window_hi=0.25)
+    other_task = bench_art("arith", window_hi=0.25)
+
+    # no selector: all same-mechanism bench artifacts pool (the pre-bhjf hazard)
+    assert cli._adj_artifact_matches_arm(coarse, "ultrametric", None)
+    assert cli._adj_artifact_matches_arm(deep, "ultrametric", None)
+
+    # a results-level knob separates protocol variants sharing the metric path
+    assert cli._adj_artifact_matches_arm(deep, "ultrametric", {"common_window_hi": 0.25})
+    assert not cli._adj_artifact_matches_arm(coarse, "ultrametric", {"common_window_hi": 0.25})
+    # null selects the knob-absent (default-protocol) artifacts only
+    assert cli._adj_artifact_matches_arm(coarse, "ultrametric", {"common_window_hi": None})
+    assert not cli._adj_artifact_matches_arm(deep, "ultrametric", {"common_window_hi": None})
+    # meta-level knobs (task, seed) select the same way
+    assert cli._adj_artifact_matches_arm(other_task, "ultrametric", {"task": "arith"})
+    assert not cli._adj_artifact_matches_arm(deep, "ultrametric", {"task": "arith"})
+    # a selector never rescues a mechanism mismatch
+    assert not cli._adj_artifact_matches_arm(deep, "tropical", {"common_window_hi": 0.25})
 
 
 # ---------------------------------------------------------------------------
