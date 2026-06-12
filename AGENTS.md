@@ -373,6 +373,19 @@ Mapping cheat-sheet:
 
 ---
 
+## The Research Loop (hypotheses → campaigns → verdicts)
+
+Scientific claims in this repo flow through an executable protocol — register
+falsifiable predictions in `hypotheses/registry.yaml` BEFORE evidence exists,
+run campaigns from frozen worktrees, and let `mgr adjudicate` (the only
+writer of verdicts) rule. **Read `docs/research_loop.md` before touching the
+registry, launching training runs, or interpreting verdicts** — it documents
+the conventions (pre-evidence registration, budget cohorts, probe quarantine,
+power-derived seed counts, refuted→successor rules) and walks one hypothesis
+through the complete cycle with real in-repo artifacts.
+
+---
+
 ## Landing the Plane (Session Completion)
 
 **When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
