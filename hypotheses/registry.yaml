@@ -72,6 +72,23 @@
 #     floor_source   — how the floor was computed (required).
 #   prediction: null is allowed ONLY with an operationalization_note naming
 #   what is missing — visible debt, never silent omission.
+#   statistical integrity (ci-v4, bead hij.4): every adjudicated arm records
+#   achieved POWER for the registered effect size (distance from the
+#   no-effect point — delta 0 / ratio 1 — to the threshold) at the observed
+#   variance, plus the seed count for 80% power. SUPPORTED/REFUTED below 50%
+#   power carries underpowered: true in the arms record — an asterisk, never
+#   a clean verdict (statuses are unchanged). Each arm also records a
+#   one-sided P_VALUE against its own registered threshold (parametric t for
+#   Welch/Student arms; the deterministic bootstrap's wrong-side proportion,
+#   add-one smoothed, for ratio arms). Each `mgr adjudicate` run computes
+#   Benjamini–Hochberg q-values over its family and reports BOTH numbers:
+#   "N supported, of which M survive FDR at q=0.10" — q-values are family-
+#   relative, so they live in run reports (verdicts.json), never in this
+#   ledger. Directional preregistration bars forking-paths inflation; FDR is
+#   the backstop for family SIZE, not a substitute. `mgr hypotheses power`
+#   renders the power table standalone. min_seeds in NEW entries should be
+#   power-derived once pilot variance exists (mgr hypotheses power tells you
+#   the number); existing entries are grandfathered until re-registered.
 #
 # GOVERNANCE
 #   Changes flow through normal git review. verdict_history is APPEND-ONLY:

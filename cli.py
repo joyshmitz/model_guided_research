@@ -7146,13 +7146,116 @@ def hypotheses_add(
     console.print(f"[bold green]Registered {hypothesis_id}[/bold green] → {path}")
 
 
+@hypotheses_app.command("power")
+def hypotheses_power(
+    hypothesis: Annotated[
+        list[str] | None, typer.Option("--hypothesis", "-H", help="Hypothesis id (repeatable; default: all)")
+    ] = None,
+    artifacts: Annotated[
+        list[Path] | None, typer.Option(help="Artifact root(s) to scan (repeatable)")
+    ] = None,
+) -> None:
+    """Power analysis per hypothesis (bead hij.4): achieved power to detect
+    the REGISTERED effect size at the current evidence's variance and seed
+    count, and the per-arm seed count needed for 80%. Read-only: runs the
+    verdict engine's evidence pipeline without touching the registry.
+
+    "3 seeds, 34% power - needs 8" is the actionable output: a SUPPORTED or
+    REFUTED verdict below the 50% power floor carries the UNDERPOWERED
+    qualifier in adjudication; this command tells you how many seeds fix it.
+    """
+    data = _hypotheses_load_or_exit()
+    entries = [h for h in data.get("hypotheses", []) if isinstance(h, dict)]
+    if hypothesis:
+        wanted = set(hypothesis)
+        unknown = wanted - {h.get("id") for h in entries}
+        if unknown:
+            console.print(f"[bold red]Unknown hypothesis id(s): {sorted(unknown)}[/bold red]")
+            raise typer.Exit(code=2)
+        entries = [h for h in entries if h.get("id") in wanted]
+    roots = [Path(p) for p in (artifacts or [Path("artifacts")])]
+    index = _adj_collect_artifacts(roots)
+    console.print(
+        f"[bold cyan]power[/bold cyan] {len(entries)} hypothesis(es) · "
+        f"{len(index)} artifact(s) · floor {_ADJ_POWER_FLOOR:.0%} · target {_ADJ_POWER_TARGET:.0%}"
+    )
+    table = Table(title=f"power analysis (policy {_ADJ_POLICY_VERSION})", box=box.SIMPLE_HEAVY)
+    table.add_column("hypothesis", style="bold")
+    table.add_column("arm")
+    table.add_column("n (c/b)", justify="right")
+    table.add_column("power", justify="right")
+    table.add_column(f"n for {_ADJ_POWER_TARGET:.0%}", justify="right")
+    table.add_column("note")
+    for h in entries:
+        v = _adjudicate_hypothesis(h, index)
+        hid = str(v["id"])
+        if v["verdict"] == "blocked":
+            table.add_row(hid, "", "", "", "", f"[dim]blocked: {v['reason_code']}[/dim]")
+            continue
+        for mech, a in v["arms"].items():
+            power = a.get("power")
+            if power is None:
+                note = "power undefined: threshold is the no-effect point"
+                table.add_row(hid, mech, f"{a['n_candidate']}/{a['n_baseline']}", "-", "-", note)
+                continue
+            under = power < _ADJ_POWER_FLOOR
+            style_p = "red" if under else ("yellow" if power < _ADJ_POWER_TARGET else "green")
+            note = "UNDERPOWERED below verdict floor" if under else ""
+            table.add_row(
+                hid,
+                mech,
+                f"{a['n_candidate']}/{a['n_baseline']}",
+                f"[{style_p}]{power:.0%}[/{style_p}]",
+                str(a.get("n_for_80pct", "-")),
+                note,
+            )
+    console.print(table)
+
+
 # =============================================================================
 # Verdict engine (bead hij.2) — mgr adjudicate. Artifacts in, verdicts out,
 # deterministically. The integrity core is REFUSAL: missing/weak/tainted
 # evidence yields BLOCKED with a machine-readable reason, never a soft verdict.
 # =============================================================================
 
-_ADJ_POLICY_VERSION = "ci-v3"
+_ADJ_POLICY_VERSION = "ci-v4"
+# ci-v4 (bead hij.4) EXTENDS ci-v3 with statistical-integrity instrumentation;
+# every verdict's CI machinery, observation units, floor gate, and budget
+# cohorts are computed exactly as under ci-v3. Prior verdicts keep their
+# stamps (append-only); re-adjudication under ci-v4 supersedes by appending.
+#   - power (per arm): achieved power to detect the REGISTERED effect size -
+#     the distance from the no-effect point (delta 0 / ratio 1) to the
+#     registered threshold - at the observed variance and seed count, normal
+#     approximation, two-sided alpha 0.05. Mildly optimistic at n=3; the
+#     power floor is a coarse honesty gate, not an inference. Power is
+#     undefined (null) when the threshold IS the no-effect point. Zero
+#     observed spread = power 1 by convention (deterministic observable).
+#     n_for_80pct: the per-arm seed count solving for 80% power under
+#     balanced-arm growth (ratio arms: 1/sqrt(n) scaling of the bootstrap
+#     SE by the smaller arm).
+#   - UNDERPOWERED qualifier: a SUPPORTED or REFUTED arm whose achieved
+#     power is below 0.5 carries underpowered: true - a visible asterisk,
+#     never a clean verdict (a test that could not have detected the
+#     registered effect is noise laundered as evidence). The verdict STATUS
+#     is unchanged (the registry vocabulary stays supported/refuted/
+#     inconclusive); the qualifier rides in the arms record and rendering.
+#   - p_value (per arm): one-sided p for the registered claim against its
+#     own threshold (H0 at the threshold, H1 the registered direction) -
+#     the test the CI rule already implies (CI95 bound clears threshold
+#     <=> one-sided p <= 0.025). Welch/Student arms: parametric t. Ratio
+#     arms: add-one-smoothed proportion of the SAME deterministic bootstrap
+#     resamples on the wrong side of the threshold (minimum resolvable p =
+#     1/(N+1) ~ 1e-4 at N=10_000 - far below the q=0.10 decision band).
+#     Record-level p_value = max over arms (a for-all claim is as strong as
+#     its weakest arm).
+#   - ledger-level FDR: each adjudication run computes Benjamini-Hochberg
+#     q-values across ITS family (every non-blocked verdict with a p-value
+#     in the run); the headline always reports both "N supported" and "M
+#     survive FDR at q=0.10" - the gap IS the honesty. q-values are family-
+#     relative and live in run reports (verdicts.json), never the ledger.
+#     Directional preregistration already bars forking-paths inflation;
+#     FDR is the backstop for family SIZE, not a substitute for it. The
+#     report flags families whose ledger mixes policy versions.
 # ci-v3 (bead xas7) EXTENDS ci-v2 by appending capabilities; every two-arm
 # verdict is computed exactly as under ci-v2 (same observation units, same
 # Welch t / bootstrap CIs, same floor gate, same budget cohorts):
@@ -7215,6 +7318,9 @@ _ADJ_POLICY_VERSION = "ci-v3"
 _ADJ_BUDGET_RTOL = 0.05
 _ADJ_BOOTSTRAP_SEED = 1234
 _ADJ_BOOTSTRAP_N = 10_000
+_ADJ_POWER_FLOOR = 0.5  # below this, supported/refuted arms carry the UNDERPOWERED qualifier (ci-v4)
+_ADJ_POWER_TARGET = 0.8  # the n_for_80pct column solves for this
+_ADJ_FDR_Q = 0.10  # Benjamini-Hochberg level for the ledger-family headline (ci-v4)
 _ADJ_ATTENTION_MECHS = frozenset(
     {"standard", "tropical", "ultrametric", "simplicial", "quaternion", "braid", "fractal", "octonion", "surreal", "reversible", "gauge"}
 )
@@ -7224,7 +7330,7 @@ _ADJ_BLOCK_REASONS = {
     "no_candidate_artifacts": "no qualifying artifact for the candidate arm",
     "no_baseline_artifacts": "no qualifying artifact for the baseline arm",
     "tainted_evidence": "only tainted artifacts available (dirty tree / missing provenance) - evidence not attributable to a committed code state",
-    "insufficient_seeds": "no equal-FLOPs cohort gives both arms at least min_seeds (>= 2) training runs",
+    "insufficient_seeds": "no equal-FLOPs cohort gives both arms at least min_seeds (>= 2) training runs - mgr hypotheses power computes the seed count the registered effect actually needs",
     "budget_mismatch": "no equal-FLOPs cohort (5% tolerance) contains both arms, or an artifact cannot prove its planned budget",
     "metric_missing": "qualifying artifact lacks the metric at the registered path",
 }
@@ -7496,18 +7602,31 @@ def _adj_ci(cand: list[float], base: list[float], threshold_kind: str) -> tuple[
 
         crit = float(_scipy_stats.t.ppf(0.975, df))
         return effect, effect - crit * se, effect + crit * se
-    rng = _np.random.default_rng(_ADJ_BOOTSTRAP_SEED)
     c = _np.asarray(cand, dtype=float)
     b = _np.asarray(base, dtype=float)
     effect = float(c.mean() / b.mean())
-    ratios = []
+    ratios = _adj_bootstrap_ratios(cand, base)
+    lo, hi = _np.percentile(ratios, [2.5, 97.5])
+    return effect, float(lo), float(hi)
+
+
+def _adj_bootstrap_ratios(cand: list[float], base: list[float]) -> list[float]:
+    """The engine's single deterministic bootstrap stream for ratio arms
+    (fixed seed, fixed resample count): the CI percentiles, the ci-v4
+    p-value, and the ci-v4 power estimate all read the SAME resamples, so
+    they can never disagree about the sampling distribution."""
+    import numpy as _np
+
+    rng = _np.random.default_rng(_ADJ_BOOTSTRAP_SEED)
+    c = _np.asarray(cand, dtype=float)
+    b = _np.asarray(base, dtype=float)
+    ratios: list[float] = []
     for _ in range(_ADJ_BOOTSTRAP_N):
         cs = c[rng.integers(0, len(c), len(c))]
         bs = b[rng.integers(0, len(b), len(b))]
         if bs.mean() != 0:
-            ratios.append(cs.mean() / bs.mean())
-    lo, hi = _np.percentile(ratios, [2.5, 97.5])
-    return effect, float(lo), float(hi)
+            ratios.append(float(cs.mean() / bs.mean()))
+    return ratios
 
 
 def _adj_ci_single(obs: list[float]) -> tuple[float, float, float]:
@@ -7525,6 +7644,123 @@ def _adj_ci_single(obs: list[float]) -> tuple[float, float, float]:
 
     crit = float(_scipy_stats.t.ppf(0.975, n - 1))
     return effect, effect - crit * se, effect + crit * se
+
+
+def _adj_null_reference(threshold_kind: str) -> float:
+    """The no-effect point the registered effect size is measured FROM:
+    a delta of 0 (absolute_delta) or a ratio of 1 (ratio)."""
+    return 1.0 if threshold_kind == "ratio" else 0.0
+
+
+def _adj_p_value(
+    cand: list[float],
+    base: list[float],
+    threshold: float,
+    threshold_kind: str,
+    comparator: str,
+    single_arm: bool,
+) -> float | None:
+    """One-sided p-value for the registered claim against its own threshold
+    (ci-v4): H0 places the true effect AT the threshold, H1 is the registered
+    direction - the test the CI verdict rule already implies (CI95 bound
+    clears threshold <=> one-sided p <= 0.025), so BH over these p-values
+    measures exactly which verdicts survive the family. Welch/Student arms:
+    parametric t. Ratio arms: add-one-smoothed proportion of the engine's
+    deterministic bootstrap resamples on the wrong side of the threshold
+    (minimum resolvable p = 1/(N+1)). Zero spread degenerates to 0 or 1."""
+    import statistics as stats_mod
+
+    if threshold_kind == "absolute_delta":
+        if single_arm:
+            n = len(cand)
+            effect = stats_mod.mean(cand)
+            var = stats_mod.variance(cand) if n > 1 else 0.0
+            se = (var / n) ** 0.5
+            df = float(n - 1)
+        else:
+            effect = stats_mod.mean(cand) - stats_mod.mean(base)
+            vc, vb = stats_mod.variance(cand), stats_mod.variance(base)
+            nc, nb = len(cand), len(base)
+            se = (vc / nc + vb / nb) ** 0.5
+            df = (
+                (vc / nc + vb / nb) ** 2 / ((vc / nc) ** 2 / (nc - 1) + (vb / nb) ** 2 / (nb - 1))
+                if se > 0.0
+                else 1.0
+            )
+        if se == 0.0:
+            ok = effect >= threshold if comparator == ">=" else effect <= threshold
+            return 0.0 if ok else 1.0
+        from scipy import stats as _scipy_stats
+
+        sf = float(_scipy_stats.t.sf((effect - threshold) / se, df))
+        return sf if comparator == ">=" else 1.0 - sf
+    ratios = _adj_bootstrap_ratios(cand, base)
+    if not ratios:
+        return None
+    if comparator == ">=":
+        wrong = sum(1 for r in ratios if r < threshold)
+    else:
+        wrong = sum(1 for r in ratios if r > threshold)
+    return (wrong + 1) / (len(ratios) + 1)
+
+
+def _adj_power(
+    cand: list[float],
+    base: list[float],
+    threshold: float,
+    threshold_kind: str,
+    single_arm: bool,
+) -> dict[str, Any] | None:
+    """Achieved power (ci-v4, normal approximation, two-sided alpha 0.05) to
+    detect the REGISTERED effect size - the distance from the no-effect point
+    to the registered threshold - at the observed variance and seed count,
+    plus the per-arm seed count needed for the 80% target under balanced-arm
+    growth. None when the threshold IS the no-effect point (effect size zero:
+    power undefined). Zero observed spread = power 1 by convention (a
+    deterministic observable). Mildly optimistic at n=3 (normal, not t);
+    the power floor is a coarse honesty gate, not an inference."""
+    import statistics as stats_mod
+
+    effect_size = abs(threshold - _adj_null_reference(threshold_kind))
+    if effect_size == 0.0:
+        return None
+    z975, z80 = 1.959963984540054, 0.8416212335729143
+    if threshold_kind == "absolute_delta":
+        if single_arm:
+            n_now = len(cand)
+            basis = stats_mod.variance(cand) if n_now > 1 else 0.0  # SE(n)^2 = basis/n
+        else:
+            nc, nb = len(cand), len(base)
+            n_now = min(nc, nb)
+            basis = (stats_mod.variance(cand) / nc + stats_mod.variance(base) / nb) * n_now
+    else:
+        ratios = _adj_bootstrap_ratios(cand, base)
+        if len(ratios) < 2:
+            return None
+        n_now = min(len(cand), len(base))
+        basis = stats_mod.variance(ratios) * n_now  # 1/sqrt(n) scaling by the smaller arm
+    se_now = (basis / n_now) ** 0.5
+    if se_now == 0.0:
+        return {"power": 1.0, "n_for_80pct": n_now}
+    from scipy import stats as _scipy_stats
+
+    power = float(_scipy_stats.norm.cdf(effect_size / se_now - z975))
+    n80 = math.ceil(basis * (z975 + z80) ** 2 / (effect_size * effect_size))
+    return {"power": power, "n_for_80pct": max(n80, 2)}
+
+
+def _adj_bh_qvalues(pvals: dict[str, float]) -> dict[str, float]:
+    """Benjamini-Hochberg adjusted q-values (step-up, monotone-enforced):
+    q_(i) = min over j >= i of p_(j) * m / j on the ascending-sorted p's.
+    Deterministic tie-break on the key keeps reports stable."""
+    items = sorted(pvals.items(), key=lambda kv: (kv[1], kv[0]))
+    m = len(items)
+    q = [0.0] * m
+    running = 1.0
+    for i in range(m - 1, -1, -1):
+        running = min(running, items[i][1] * m / (i + 1))
+        q[i] = running
+    return {items[i][0]: q[i] for i in range(m)}
 
 
 def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -7677,6 +7913,19 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
                 arm_verdict = "inconclusive"
                 arm["floor_effect"] = True
                 floor_gated = True
+        # ---- ci-v4 statistical integrity: p-value + power per arm ----
+        arm["p_value"] = _adj_p_value(
+            cand_obs, base_obs, threshold, threshold_kind, str(comparator), single_arm
+        )
+        power_info = _adj_power(cand_obs, base_obs, threshold, threshold_kind, single_arm)
+        if power_info is not None:
+            arm["power"] = power_info["power"]
+            arm["n_for_80pct"] = power_info["n_for_80pct"]
+            if arm_verdict in ("supported", "refuted") and power_info["power"] < _ADJ_POWER_FLOOR:
+                # a clean-looking verdict from a test that could not have
+                # detected the registered effect is noise laundered as
+                # evidence - visibly qualified, never silently clean (hij.4)
+                arm["underpowered"] = True
         arm["verdict"] = arm_verdict
         arms[mech] = arm
         used_paths.extend(sorted({a["path"] for a in cc + bb}))
@@ -7691,6 +7940,13 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
         "policy_version": _ADJ_POLICY_VERSION,
         "tainted_artifacts_seen": saw_tainted,
     }
+    # ci-v4: a for-all claim is as strong as its weakest arm
+    arm_ps = [a.get("p_value") for a in arms.values()]
+    record["p_value"] = (
+        None if any(p is None for p in arm_ps) else max(p for p in arm_ps if p is not None)
+    )
+    if any(a.get("underpowered") for a in arms.values()):
+        record["underpowered"] = True
     if floor_gated:
         record["floor_effect"] = True
     return record
@@ -7765,6 +8021,27 @@ def adjudicate(
     today = time.strftime("%Y-%m-%d")
     verdicts = [_adjudicate_hypothesis(h, index) for h in entries]
 
+    # ---- ledger-level FDR (ci-v4): BH q-values across this run's family ----
+    # q-values are family-relative: they live in run reports, never the ledger.
+    family = [v for v in verdicts if v["verdict"] != "blocked" and v.get("p_value") is not None]
+    if family:
+        qmap = _adj_bh_qvalues({str(v["id"]): float(v["p_value"]) for v in family})
+        for v in family:
+            v["q_value"] = qmap[str(v["id"])]
+    n_supported = sum(1 for v in verdicts if v["verdict"] == "supported")
+    fdr_survivors = sorted(
+        str(v["id"]) for v in family if v["verdict"] == "supported" and v["q_value"] <= _ADJ_FDR_Q
+    )
+    # flag families aggregating heterogeneous statistical machinery: the
+    # ledger's latest recorded verdicts may predate this policy version
+    ledger_policies = sorted(
+        {
+            str((h.get("verdict_history") or [{}])[-1].get("policy_version") or "unstamped")
+            for h in data.get("hypotheses", [])
+            if isinstance(h, dict) and h.get("verdict_history")
+        }
+    )
+
     # ---- ledger append (real verdicts only; refusals are report-only) ----
     registry_path = _hypotheses_registry_path()
     applied = 0
@@ -7807,7 +8084,19 @@ def adjudicate(
     resolved_run_id = run_id or today
     run_dir = artifacts_dir / "adjudications" / resolved_run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    payload = {"policy_version": _ADJ_POLICY_VERSION, "date": today, "verdicts": verdicts}
+    payload = {
+        "policy_version": _ADJ_POLICY_VERSION,
+        "date": today,
+        "verdicts": verdicts,
+        "fdr": {
+            "q_level": _ADJ_FDR_Q,
+            "family_size": len(family),
+            "family_is_full_ledger": bool(adjudicate_all),
+            "supported": n_supported,
+            "supported_fdr_survivors": fdr_survivors,
+            "ledger_policy_versions": ledger_policies,
+        },
+    }
     (run_dir / "verdicts.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
     style = {"supported": "green", "refuted": "red", "inconclusive": "magenta", "blocked": "dim"}
@@ -7819,16 +8108,25 @@ def adjudicate(
     table = Table(title=f"adjudication — {today} (policy {_ADJ_POLICY_VERSION})", box=box.SIMPLE_HEAVY)
     table.add_column("hypothesis", style="bold")
     table.add_column("verdict")
+    table.add_column("q", justify="right")
     table.add_column("detail")
     md_rows = []
     for v in rows:
         st = v["verdict"]
+        st_label = st + ("-underpowered" if v.get("underpowered") else "")
+        q_txt = f"{v['q_value']:.3g}" if v.get("q_value") is not None else ""
         if st == "blocked":
             detail = f"{v['reason_code']}" + (f" [{v.get('mechanism')}]" if v.get("mechanism") else "")
         else:
             detail = "; ".join(
                 f"{m}: effect={a['effect']:.4g} ci95=[{a['ci95'][0]:.4g},{a['ci95'][1]:.4g}] "
                 f"(n={a['n_candidate']}/{a['n_baseline']})"
+                + (f" power={a['power']:.0%}" if a.get("power") is not None else "")
+                + (
+                    f" UNDERPOWERED(need n≈{a['n_for_80pct']})"
+                    if a.get("underpowered")
+                    else ""
+                )
                 + (
                     f" FLOOR(base {a['baseline_mean']:.4g} <= {a['baseline_floor']:.4g}, no power)"
                     if a.get("floor_effect")
@@ -7836,27 +8134,47 @@ def adjudicate(
                 )
                 for m, a in v["arms"].items()
             )
-        table.add_row(str(v["id"]), f"[{style[st]}]{st}[/{style[st]}]", detail)
-        md_rows.append(f"| {v['id']} | {st} | {detail} |")
+        table.add_row(str(v["id"]), f"[{style[st]}]{st_label}[/{style[st]}]", q_txt, detail)
+        md_rows.append(f"| {v['id']} | {st_label} | {q_txt} | {detail} |")
     console.print(table)
     counts: dict[str, int] = {}
     for v in verdicts:
         counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
     summary_line = " · ".join(f"{k}: {n}" for k, n in sorted(counts.items()))
+    # the mandatory two-number headline (ci-v4): the gap IS the honesty
+    fdr_line = (
+        f"{n_supported} supported, of which {len(fdr_survivors)} survive FDR at q={_ADJ_FDR_Q:g} "
+        f"(family: {len(family)} adjudicated"
+        + ("" if adjudicate_all else " - PARTIAL run, not the whole ledger")
+        + ")"
+    )
+    policy_note = (
+        f"ledger note: latest recorded verdicts span policies {ledger_policies}; q-values here "
+        f"are computed fresh under {_ADJ_POLICY_VERSION} for this run's family only."
+        if len(ledger_policies) > 1
+        else ""
+    )
     report_md = (
         f"# Adjudication — {today}\n\n"
         f"- policy: `{_ADJ_POLICY_VERSION}`\n"
         f"- artifacts indexed: {len(index)} from {[str(r) for r in roots]}\n"
         f"- ledger entries appended: {applied}{' (dry run)' if dry_run else ''}\n"
-        f"- verdicts: {summary_line}\n\n"
-        "| hypothesis | verdict | detail |\n|---|---|---|\n" + "\n".join(md_rows) + "\n\n"
+        f"- verdicts: {summary_line}\n"
+        f"- **{fdr_line}**\n"
+        + (f"- {policy_note}\n" if policy_note else "")
+        + "\n| hypothesis | verdict | q | detail |\n|---|---|---|---|\n" + "\n".join(md_rows) + "\n\n"
         "BLOCKED rows are refusals, not adjudications: the engine declines to rule on weak, "
-        "mismatched, or tainted evidence. See `verdicts.json` for machine-readable reasons.\n"
+        "mismatched, or tainted evidence. UNDERPOWERED verdicts cleared their threshold at a test "
+        "with under 50% power to detect the registered effect - an asterisk, not a clean verdict. "
+        "See `verdicts.json` for machine-readable reasons, p-values, and q-values.\n"
     )
     (run_dir / "report.md").write_text(report_md)
+    if policy_note:
+        console.print(f"[yellow]{policy_note}[/yellow]")
     console.print(
         Panel(
-            f"[bold]{summary_line}[/bold] · ledger appends: {applied}{' (dry run)' if dry_run else ''} · → {run_dir}",
+            f"[bold]{summary_line}[/bold]\n[bold cyan]{fdr_line}[/bold cyan]\n"
+            f"ledger appends: {applied}{' (dry run)' if dry_run else ''} · → {run_dir}",
             border_style="blue",
         )
     )

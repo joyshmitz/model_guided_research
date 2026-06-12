@@ -10,6 +10,7 @@ evidence - is tested explicitly per the bead.
 """
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -125,7 +126,7 @@ def test_supported_when_ci_clears_threshold(tmp_path):
     arm = v["arms"]["ultrametric"]
     assert arm["ci95"][0] >= 0.05 and abs(arm["effect"] - 0.30) < 0.02
     assert arm["n_candidate"] == 3 and arm["n_baseline"] == 3  # one obs per trained model
-    assert v["policy_version"] == "ci-v3"
+    assert v["policy_version"] == "ci-v4"
 
 
 def test_refuted_when_ci_clears_opposite_side(tmp_path):
@@ -444,8 +445,8 @@ def test_ledger_append_preserves_comments_and_is_append_only(tmp_path, monkeypat
     assert entry["status"] == "supported"
     assert len(entry["verdict_history"]) == 1
     first = entry["verdict_history"][0]
-    assert first["verdict"] == "supported" and first["adjudicator"] == "engine:ci-v3"
-    assert first["policy_version"] == "ci-v3" and first["artifacts"]
+    assert first["verdict"] == "supported" and first["adjudicator"] == "engine:ci-v4"
+    assert first["policy_version"] == "ci-v4" and first["artifacts"]
 
     # second adjudication APPENDS; the first entry is untouched
     result = runner.invoke(cli.app, [
@@ -651,7 +652,7 @@ def test_single_arm_certify_supported_budget_exempt(tmp_path):
     assert arm["single_arm"] is True
     assert arm["budget_flops"] is None
     assert arm["n_candidate"] == 3 and arm["n_baseline"] == 0
-    assert v["policy_version"] == "ci-v3"
+    assert v["policy_version"] == "ci-v4"
 
 
 def test_single_arm_certify_refuted_and_seed_dedupe(tmp_path):
@@ -740,8 +741,9 @@ def test_single_arm_train_trend_route_coverage_delta(tmp_path):
 
 
 def test_two_arm_verdicts_unchanged_under_ci_v3(tmp_path):
-    """ci-v3 is append-only policy: a classic two-arm adjudication produces
-    the same arms record as under ci-v2 (only the stamp changes)."""
+    """ci-v3/ci-v4 are append-only policy: a classic two-arm adjudication
+    produces the same verdict and CI as under ci-v2 (the stamp changes, and
+    ci-v4 ADDS power/p_value instrumentation without touching the decision)."""
     _arm_artifacts(tmp_path, "cand", "ultrametric", [0.50, 0.52, 0.54], answer_prior=0.01)
     _arm_artifacts(tmp_path, "base", "standard", [0.30, 0.31, 0.32], answer_prior=0.01)
     v = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path))
@@ -749,7 +751,7 @@ def test_two_arm_verdicts_unchanged_under_ci_v3(tmp_path):
     arm = v["arms"]["ultrametric"]
     assert "single_arm" not in arm
     assert arm["n_candidate"] == 3 and arm["n_baseline"] == 3
-    assert v["policy_version"] == "ci-v3"
+    assert v["policy_version"] == "ci-v4"
 
 
 def test_evaltasks_variant_selector_resolves_via_model_config(tmp_path):
@@ -1164,3 +1166,137 @@ def test_depth_curve_hygiene_rejects_mislabeled_groups(tmp_path):
         "--artifacts-dir", str(tmp_path), "--run-id", "dc-inverted",
     ])
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# ci-v4 (bead hij.4): power-gated verdicts + ledger-level FDR
+
+
+def test_bh_qvalues_textbook():
+    """BH step-up against the hand-computed canonical case: sorted p
+    [0.005, 0.01, 0.03, 0.04], m=4 -> raw p*m/i [0.02, 0.02, 0.04, 0.04]
+    (monotone enforcement leaves them unchanged here)."""
+    q = cli._adj_bh_qvalues({"a": 0.01, "b": 0.04, "c": 0.03, "d": 0.005})
+    assert abs(q["d"] - 0.02) < 1e-12
+    assert abs(q["a"] - 0.02) < 1e-12
+    assert abs(q["c"] - 0.04) < 1e-12
+    assert abs(q["b"] - 0.04) < 1e-12
+    # monotone enforcement: a later small raw q pulls earlier ones down
+    q2 = cli._adj_bh_qvalues({"x": 0.02, "y": 0.021})
+    # raw: x -> 0.04, y -> 0.021; min-from-top: x -> min(0.04, 0.021) = 0.021
+    assert abs(q2["x"] - 0.021) < 1e-12 and abs(q2["y"] - 0.021) < 1e-12
+    # singleton family: q == p
+    assert cli._adj_bh_qvalues({"only": 0.03})["only"] == 0.03
+
+
+def test_power_closed_form_two_sample():
+    """Power validated against the closed-form normal expression written out
+    independently here: power = Phi(D/SE - z975) with SE^2 = vc/nc + vb/nb."""
+    from scipy import stats as scipy_stats
+
+    out = cli._adj_power([1.0, 2.0, 3.0], [0.0, 1.0, 2.0], 2.0, "absolute_delta", False)
+    se = math.sqrt(1.0 / 3 + 1.0 / 3)  # both sample variances are exactly 1
+    expected = float(scipy_stats.norm.cdf(2.0 / se - 1.959963984540054))
+    assert abs(out["power"] - expected) < 1e-12
+    # n for 80%: ceil((vc+vb) * (z975+z80)^2 / D^2) = ceil(2 * 7.8489 / 4) = 4
+    assert out["n_for_80pct"] == 4
+
+    # threshold AT the no-effect point: effect size zero, power undefined
+    assert cli._adj_power([1.0, 2.0], [1.0, 2.0], 0.0, "absolute_delta", False) is None
+    # zero spread in both arms: a deterministic observable has full power
+    out0 = cli._adj_power([1.0, 1.0, 1.0], [0.0, 0.0, 0.0], 0.5, "absolute_delta", False)
+    assert out0["power"] == 1.0 and out0["n_for_80pct"] == 3
+
+    # single-arm Student case
+    out1 = cli._adj_power([1.0, 2.0, 3.0], [], 2.0, "absolute_delta", True)
+    se1 = math.sqrt(1.0 / 3)
+    expected1 = float(scipy_stats.norm.cdf(2.0 / se1 - 1.959963984540054))
+    assert abs(out1["power"] - expected1) < 1e-12
+    assert out1["n_for_80pct"] == 2
+
+
+def test_underpowered_qualifier_on_supported_verdict(tmp_path):
+    """A SUPPORTED verdict whose test had under 50% power to detect the
+    registered effect carries the UNDERPOWERED qualifier; a tight-variance
+    SUPPORTED verdict stays clean. Hand-built case: cand [0.65, 0.70, 0.75]
+    vs base [0.50, 0.50, 0.50], threshold 0.05 -> SE = sqrt(0.0025/3) ~ 0.0289,
+    achieved power ~ 41%, but the CI (df=2, crit 4.303) still clears."""
+    _arm_artifacts(tmp_path / "weak", "cand", "ultrametric", [0.65, 0.70, 0.75])
+    _arm_artifacts(tmp_path / "weak", "base", "standard", [0.50, 0.50, 0.50])
+    v = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path / "weak"))
+    assert v["verdict"] == "supported", v
+    arm = v["arms"]["ultrametric"]
+    assert arm["underpowered"] is True and v["underpowered"] is True
+    assert 0.30 < arm["power"] < 0.50
+    assert arm["n_for_80pct"] == 8  # ceil(0.0025 * 7.8489 / 0.0025)
+    assert arm["p_value"] <= 0.025  # supported <=> one-sided p clears 2.5%
+
+    _arm_artifacts(tmp_path / "tight", "cand", "ultrametric", [0.80, 0.82, 0.81])
+    _arm_artifacts(tmp_path / "tight", "base", "standard", [0.50, 0.51, 0.52])
+    v2 = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path / "tight"))
+    assert v2["verdict"] == "supported"
+    arm2 = v2["arms"]["ultrametric"]
+    assert arm2["power"] > 0.99 and "underpowered" not in arm2
+    assert "underpowered" not in v2
+
+
+def test_p_value_matches_ci_decision_welch(tmp_path):
+    """The ci-v4 p-value tests H0 at the registered threshold, so it must
+    agree with the existing CI verdict rule: supported <=> p <= 0.025 and an
+    inconclusive straddle <=> p > 0.025 (for >= claims)."""
+    _arm_artifacts(tmp_path / "s", "cand", "ultrametric", [0.80, 0.82, 0.81])
+    _arm_artifacts(tmp_path / "s", "base", "standard", [0.50, 0.51, 0.52])
+    vs = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path / "s"))
+    assert vs["verdict"] == "supported" and vs["arms"]["ultrametric"]["p_value"] <= 0.025
+    assert vs["p_value"] == vs["arms"]["ultrametric"]["p_value"]
+
+    _arm_artifacts(tmp_path / "i", "cand", "ultrametric", [0.50, 0.60, 0.55])
+    _arm_artifacts(tmp_path / "i", "base", "standard", [0.48, 0.52, 0.50])
+    vi = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path / "i"))
+    assert vi["verdict"] == "inconclusive" and vi["arms"]["ultrametric"]["p_value"] > 0.025
+
+
+def test_ratio_bootstrap_p_value_deterministic_and_bounded():
+    """Ratio-arm p-values reuse the engine's fixed-seed bootstrap stream:
+    deterministic across calls, add-one smoothed (never exactly 0), and
+    directionally sane."""
+    cand, base = [2.0, 2.1, 1.9], [1.0, 1.05, 0.95]
+    p1 = cli._adj_p_value(cand, base, 1.5, "ratio", ">=", False)
+    p2 = cli._adj_p_value(cand, base, 1.5, "ratio", ">=", False)
+    assert p1 == p2, "fixed seed must make the bootstrap p deterministic"
+    assert p1 >= 1.0 / (cli._ADJ_BOOTSTRAP_N + 1)  # minimum resolvable p
+    assert p1 < 0.025  # ratio ~2 vs threshold 1.5: clearly supported
+    p_flip = cli._adj_p_value(cand, base, 1.5, "ratio", "<=", False)
+    assert p_flip > 0.5  # the same evidence is terrible for a <= 1.5 claim
+
+
+def test_fdr_headline_and_qvalues_in_run_report(tmp_path, monkeypatch):
+    """Command-level ci-v4: verdicts.json carries the fdr block + per-verdict
+    q_value, and the report headline shows BOTH numbers (N supported / M
+    survive). Two clearly-supported hypotheses at tiny p -> both survive."""
+    registry = tmp_path / "registry.yaml"
+    h1 = _hyp()
+    h2 = _hyp()
+    h2["id"] = "hyp-engine-test-2"
+    h2["prediction"]["metric_path"] = "evaltasks:tasks.hier.exact_match.greedy.in_range.mean"
+    registry.write_text(
+        "schema_version: 1\nhypotheses:\n" + _yaml_entry(h1) + _yaml_entry(h2)
+    )
+    monkeypatch.setattr(cli, "_hypotheses_registry_path", lambda: registry)
+    monkeypatch.setattr(cli, "_load_parent_hypothesis_registry", lambda repo_root: None)
+    _arm_artifacts(tmp_path / "a", "cand", "ultrametric", [0.80, 0.82, 0.81])
+    _arm_artifacts(tmp_path / "a", "base", "standard", [0.50, 0.51, 0.52])
+
+    result = runner.invoke(cli.app, [
+        "adjudicate", "--all", "--dry-run", "--artifacts", str(tmp_path / "a"),
+        "--artifacts-dir", str(tmp_path / "out"), "--run-id", "fdr",
+    ])
+    assert result.exit_code == 0, result.output
+    payload = json.loads((tmp_path / "out" / "adjudications" / "fdr" / "verdicts.json").read_text())
+    fdr = payload["fdr"]
+    assert fdr["q_level"] == 0.10 and fdr["family_size"] == 2 and fdr["supported"] == 2
+    assert sorted(fdr["supported_fdr_survivors"]) == ["hyp-engine-test", "hyp-engine-test-2"]
+    for v in payload["verdicts"]:
+        assert v["q_value"] <= 0.10 and v["p_value"] is not None
+    report = (tmp_path / "out" / "adjudications" / "fdr" / "report.md").read_text()
+    assert "2 supported, of which 2 survive FDR at q=0.1" in report
