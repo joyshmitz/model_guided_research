@@ -1,0 +1,33 @@
+{
+  "date": "2026-06-11",
+  "policy_version": "ci-v3",
+  "verdicts": [
+    {
+      "arms": {
+        "tropical": {
+          "budget_flops": 100000000000000.0,
+          "ci95": [
+            0.9990939939879852,
+            1.000311134113516
+          ],
+          "effect": 0.9997239529166014,
+          "n_baseline": 3,
+          "n_candidate": 3,
+          "verdict": "supported"
+        }
+      },
+      "artifacts": [
+        "artifacts/campaigns/9qk3/arith-tropical-anneal-s0/summary.json",
+        "artifacts/campaigns/9qk3/arith-tropical-anneal-s1/summary.json",
+        "artifacts/campaigns/9qk3/arith-tropical-anneal-s2/summary.json",
+        "artifacts/campaigns/9qk3/arith-tropical-b1-s0/summary.json",
+        "artifacts/campaigns/9qk3/arith-tropical-b1-s1/summary.json",
+        "artifacts/campaigns/9qk3/arith-tropical-b1-s2/summary.json"
+      ],
+      "id": "hyp-maslov-anneal-loss-retention",
+      "policy_version": "ci-v3",
+      "tainted_artifacts_seen": false,
+      "verdict": "supported"
+    }
+  ]
+}

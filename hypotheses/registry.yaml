@@ -724,9 +724,10 @@ hypotheses:
       candidate_variant: {semiring_beta_spec: "linear:1:32"}
       min_seeds: 3
       scale_caveats: "E1 rung on the arith corpus (the validated discriminator); runs must enable --val-interval (campaign trainings default to no validation pass)"
-    status: open
+    status: supported
     evidence: []
-    verdict_history: []
+    verdict_history:
+      - {date: "2026-06-11", verdict: supported, artifacts: ["artifacts/campaigns/9qk3/arith-tropical-anneal-s0/summary.json", "artifacts/campaigns/9qk3/arith-tropical-anneal-s1/summary.json", "artifacts/campaigns/9qk3/arith-tropical-anneal-s2/summary.json", "artifacts/campaigns/9qk3/arith-tropical-b1-s0/summary.json", "artifacts/campaigns/9qk3/arith-tropical-b1-s1/summary.json", "artifacts/campaigns/9qk3/arith-tropical-b1-s2/summary.json"], adjudicator: "engine:ci-v3", policy_version: "ci-v3", arms: {"tropical": {"budget_flops": 100000000000000.0, "ci95": [0.9990939939879852, 1.000311134113516], "effect": 0.9997239529166014, "n_baseline": 3, "n_candidate": 3, "verdict": "supported"}}}
 
   - id: hyp-braid-dyck-directional
     statement: >-
