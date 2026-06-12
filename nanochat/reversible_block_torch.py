@@ -1,71 +1,194 @@
 """
 Reversible Block Module (PyTorch)
-Implements a Reversible Block using Additive Coupling or Symplectic/Cayley transforms.
-Allows O(1) memory training (in theory, via checkpointing/recomputation).
+
+Two coupling modes on the half-split stream x = [x1, x2] (bead u55.5):
+
+additive (the classic RevNet form — volume-preserving for ANY F, G):
+    y1 = x1 + F(x2)          y2 = x2 + G(y1)
+    x2 = y2 - G(y1)          x1 = y1 - F(x2)
+
+symplectic (kick-kick / Stormer-Verlet, F and G are EXACT GRADIENTS of
+scalar potentials — each kick is an exact symplectic shear, so the block
+satisfies J^T Omega J = Omega identically; theory note
+markdown_documentation/symplectic_transformer.md):
+    y1 = x1 + grad(phi_F)(x2)        y2 = x2 - grad(phi_G)(y1)
+    x2 = y2 + grad(phi_G)(y1)        x1 = y1 - grad(phi_F)(x2)
+
+The MINUS on the second kick is load-bearing: it makes the block the
+splitting integrator of the COERCIVE Hamiltonian H = phi_G(x1) + phi_F(x2),
+whose shadow is conserved across tied depth and bounds activation norms.
+With ++ signs the conserved quantity is the non-coercive DIFFERENCE
+phi_F - phi_G and norms can blow up (validated: 6.5e4x at kick scale 0.2).
+
+O(1)-memory training (in theory, via recomputation) is unchanged: the kick
+inverse is the negative kick, exact to machine epsilon.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F_torch
 
-# Simple Reversible Block:
-# x = [x1, x2]
-# y1 = x1 + F(x2)
-# y2 = x2 + G(y1)
-# Inverse:
-# x2 = y2 - G(y1)
-# x1 = y1 - F(x2)
+
+class _EnergyHead(nn.Module):
+    """Scalar potential phi(x) = sum_t v^T tanh(W h_t) + (lambda/2) ||x||^2,
+    h = inner(x) the wrapped attention/MLP block on the half-stream.
+
+    Coercivity by construction (u55.5 polish round 3): the tanh head is
+    BOUNDED (|phi_net| <= T ||v||_1), so the learnable confinement
+    lambda = lambda_min + softplus(lambda_raw) >= lambda_min makes every
+    level set of phi bounded, with the explicit activation bound
+    ||x||^2 <= (2/lambda_min) (H + 2 T max ||v||_1) derived in the note.
+    lambda_min = 0 is allowed as the registered falsification control."""
+
+    def __init__(self, inner: nn.Module, dim: int, lambda_min: float, inner_takes_ctx: bool):
+        super().__init__()
+        self.inner = inner
+        self.inner_takes_ctx = inner_takes_ctx
+        self.W = nn.Linear(dim, dim, bias=False)
+        self.v = nn.Parameter(torch.randn(dim) * 0.02)
+        self.lambda_min = float(lambda_min)
+        # softplus(0.0541) ~ 0.72 is too hot; pick raw so initial lambda ~ lambda_min + 0.05
+        self.lambda_raw = nn.Parameter(torch.tensor(_softplus_inverse(0.05)))
+
+    @property
+    def confinement(self) -> torch.Tensor:
+        return self.lambda_min + F_torch.softplus(self.lambda_raw)
+
+    def forward(self, x, cos_sin=None, kv_cache=None) -> torch.Tensor:
+        # x: (B, T, C_half) -> phi: (B,)  [token-coupled scalar per element]
+        h = self.inner(x, cos_sin, kv_cache) if self.inner_takes_ctx else self.inner(x)
+        e: torch.Tensor = torch.tanh(self.W(h)) @ self.v  # (B, T)
+        phi: torch.Tensor = e.sum(dim=-1) + 0.5 * self.confinement * x.pow(2).sum(dim=(-2, -1))
+        return phi
+
+
+def _softplus_inverse(y: float) -> float:
+    import math
+
+    return math.log(math.expm1(y))
+
+
+class SymplecticKick(nn.Module):
+    """Exact-gradient kick: returns grad_x phi(x).
+
+    Differentiability contract: under grad mode the kick output carries a
+    create_graph=True second-order graph (the autograd-of-autograd training
+    path — phi's parameters AND upstream activations both receive gradients
+    through the kick). Under no_grad (eval/generation) the gradient is
+    computed in a local enable_grad island and returned detached."""
+
+    def __init__(self, energy: _EnergyHead):
+        super().__init__()
+        self.energy = energy
+        self.last_phi: float | None = None  # telemetry, populated when recording
+
+    def forward(self, x, cos_sin=None, kv_cache=None, record: bool = False) -> torch.Tensor:
+        # The kick's training path differentiates THROUGH the energy gradient
+        # (double backward); fused SDPA kernels have no second derivative, so
+        # the energy evaluation pins the math backend (plain matmul+softmax,
+        # double-differentiable everywhere).
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        if torch.is_grad_enabled():
+            xg = x if x.requires_grad else x.detach().requires_grad_(True)
+            with sdpa_kernel(SDPBackend.MATH):
+                phi = self.energy(xg, cos_sin, kv_cache)
+                if record:
+                    self.last_phi = float(phi.detach().mean())
+                (g,) = torch.autograd.grad(phi.sum(), xg, create_graph=True)
+            return g
+        with torch.enable_grad(), sdpa_kernel(SDPBackend.MATH):
+            xl = x.detach().requires_grad_(True)
+            phi = self.energy(xl, cos_sin, kv_cache)
+            if record:
+                self.last_phi = float(phi.detach().mean())
+            (g,) = torch.autograd.grad(phi.sum(), xl)
+        return g.detach()
 
 
 class ReversibleBlock(nn.Module):
     def __init__(self, config, layer_idx, f_block, g_block):
         super().__init__()
         self.layer_idx = layer_idx
-        self.f_block = f_block  # Attention-like
-        self.g_block = g_block  # MLP-like
-
-        # For now, we assume f_block and g_block are instantiated modules
-        # that take half the embedding dimension?
-        # Or we act on the full dimension but use masks?
-        # Standard RevNet splits channels in half.
+        self.mode = str(getattr(config, "reversible_mode", "additive"))
+        self.record_energy = bool(getattr(config, "reversible_record_energy", False))
         self.dim = config.n_embd
         if self.dim % 2 != 0:
             raise ValueError("n_embd must be even for Reversible Block")
+        if self.mode == "symplectic":
+            half = self.dim // 2
+            lam_min = float(getattr(config, "reversible_lambda_min", 0.05))
+            # attention rides inside phi_F (needs cos_sin/kv_cache), the MLP
+            # inside phi_G; both reduced to scalars by the bounded energy head
+            self.f_block = SymplecticKick(_EnergyHead(f_block, half, lam_min, inner_takes_ctx=True))
+            self.g_block = SymplecticKick(_EnergyHead(g_block, half, lam_min, inner_takes_ctx=False))
+        elif self.mode == "additive":
+            self.f_block = f_block  # Attention-like
+            self.g_block = g_block  # MLP-like
+        else:
+            raise ValueError(f"unknown reversible_mode {self.mode!r} (additive | symplectic)")
+        # Per-call telemetry trace (train.py drains once per step). A TIED
+        # block is the same object called n_layer times per forward, so the
+        # trace carries one entry per LAYER in call order - the across-layer
+        # shadow-energy band is the conservation observable (note section 2).
+        self.energy_trace: list[dict[str, float]] = []
+
+    def drain_energy_trace(self) -> list[dict[str, float]]:
+        trace, self.energy_trace = self.energy_trace, []
+        return trace
 
     def forward(self, x, cos_sin, kv_cache):
         # x: (B, T, C)
         x1, x2 = torch.chunk(x, 2, dim=-1)
 
-        # Forward pass
-        # Note: We need to pass cos_sin/kv_cache to F (Attention)
-        # But G (MLP) doesn't need them.
+        if self.mode == "symplectic":
+            rec = self.record_energy
+            f_out = self.f_block(x2, cos_sin, kv_cache, record=rec)
+            y1 = x1 + f_out
+            g_out = self.g_block(y1, record=rec)
+            # MINUS: the corrected kick-kick sign — conserves the coercive
+            # H = phi_G + phi_F instead of the unbounded difference (note 1.1)
+            y2 = x2 - g_out
+            if rec:
+                with torch.no_grad():
+                    phi_f = self.f_block.last_phi if self.f_block.last_phi is not None else float("nan")
+                    phi_g = self.g_block.last_phi if self.g_block.last_phi is not None else float("nan")
+                    self.energy_trace.append(
+                        {
+                            "phi_f": phi_f,
+                            "phi_g": phi_g,
+                            "shadow_energy": phi_f + phi_g,
+                            "x1_norm": float(x1.detach().pow(2).sum(dim=(-2, -1)).mean()),
+                            "x2_norm": float(x2.detach().pow(2).sum(dim=(-2, -1)).mean()),
+                            "lambda_f": float(self.f_block.energy.confinement.detach()),
+                            "lambda_g": float(self.g_block.energy.confinement.detach()),
+                        }
+                    )
+            return torch.cat([y1, y2], dim=-1)
 
-        # F block (Attention side)
-        # We need to pad x2 to full dim if F expects full dim?
-        # Or F is designed for half dim.
-        # Let's assume F and G are designed for C/2.
-
-        # y1 = x1 + F(x2)
+        # additive: y1 = x1 + F(x2); y2 = x2 + G(y1)
         f_out = self.f_block(x2, cos_sin, kv_cache)
         y1 = x1 + f_out
-
-        # y2 = x2 + G(y1)
         g_out = self.g_block(y1)
         y2 = x2 + g_out
-
         return torch.cat([y1, y2], dim=-1)
 
     def inverse(self, y, cos_sin, kv_cache):
         y1, y2 = torch.chunk(y, 2, dim=-1)
 
-        # Inverse pass
-        # x2 = y2 - G(y1)
+        if self.mode == "symplectic":
+            # kick inverse = negative kick, EXACT (machine eps; note 1.2)
+            g_out = self.g_block(y1)
+            x2 = y2 + g_out
+            f_out = self.f_block(x2, cos_sin, kv_cache)
+            x1 = y1 - f_out
+            return torch.cat([x1, x2], dim=-1)
+
+        # additive inverse: x2 = y2 - G(y1); x1 = y1 - F(x2)
         g_out = self.g_block(y1)
         x2 = y2 - g_out
-
-        # x1 = y1 - F(x2)
         f_out = self.f_block(x2, cos_sin, kv_cache)
         x1 = y1 - f_out
-
         return torch.cat([x1, x2], dim=-1)
 
 

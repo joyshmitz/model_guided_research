@@ -198,6 +198,19 @@ class GPTConfig:
     ultrametric_p: int = 2
     ultrametric_alpha: float = 2.0
     ultrametric_lcp_beta: float = 32.0
+    # Reversible-specific options (see nanochat.reversible_block_torch; u55.5).
+    # symplectic = kick-kick coupling with exact-gradient kicks (corrected
+    # sign: conserves the coercive H = phi_G + phi_F; theory note
+    # markdown_documentation/symplectic_transformer.md).
+    reversible_mode: str = "additive"  # "additive" | "symplectic"
+    # Layer-tied potentials: ONE block shared across all layers (the regime
+    # where shadow conservation is theory-backed). Generation/kv-cache is
+    # unsupported when tied (per-layer cache slots vs shared layer_idx).
+    reversible_tied: bool = False
+    # Coercivity floor for the learnable confinement lambda; 0.0 is the
+    # registered falsification control (unconfined potentials).
+    reversible_lambda_min: float = 0.05
+    reversible_record_energy: bool = False  # shadow-energy/norm telemetry
     # Braid-specific options (see nanochat.braid_attention_torch).
     braid_mode: str = "soft"  # "soft" | "discrete"
     braid_tau: float = 0.0
@@ -363,10 +376,22 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self._validate_config()
+        # Construction order is RNG draw order (golden-trajectory contract):
+        # wte FIRST, then blocks - exactly the original dict-literal order.
+        wte = nn.Embedding(config.vocab_size, config.n_embd)
+        if getattr(config, "reversible_tied", False):
+            # Layer-tied symplectic potentials (u55.5): ONE block iterated
+            # n_layer times - the regime where shadow conservation is the
+            # theorem (the same symplectic map composed with itself).
+            # Parameters dedupe by identity in .parameters()/named_parameters().
+            tied_block = Block(config, 0)
+            blocks = nn.ModuleList([tied_block for _ in range(config.n_layer)])
+        else:
+            blocks = nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)])
         self.transformer = nn.ModuleDict(
             {
-                "wte": nn.Embedding(config.vocab_size, config.n_embd),
-                "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+                "wte": wte,
+                "h": blocks,
             }
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -411,6 +436,17 @@ class GPT(nn.Module):
                 raise ValueError(
                     "reversible attention requires n_kv_head to divide (n_head // 2) and be <= (n_head // 2)"
                 )
+            rev_mode = getattr(self.config, "reversible_mode", "additive")
+            if rev_mode not in ("additive", "symplectic"):
+                raise ValueError(f"reversible_mode must be additive | symplectic, got {rev_mode!r}")
+            if float(getattr(self.config, "reversible_lambda_min", 0.05)) < 0.0:
+                raise ValueError("reversible_lambda_min must be >= 0 (0 = unconfined falsification control)")
+            if getattr(self.config, "reversible_tied", False) and rev_mode != "symplectic":
+                raise ValueError("reversible_tied requires reversible_mode=symplectic (the tied shadow regime)")
+        elif getattr(self.config, "reversible_mode", "additive") != "additive" or getattr(
+            self.config, "reversible_tied", False
+        ):
+            raise ValueError("reversible_mode/reversible_tied require attention_type=reversible")
         ffn_type = getattr(self.config, "ffn_type", "standard")
         if ffn_type not in ("standard", "tropical", "tropical-rational"):
             raise ValueError(f"ffn_type must be standard | tropical | tropical-rational, got {ffn_type!r}")
@@ -699,6 +735,11 @@ class GPT(nn.Module):
         if self.cos.dtype != torch.bfloat16:
             raise TypeError("Rotary embeddings must be in bfloat16")
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
+        if kv_cache is not None and getattr(self.config, "reversible_tied", False):
+            # the tied block owns ONE attention instance (layer_idx 0), so
+            # per-layer cache slots would alias - teacher-forced forward and
+            # prefill-free scoring are the supported tied paths (u55.5)
+            raise ValueError("reversible_tied does not support kv-cache generation (per-layer cache aliasing)")
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0 : T0 + T], self.sin[:, T0 : T0 + T]  # truncate cache to current sequence length
 
