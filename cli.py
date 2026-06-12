@@ -4366,8 +4366,34 @@ def _load_eval_checkpoint(
     if device.type in {"cpu", "mps"}:
         model_data = {k: v.float() if v.dtype == torch.bfloat16 else v for k, v in model_data.items()}
     model.load_state_dict(model_data, strict=True)
+    quant_bits = config_dict.get("eval_weight_quant_bits")
+    if quant_bits is not None:
+        _fake_quantize_weights(model, int(quant_bits))
     model.eval()
     return model, meta, resolved_step
+
+
+def _fake_quantize_weights(model: Any, bits: int) -> None:
+    """Symmetric uniform per-tensor fake-quantization of Linear/Embedding
+    weights (bead tcuy): w -> round(w/delta) * delta with delta =
+    max|w| / (2^(bits-1) - 1). The archimedean baseline arm for the
+    digit-truncation precision curves (hyp-padic-truncation-graceful):
+    per-layer rounding errors here COMPOUND through depth, which is exactly
+    what the flat-error lemma forbids on the p-adic-native path."""
+    import torch
+
+    if not (2 <= bits <= 16):
+        raise ValueError(f"eval_weight_quant_bits must be in [2, 16], got {bits}")
+    qmax = float(2 ** (bits - 1) - 1)
+    with torch.no_grad():
+        for module in model.modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+                w = module.weight
+                scale = w.abs().max()
+                if float(scale) == 0.0:
+                    continue
+                delta = scale / qmax
+                w.copy_(torch.clamp(torch.round(w / delta), -qmax, qmax) * delta)
 
 
 def _eval_tasks_provenance(
@@ -5260,6 +5286,125 @@ def probe_charges(
     )
     (run_dir / "run.md").write_text("\n".join(md) + "\n")
     console.print(f"[bold green]Wrote charge-probe artifacts[/bold green] → {run_dir}")
+
+
+@app.command("precision-curve")
+def precision_curve(
+    digit_run: Annotated[list[str], typer.Option(help="eval-tasks run-id of one digit-truncation sweep point (repeatable)")],
+    float_run: Annotated[list[str], typer.Option(help="eval-tasks run-id of one float-quantization sweep point (repeatable)")],
+    digit_full: Annotated[str, typer.Option(help="run-id of the digit arm's FULL-precision eval (the anchor)")],
+    float_full: Annotated[str, typer.Option(help="run-id of the float arm's FULL-precision eval (the anchor)")],
+    task: Annotated[str, typer.Option(help="Task whose in-range perplexity is the quality metric")] = "hier",
+    seed: Annotated[int, typer.Option(help="Checkpoint-seed pairing this artifact represents (one artifact per seed)")] = 0,
+    artifacts_dir: Annotated[Path, typer.Option(help="Artifacts root")] = Path("artifacts"),
+    run_id: Annotated[str | None, typer.Option(help="Run identifier (default: timestamp)")] = None,
+) -> None:
+    """Precision curves: digit truncation vs float quantization (bead tcuy).
+
+    Reads per-point eval artifacts (the knob - ultrametric_digits_k or
+    eval_weight_quant_bits - is taken from each artifact's recorded
+    meta.checkpoint.model_config), normalizes both arms onto a shared
+    memory-fraction axis (digits: k/K of the digit path; float: bits/32 of
+    the weights), computes quality = ppl_full / ppl_point per point, and the
+    trapezoid AUC per arm anchored at (1.0, 1.0). The headline scalar is
+    results.auc_ratio = AUC_digit / AUC_float - the preregistered
+    graceful-vs-cliff observable of hyp-padic-truncation-graceful. One
+    artifact per checkpoint-seed pairing: the verdict engine counts each as
+    one observation (bench schema, budget-exempt).
+    """
+    from nanochat.report import build_provenance
+
+    def _load(rid: str) -> dict[str, Any]:
+        path = artifacts_dir / "evals" / "tasks" / rid / "summary.json"
+        loaded: dict[str, Any] = json.loads(path.read_text())
+        return loaded
+
+    def _ppl(d: dict[str, Any]) -> float:
+        return float(d["tasks"][task]["perplexity"]["in_range"])
+
+    def _points(runs: list[str], knob: str, denom_from: Any) -> list[tuple[float, float]]:
+        pts = []
+        for rid in runs:
+            d = _load(rid)
+            mc = (d["meta"]["checkpoint"].get("model_config") or {})
+            val = mc.get(knob)
+            if val is None:
+                raise ValueError(f"{rid}: artifact does not record {knob} (run with --model-override)")
+            denom = denom_from(mc)
+            pts.append((float(val) / denom, _ppl(d)))
+        return pts
+
+    digit_anchor = _ppl(_load(digit_full))
+    float_anchor = _ppl(_load(float_full))
+    digit_pts = _points(digit_run, "ultrametric_digits_k", lambda mc: float(mc.get("ultrametric_K", 8)))
+    float_pts = _points(float_run, "eval_weight_quant_bits", lambda mc: 32.0)
+
+    def _auc(pts: list[tuple[float, float]], anchor_ppl: float) -> tuple[float, list[dict[str, float]]]:
+        curve = sorted([(f, anchor_ppl / p if p > 0 else 0.0) for f, p in pts] + [(1.0, 1.0)])
+        area = 0.0
+        for (f0, q0), (f1, q1) in zip(curve, curve[1:]):
+            area += (f1 - f0) * (q0 + q1) / 2.0
+        span = curve[-1][0] - curve[0][0]
+        return (area / span if span > 0 else 0.0), [{"fraction": f, "quality": q} for f, q in curve]
+
+    auc_digit, curve_digit = _auc(digit_pts, digit_anchor)
+    auc_float, curve_float = _auc(float_pts, float_anchor)
+    ratio = auc_digit / auc_float if auc_float > 0 else float("inf")
+
+    table = Table(title=f"precision curves — {task} (seed pairing {seed})", box=box.SIMPLE_HEAVY)
+    for col in ("arm", "points", "AUC (quality x memory-fraction)"):
+        table.add_column(col, justify="right")
+    table.add_row("digit truncation", str(len(digit_pts)), f"{auc_digit:.4f}")
+    table.add_row("float quantization", str(len(float_pts)), f"{auc_float:.4f}")
+    table.add_row("ratio (digit/float)", "-", f"{ratio:.3f}")
+    console.print(table)
+
+    resolved_run_id = run_id or time.strftime("%Y%m%d_%H%M%S")
+    run_dir = artifacts_dir / "bench" / "precision_curves" / resolved_run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "schema_version": "mgr.bench.precision_curves.v1",
+        "kind": "precision-curve",
+        "mechanism": "ultrametric",
+        "meta": {
+            "run_id": resolved_run_id,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "task": task,
+            "seed": seed,
+            "device": "cpu",
+            "digit_runs": list(digit_run),
+            "float_runs": list(float_run),
+            "digit_full": digit_full,
+            "float_full": float_full,
+            "normalization": "digits: k/K of the digit path; float: bits/32 of weights; quality = ppl_full/ppl_point; AUC normalized by fraction span, anchored at (1,1)",
+            "git": _get_git_info(),
+        },
+        "provenance": build_provenance(
+            {"precision_curve": {"task": task, "seed": seed, "digit_runs": list(digit_run), "float_runs": list(float_run)}}
+        ),
+        "results": {
+            "auc_digit": auc_digit,
+            "auc_float": auc_float,
+            "auc_ratio": ratio,
+            "curve_digit": curve_digit,
+            "curve_float": curve_float,
+        },
+    }
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    md = [
+        f"# precision-curve — {resolved_run_id}",
+        "",
+        f"- task {task} · seed pairing {seed}",
+        f"- AUC digit {auc_digit:.4f} vs float {auc_float:.4f} -> ratio {ratio:.3f}",
+        "",
+        "| arm | fraction | quality |",
+        "|---|---|---|",
+    ]
+    for name, curve in (("digit", curve_digit), ("float", curve_float)):
+        for pt in curve:
+            md.append(f"| {name} | {pt['fraction']:.3f} | {pt['quality']:.4f} |")
+    (run_dir / "run.md").write_text("\n".join(md) + "\n")
+    console.print(f"[bold green]Wrote precision-curve artifacts[/bold green] → {run_dir}")
 
 
 @app.command("bench-ultrametric")
@@ -6826,7 +6971,7 @@ def _adj_collect_artifacts(roots: list[Path]) -> list[dict[str, Any]]:
                 schema = "train"
             elif sv == "mgr.chargeprobe.v1":
                 schema = "chargeprobe"
-            elif sv == "mgr.bench.ultrametric_paths.v1":
+            elif sv in ("mgr.bench.ultrametric_paths.v1", "mgr.bench.precision_curves.v1"):
                 schema = "bench"
             elif sv == 1 and data.get("kind") == "certify":
                 schema = "certify"
@@ -6900,7 +7045,7 @@ def _adj_artifact_matches_arm(art: dict[str, Any], mechanism: str, variant: dict
         )
     if art["schema"] == "bench":
         # path benchmarks record the mechanism they exercise top-level
-        return data.get("mechanism") == mechanism
+        return bool(data.get("mechanism") == mechanism)
     if art["schema"] in ("evaltasks", "chargeprobe"):
         attn = ((data.get("meta") or {}).get("checkpoint") or {}).get("attention_type")
         return attn == (mechanism if mechanism in _ADJ_ATTENTION_MECHS else "standard") and _adj_variant_matches(

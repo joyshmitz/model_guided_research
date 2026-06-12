@@ -849,3 +849,80 @@ def test_training_taint_propagates_through_eval_artifacts(tmp_path):
         p.write_text(json.dumps(data))
     v = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path))
     assert v["verdict"] == "supported", v
+
+
+# ---------------------------------------------------------------------------
+# tcuy: precision-curve artifacts (the graceful-vs-cliff evidence producer)
+
+
+def _precision_eval_artifact(root: Path, rid: str, *, ppl: float, knob: str | None = None,
+                             value: float | None = None, K: int = 8) -> None:
+    run = root / "evals" / "tasks" / rid
+    run.mkdir(parents=True, exist_ok=True)
+    mc: dict = {"attention_type": "ultrametric", "ultrametric_K": K}
+    if knob:
+        mc[knob] = value
+    (run / "summary.json").write_text(json.dumps({
+        "schema_version": "mgr.evaltasks.v3",
+        "meta": {"checkpoint": {"model_config": mc}},
+        "tasks": {"hier": {"perplexity": {"in_range": ppl, "held_out": ppl}}},
+    }))
+
+
+def test_precision_curve_auc_math_and_engine_ingestion(tmp_path, monkeypatch):
+    """Hand-computable AUC case: digit arm flat (quality 1.0 everywhere) ->
+    AUC 1.0; float arm cliff (quality 0 at every truncated point) -> AUC of
+    the anchored trapezoid; the produced artifact is engine-readable bench
+    evidence with the auc_ratio observable."""
+    _precision_eval_artifact(tmp_path, "dfull", ppl=2.0)
+    _precision_eval_artifact(tmp_path, "ffull", ppl=2.0)
+    # digit points: NO degradation (ppl stays 2.0) at k = 4 and 2 of K = 8
+    _precision_eval_artifact(tmp_path, "d-k4", ppl=2.0, knob="ultrametric_digits_k", value=4)
+    _precision_eval_artifact(tmp_path, "d-k2", ppl=2.0, knob="ultrametric_digits_k", value=2)
+    # float points: total collapse (ppl -> huge) at 8 and 16 of 32 bits
+    _precision_eval_artifact(tmp_path, "f-b8", ppl=2.0e9, knob="eval_weight_quant_bits", value=8)
+    _precision_eval_artifact(tmp_path, "f-b16", ppl=2.0e9, knob="eval_weight_quant_bits", value=16)
+
+    result = runner.invoke(cli.app, [
+        "precision-curve",
+        "--digit-run", "d-k4", "--digit-run", "d-k2",
+        "--float-run", "f-b8", "--float-run", "f-b16",
+        "--digit-full", "dfull", "--float-full", "ffull",
+        "--task", "hier", "--seed", "0",
+        "--artifacts-dir", str(tmp_path), "--run-id", "pc-test",
+    ])
+    assert result.exit_code == 0, result.output
+    art = json.loads((tmp_path / "bench" / "precision_curves" / "pc-test" / "summary.json").read_text())
+    r = art["results"]
+    assert abs(r["auc_digit"] - 1.0) < 1e-9  # flat at quality 1.0 from 0.25 to 1.0
+    # float curve: ~0 at 0.25 and 0.5, then trapezoid up to (1.0, 1.0):
+    # spans 0.25->0.5 (~0) and 0.5->1.0 (avg ~0.5) over total span 0.75
+    assert abs(r["auc_float"] - (0.5 * 0.5) / 0.75) < 1e-6
+    assert r["auc_ratio"] > 2.9
+
+    # the artifact is engine-readable bench evidence for the ultrametric arm
+    arts = cli._adj_collect_artifacts([tmp_path / "bench"])
+    assert len(arts) == 1 and arts[0]["schema"] == "bench"
+    assert cli._adj_artifact_matches_arm(arts[0], "ultrametric", None)
+    assert cli._adj_observations(arts[0], "results.auc_ratio")
+
+
+def test_fake_quantize_weights_monotone_and_bounds():
+    """More bits -> strictly smaller reconstruction error; range validated."""
+    import torch
+
+    torch.manual_seed(0)
+    lin = torch.nn.Linear(32, 32, bias=False)
+    ref = lin.weight.detach().clone()
+    errs = []
+    for bits in (2, 4, 8, 12):
+        lin.weight.data.copy_(ref)
+        cli._fake_quantize_weights(lin, bits)
+        errs.append(float((lin.weight - ref).abs().max()))
+    assert errs == sorted(errs, reverse=True), errs  # error shrinks with bits
+    assert errs[-1] < 1e-3  # 12-bit is near-identity at this scale
+    try:
+        cli._fake_quantize_weights(lin, 1)
+        raise AssertionError("bits=1 must be rejected")
+    except ValueError:
+        pass

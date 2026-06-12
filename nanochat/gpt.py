@@ -187,6 +187,12 @@ class GPTConfig:
     # of the K digit channels - quantization as valuation truncation, with the
     # flat-error lemma governing the p-adic-native path. None = full precision.
     ultrametric_digits_k: int | None = None
+    # Eval-time float weight quantization (bead tcuy): symmetric uniform
+    # per-tensor fake-quantization of Linear/Embedding weights to b bits,
+    # applied once at checkpoint load by the eval loader (the model itself
+    # never reads this field). The archimedean baseline the digit-truncation
+    # curves are preregistered against. None = full precision.
+    eval_weight_quant_bits: int | None = None
     ultrametric_hard_digits: bool = False
     ultrametric_K: int = 8
     ultrametric_p: int = 2
