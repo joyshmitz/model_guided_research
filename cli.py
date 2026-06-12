@@ -7355,6 +7355,14 @@ def _adj_collect_artifacts(roots: list[Path]) -> list[dict[str, Any]]:
         if not root.exists():
             continue
         for path in sorted(root.rglob("summary.json")):
+            parts = path.parts
+            if ("probes", "sizing") in zip(parts, parts[1:]):
+                # probes/sizing/ is the evidence-pool quarantine (bead dzor):
+                # sizing/calibration runs SELECT rungs and budgets, so
+                # admitting them as evidence is selection bias by
+                # construction. probes/charges stays evidence - chargeprobe
+                # instruments measure, they do not select.
+                continue
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -7976,6 +7984,238 @@ def _registry_append_verdict(path: Path, hyp_id: str, entry_line: str, new_statu
             insert_at += 1
         lines.insert(insert_at, entry_line)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _report_train_row(art: dict[str, Any]) -> dict[str, Any]:
+    """One roll-up row per train summary (mgr.telemetry.v1)."""
+    data = art["data"]
+    cfg = data.get("config") or {}
+    ds = (data.get("dataset") or {}).get("data_dir")
+    res = data.get("results") or {}
+    meta = data.get("meta") or {}
+    argv = [str(a) for a in (meta.get("argv") or [])]
+    seed = "?"
+    if "--seed" in argv and argv.index("--seed") + 1 < len(argv):
+        seed = argv[argv.index("--seed") + 1]
+    return {
+        "run_id": str(meta.get("run_id") or Path(art["path"]).parent.name),
+        "task": Path(ds).name if ds else "fineweb",
+        "mechanism": str(cfg.get("attention_type") or "?"),
+        "seed": seed,
+        "target_flops": (data.get("budget") or {}).get("target_flops"),
+        "train_ce_final": res.get("train_ce_final"),
+        "val_ce_final": res.get("val_ce_final"),
+        "minutes": float(res.get("measured_time_s") or 0.0) / 60.0,
+        "tainted": bool(art["tainted"]),
+    }
+
+
+def _report_eval_rows(art: dict[str, Any]) -> list[dict[str, Any]]:
+    """One roll-up row per (eval artifact, task): the artifact's held-out EM
+    mean is the ci-v2 observation unit (one per trained checkpoint)."""
+    data = art["data"]
+    ckpt = (data.get("meta") or {}).get("checkpoint") or {}
+    lineage = ckpt.get("lineage") or {}
+    rows: list[dict[str, Any]] = []
+    for task, rec in (data.get("tasks") or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        em = ((rec.get("exact_match") or {}).get("greedy") or {}).get("held_out") or {}
+        prior = (rec.get("answer_prior") or {}).get("held_out") or {}
+        rows.append({
+            "run_id": str(lineage.get("run_id") or "?"),
+            "step": ckpt.get("step"),
+            "task": str(task),
+            "mechanism": str(ckpt.get("attention_type") or "?"),
+            "target_flops": (ckpt.get("budget") or {}).get("target_flops"),
+            "em_held_out": em.get("mean"),
+            "answer_prior": prior.get("mean"),
+            "tainted": bool(art["tainted"]),
+        })
+    return rows
+
+
+def _report_fmt(v: Any, spec: str = ".4g") -> str:
+    if v is None:
+        return "-"
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, (int, float)):
+        return format(v, spec)
+    return str(v)
+
+
+def _report_mean_sd(vals: list[float]) -> str:
+    if not vals:
+        return "-"
+    m = statistics.mean(vals)
+    if len(vals) == 1:
+        return f"{m:.4g}"
+    return f"{m:.4g} ± {statistics.stdev(vals):.2g}"
+
+
+@app.command("report")
+def report(
+    artifacts: Annotated[
+        list[Path] | None, typer.Option(help="Artifact root(s) to scan (repeatable)")
+    ] = None,
+    out: Annotated[Path, typer.Option(help="Output root for the roll-up")] = Path("artifacts/reports"),
+    run_id: Annotated[str | None, typer.Option(help="Report id (default: UTC timestamp)")] = None,
+) -> None:
+    """Roll-up report across an artifacts tree (bead yhy): the cross-run
+    aggregation that per-run run.md files cannot give. Train runs and eval
+    evidence are grouped into campaign-style arm tables - mean ± sd over
+    CLEAN, lineage-deduped observations (the ci-v2 unit: one per trained
+    checkpoint) - with tainted evidence counted but excluded from the stats.
+    Replaces the hand-written campaign.md arm tables; report.md +
+    report.json land under artifacts/reports/<id>/ with provenance."""
+    roots = [Path(p) for p in (artifacts or [Path("artifacts")])]
+    index = _adj_collect_artifacts(roots)
+    counts: dict[str, dict[str, int]] = {}
+    for a in index:
+        c = counts.setdefault(a["schema"], {"total": 0, "tainted": 0})
+        c["total"] += 1
+        c["tainted"] += int(a["tainted"])
+    console.print(
+        f"[bold cyan]report[/bold cyan] {len(index)} artifact(s) indexed from {[str(r) for r in roots]}"
+    )
+
+    # ---- train runs ----
+    train_rows = sorted(
+        (_report_train_row(a) for a in index if a["schema"] == "train"),
+        key=lambda r: (r["task"], r["mechanism"], r["target_flops"] or 0.0, r["run_id"]),
+    )
+    train_groups: list[dict[str, Any]] = []
+    seen_tg: dict[tuple[str, str, Any], dict[str, Any]] = {}
+    for r in train_rows:
+        g = seen_tg.setdefault(
+            (r["task"], r["mechanism"], r["target_flops"]),
+            {"task": r["task"], "mechanism": r["mechanism"], "target_flops": r["target_flops"],
+             "n": 0, "n_tainted": 0, "ce": [], "minutes": 0.0},
+        )
+        g["n"] += 1
+        g["minutes"] += r["minutes"]
+        if r["tainted"]:
+            g["n_tainted"] += 1
+        elif isinstance(r["train_ce_final"], (int, float)):
+            g["ce"].append(float(r["train_ce_final"]))
+    for key in sorted(seen_tg):
+        g = seen_tg[key]
+        g["train_ce_final"] = _report_mean_sd(g.pop("ce"))
+        train_groups.append(g)
+
+    # ---- eval evidence (clean, lineage-deduped: the ci-v2 observation set) ----
+    evals_all = [a for a in index if a["schema"] == "evaltasks"]
+    evals_clean = _adj_dedupe_evaltasks([a for a in evals_all if not a["tainted"]])
+    eval_rows = sorted(
+        (row for a in evals_clean for row in _report_eval_rows(a)),
+        key=lambda r: (r["task"], r["mechanism"], r["target_flops"] or 0.0, r["run_id"]),
+    )
+    n_eval_tainted = sum(1 for a in evals_all if a["tainted"])
+    eval_groups: list[dict[str, Any]] = []
+    seen_eg: dict[tuple[str, str, Any], dict[str, Any]] = {}
+    for r in eval_rows:
+        g = seen_eg.setdefault(
+            (r["task"], r["mechanism"], r["target_flops"]),
+            {"task": r["task"], "mechanism": r["mechanism"], "target_flops": r["target_flops"],
+             "n_models": 0, "em": [], "prior": []},
+        )
+        g["n_models"] += 1
+        if isinstance(r["em_held_out"], (int, float)):
+            g["em"].append(float(r["em_held_out"]))
+        if isinstance(r["answer_prior"], (int, float)):
+            g["prior"].append(float(r["answer_prior"]))
+    for key in sorted(seen_eg):
+        g = seen_eg[key]
+        g["em_held_out"] = _report_mean_sd(g.pop("em"))
+        priors = g.pop("prior")
+        g["answer_prior"] = f"{statistics.mean(priors):.4g}" if priors else "-"
+        eval_groups.append(g)
+
+    # ---- render ----
+    overview = Table(title="artifact overview", box=box.SIMPLE_HEAVY)
+    for col in ("schema", "total", "tainted"):
+        overview.add_column(col)
+    for schema in sorted(counts):
+        c = counts[schema]
+        overview.add_row(schema, str(c["total"]), str(c["tainted"]))
+    console.print(overview)
+
+    tg_table = Table(title="train runs by arm (CE over clean runs)", box=box.SIMPLE_HEAVY)
+    for col in ("task", "mechanism", "FLOPs", "n", "tainted", "train CE (mean ± sd)", "total min"):
+        tg_table.add_column(col)
+    for g in train_groups:
+        tg_table.add_row(
+            g["task"], g["mechanism"], _report_fmt(g["target_flops"], ".3g"), str(g["n"]),
+            str(g["n_tainted"]), g["train_ce_final"], f"{g['minutes']:.0f}",
+        )
+    console.print(tg_table)
+
+    eg_table = Table(
+        title="eval evidence by arm (held-out EM over clean deduped checkpoints)", box=box.SIMPLE_HEAVY
+    )
+    for col in ("task", "mechanism", "FLOPs", "n models", "EM held-out (mean ± sd)", "answer prior"):
+        eg_table.add_column(col)
+    for g in eval_groups:
+        eg_table.add_row(
+            g["task"], g["mechanism"], _report_fmt(g["target_flops"], ".3g"),
+            str(g["n_models"]), g["em_held_out"], g["answer_prior"],
+        )
+    console.print(eg_table)
+    if n_eval_tainted:
+        console.print(f"[yellow]{n_eval_tainted} tainted eval artifact(s) excluded from arm stats[/yellow]")
+
+    # ---- persist ----
+    resolved = run_id or time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+    run_dir = out / resolved
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "kind": "report",
+        "schema_version": "mgr.report.v1",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "git": _get_git_info(),
+        "roots": [str(r) for r in roots],
+        "counts": counts,
+        "train_runs": train_rows,
+        "train_groups": train_groups,
+        "eval_rows": eval_rows,
+        "eval_groups": eval_groups,
+        "eval_tainted_excluded": n_eval_tainted,
+    }
+    (run_dir / "report.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    md = [
+        f"# Artifact roll-up — {payload['generated_at']}",
+        "",
+        f"- roots: {payload['roots']}",
+        "- counts: " + ", ".join(f"{k}: {v['total']} ({v['tainted']} tainted)" for k, v in sorted(counts.items())),
+        "",
+        "## Train runs by arm",
+        "",
+        "| task | mechanism | FLOPs | n | tainted | train CE (mean ± sd) | total min |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for g in train_groups:
+        md.append(
+            f"| {g['task']} | {g['mechanism']} | {_report_fmt(g['target_flops'], '.3g')} | {g['n']} "
+            f"| {g['n_tainted']} | {g['train_ce_final']} | {g['minutes']:.0f} |"
+        )
+    md += [
+        "",
+        "## Eval evidence by arm (held-out EM; clean, lineage-deduped — ci-v2 observation units)",
+        "",
+        "| task | mechanism | FLOPs | n models | EM held-out (mean ± sd) | answer prior |",
+        "|---|---|---|---|---|---|",
+    ]
+    for g in eval_groups:
+        md.append(
+            f"| {g['task']} | {g['mechanism']} | {_report_fmt(g['target_flops'], '.3g')} | {g['n_models']} "
+            f"| {g['em_held_out']} | {g['answer_prior']} |"
+        )
+    if n_eval_tainted:
+        md.append(f"\n{n_eval_tainted} tainted eval artifact(s) excluded from arm stats.")
+    md.append("")
+    (run_dir / "report.md").write_text("\n".join(md))
+    console.print(Panel(f"report → [bold]{run_dir}[/bold]", border_style="blue"))
 
 
 @app.command("adjudicate")

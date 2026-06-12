@@ -1300,3 +1300,16 @@ def test_fdr_headline_and_qvalues_in_run_report(tmp_path, monkeypatch):
         assert v["q_value"] <= 0.10 and v["p_value"] is not None
     report = (tmp_path / "out" / "adjudications" / "fdr" / "report.md").read_text()
     assert "2 supported, of which 2 survive FDR at q=0.1" in report
+
+
+def test_sizing_probe_quarantine_excluded_from_pools(tmp_path):
+    """dzor: artifacts under probes/sizing/ never enter evidence pools - the
+    runs that SELECT a rung must not adjudicate it. probes/charges (chargeprobe
+    instruments) remains readable evidence."""
+    _evaltasks_artifact(tmp_path / "evals" / "tasks", "real", mechanism="ultrametric",
+                        per_seed=[0.8, 0.8, 0.8])
+    _evaltasks_artifact(tmp_path / "probes" / "sizing" / "e2-probe", "probe-eval",
+                        mechanism="standard", per_seed=[0.9, 0.9, 0.9])
+    arts = cli._adj_collect_artifacts([tmp_path])
+    paths = [a["path"] for a in arts]
+    assert len(arts) == 1 and paths[0].endswith("real/summary.json"), paths
