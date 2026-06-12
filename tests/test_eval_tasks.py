@@ -10,7 +10,7 @@
   change must update the fixture deliberately (set MGR_CAPTURE_EVAL_GOLDEN=1)
   with a justification in the commit message.
 - End-to-end: train a tiny CPU checkpoint (synthetic loader), eval it through
-  the CLI, validate the mgr.evaltasks.v2 schema + artifacts (answer_prior
+  the CLI, validate the mgr.evaltasks.v3 schema + artifacts (answer_prior
   floors + generations.jsonl receipts included).
 """
 
@@ -295,7 +295,12 @@ def test_e2e_trained_checkpoint_evaluates(attention_type, monkeypatch, tmp_path)
     assert result.exit_code == 0, result.output
     run_dir = tmp_path / "artifacts" / "evals" / "tasks" / f"eval-{attention_type}"
     summary = json.loads((run_dir / "summary.json").read_text())
-    assert summary["schema_version"] == "mgr.evaltasks.v2"
+    assert summary["schema_version"] == "mgr.evaltasks.v3"
+    # dz9i: a real trained checkpoint has a run summary beside it -> the
+    # TRAINING provenance must be carried (taintedness mirrors whatever
+    # tree state the tiny train ran under - assert shape, not state)
+    assert isinstance(summary["train_provenance"], dict)
+    assert isinstance(summary["train_provenance"]["tainted"], bool)
     assert summary["meta"]["checkpoint"]["attention_type"] == attention_type
     assert summary["meta"]["receipts"] == "generations.jsonl"
     rec = summary["tasks"]["arith"]

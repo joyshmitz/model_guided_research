@@ -819,3 +819,33 @@ def test_evaltasks_variant_selector_resolves_via_model_config(tmp_path):
         _evaltasks_artifact(legacy_root, f"old{i}", mechanism="braid", per_seed=[0.5])
     v2 = cli._adjudicate_hypothesis(hyp, _index(legacy_root))
     assert v2["verdict"] == "blocked" and v2["reason_code"] == "no_candidate_artifacts", v2
+
+
+def test_training_taint_propagates_through_eval_artifacts(tmp_path):
+    """dz9i (hqwi audit finding): a clean-time eval of a TAINTED-TRAINING
+    checkpoint must be refused - the engine taints an evaltasks artifact when
+    EITHER provenance block is tainted. Legacy artifacts (no train_provenance)
+    keep eval-time-only semantics."""
+    _arm_artifacts(tmp_path, "base", "standard", [0.5, 0.5, 0.5])
+    _arm_artifacts(tmp_path, "cand", "ultrametric", [0.8, 0.8, 0.8])
+    # poison the candidate artifacts: clean eval provenance, tainted training
+    for sub in tmp_path.iterdir():
+        if not sub.name.startswith("cand"):
+            continue
+        p = sub / "summary.json"
+        data = json.loads(p.read_text())
+        data["train_provenance"] = {**CLEAN_PROV, "git_dirty": True, "tainted": True}
+        p.write_text(json.dumps(data))
+    v = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path))
+    assert v["verdict"] == "blocked" and v["reason_code"] == "tainted_evidence", v
+
+    # clean train_provenance adjudicates normally
+    for sub in tmp_path.iterdir():
+        if not sub.name.startswith("cand"):
+            continue
+        p = sub / "summary.json"
+        data = json.loads(p.read_text())
+        data["train_provenance"] = dict(CLEAN_PROV)
+        p.write_text(json.dumps(data))
+    v = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path))
+    assert v["verdict"] == "supported", v
