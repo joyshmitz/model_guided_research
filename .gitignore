@@ -71,3 +71,6 @@ artifacts/
 # Beads ephemeral files
 .beads/last-touched
 .beads/.bv.lock
+
+# Claude Code worktrees/settings - untracked junk here must never taint evidence provenance
+.claude/
