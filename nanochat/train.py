@@ -220,6 +220,16 @@ class _OrdinalBetaLadder:
         self._last_ab = ab
         return self.beta
 
+    def state_dict(self) -> dict[str, Any]:
+        """Round-trip payload (efzy): everything `step` reads or writes, in
+        weights-only-safe types (lists, not tuples)."""
+        return {"beta": self.beta, "last_ab": None if self._last_ab is None else list(self._last_ab)}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.beta = float(state["beta"])
+        last_ab = state.get("last_ab")
+        self._last_ab = None if last_ab is None else (int(last_ab[0]), int(last_ab[1]))
+
 
 class _CoverageBetaController:
     """Closed-loop dequantization annealing (9jzb): certificate-driven beta
@@ -246,6 +256,15 @@ class _CoverageBetaController:
             self.beta = max(self.beta / self.DOWN, self.b0)
         # coverage None -> hold (first step, or margins momentarily silent)
         return self.beta
+
+    def state_dict(self) -> dict[str, Any]:
+        """Round-trip payload (efzy): beta is the only mutable state. The
+        checkpoint step's pending coverage reading is saved BESIDE this by the
+        trainer (the live route-coverage buffers are non-persistent)."""
+        return {"beta": self.beta}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.beta = float(state["beta"])
 
 
 def _semiring_beta_at(schedule: _SemiringSpec, step: int, max_steps: int) -> float:
@@ -605,6 +624,11 @@ def train(args) -> None:
     semiring_schedule: _SemiringSpec | None = None
     semiring_controller: _CoverageBetaController | None = None
     semiring_ladder: _OrdinalBetaLadder | None = None
+    # The checkpoint step's coverage reading, restored on resume (efzy): the
+    # live route-coverage buffers are non-persistent (reload as nan), so the
+    # resumed first step would otherwise see None (hold) where the
+    # uninterrupted run consumes the checkpoint step's real reading.
+    semiring_resume_coverage: float | None = None
 
     if model_type == "gpt":
         config = GPTConfig()
@@ -724,16 +748,6 @@ def train(args) -> None:
                 # per step (see the semiring_schedule hook in the training loop).
                 parsed = _parse_semiring_beta_spec(semiring_beta_arg)
                 config.semiring_beta = float(parsed[1])
-                if parsed[0] in ("coverage", "ordinal") and getattr(args, "resume_from", None) is not None:
-                    # the controller/ladder state is NOT in the checkpoint yet:
-                    # resuming would silently restart the beta trajectory and
-                    # break the bitwise-resume guarantee. Refuse loudly until
-                    # the state round-trips (follow-up bead).
-                    raise ValueError(
-                        f"--semiring-beta {parsed[0]}:... cannot resume yet: the schedule controller's "
-                        "state is not checkpointed, so a resumed run would restart its beta trajectory. "
-                        "Use linear/exp (stateless in step) for resumable runs."
-                    )
                 if parsed[0] == "coverage" and len(parsed) == 4:
                     if not config.tropical_record_margins:
                         raise ValueError(
@@ -899,6 +913,29 @@ def train(args) -> None:
             )
         for sched, sched_state in zip(schedulers, saved_sched_states):
             sched.load_state_dict(sched_state)
+        # Stateful dequantization-annealing controllers (efzy): like the
+        # schedulers, their state must round-trip or the resumed beta
+        # trajectory silently restarts at b0.
+        if semiring_controller is not None:
+            saved_ctl = resume_train_state.get("semiring_controller")
+            if saved_ctl is None:
+                raise RuntimeError(
+                    "--semiring-beta coverage:... resume: the checkpoint has no semiring_controller "
+                    "state (saved before efzy or with a different --semiring-beta mode); resuming "
+                    "would restart the beta trajectory at b0"
+                )
+            semiring_controller.load_state_dict(saved_ctl)
+            pending_cov = resume_train_state.get("semiring_pending_coverage")
+            semiring_resume_coverage = None if pending_cov is None else float(pending_cov)
+        if semiring_ladder is not None:
+            saved_ladder = resume_train_state.get("semiring_ladder")
+            if saved_ladder is None:
+                raise RuntimeError(
+                    "--semiring-beta ordinal:... resume: the checkpoint has no semiring_ladder "
+                    "state (saved before efzy or with a different --semiring-beta mode); resuming "
+                    "would restart the beta ladder at b0"
+                )
+            semiring_ladder.load_state_dict(saved_ladder)
 
     # Dataloader (with-state variant so checkpoints can capture the data position).
     batches_consumed = 0
@@ -1088,6 +1125,15 @@ def train(args) -> None:
             },
             "rng": rng_state,
         }
+        # Stateful dequantization-annealing controllers (efzy) ride beside the
+        # schedulers. The coverage controller also saves the model's CURRENT
+        # route-coverage reading: the live buffers are non-persistent, so this
+        # is the value the next step's controller call must consume on resume.
+        if semiring_controller is not None:
+            train_state["semiring_controller"] = semiring_controller.state_dict()
+            train_state["semiring_pending_coverage"] = _collect_tropical_route_coverage(raw_model)
+        if semiring_ladder is not None:
+            train_state["semiring_ladder"] = semiring_ladder.state_dict()
         meta_data: dict[str, Any] = {
             "step": step,
             "model_config": asdict(config),
@@ -1223,9 +1269,13 @@ def train(args) -> None:
                 if semiring_controller is not None:
                     # closed-loop: consume the PREVIOUS forward's certificate
                     # coverage; the controller never raises beta below the floor
-                    current_semiring_beta = semiring_controller.step(
-                        _collect_tropical_route_coverage(raw_model)
-                    )
+                    if semiring_resume_coverage is not None:
+                        # first step after resume (efzy): the checkpointed reading
+                        coverage_reading: float | None = semiring_resume_coverage
+                        semiring_resume_coverage = None
+                    else:
+                        coverage_reading = _collect_tropical_route_coverage(raw_model)
+                    current_semiring_beta = semiring_controller.step(coverage_reading)
                 elif semiring_ladder is not None and schedulers:
                     # ordinal-orchestrated: the transfinite clock drives beta
                     current_semiring_beta = semiring_ladder.step(schedulers[0].A, schedulers[0].B)

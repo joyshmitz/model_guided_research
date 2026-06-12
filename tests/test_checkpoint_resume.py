@@ -729,20 +729,103 @@ def test_ordinal_beta_mode_e2e_holds_absent_transitions(monkeypatch, tmp_path):
     assert saw_ordinal, "ordinal scheduler telemetry must accompany the beta stream"
 
 
-def test_stateful_beta_modes_refuse_resume(monkeypatch, tmp_path):
-    """Fresh-eyes audit finding: controller/ladder state is not checkpointed,
-    so resuming a coverage/ordinal beta run would silently restart the beta
-    trajectory and break the bitwise-resume guarantee. Until the state
-    round-trips, resume must be refused LOUDLY for those modes."""
-    _run_train(monkeypatch, tmp_path, "stateful-parent", checkpoint_interval=6,
-               attention_type="tropical", semiring_beta="linear:1:8")  # stateless: resumable
-    for spec, extra in (("coverage:1:8:0.5", {"tropical_record_margins": None}),
-                        ("ordinal:1:8", {"scheduler_type": "ordinal"})):
+def test_semiring_controller_and_ladder_state_round_trip():
+    """efzy: state_dict/load_state_dict reproduce the exact decision state of
+    both stateful beta controllers."""
+    ctl = train_mod._CoverageBetaController(1.0, 64.0, 0.7)
+    ctl.step(0.9)
+    ctl.step(0.9)
+    ctl.step(0.1)
+    clone = train_mod._CoverageBetaController(1.0, 64.0, 0.7)
+    clone.load_state_dict(ctl.state_dict())
+    assert clone.beta == ctl.beta
+    assert clone.step(0.9) == ctl.step(0.9)
+
+    lad = train_mod._OrdinalBetaLadder(1.0, 32.0)
+    lad.step(3, 5)
+    lad.step(3, 4)  # descent -> double
+    clone2 = train_mod._OrdinalBetaLadder(1.0, 32.0)
+    clone2.load_state_dict(lad.state_dict())
+    assert clone2.beta == lad.beta and clone2._last_ab == lad._last_ab
+    assert clone2.step(3, 3) == lad.step(3, 3)  # descent seen identically
+    assert clone2.step(3, 3) == lad.step(3, 3)  # hold seen identically
+
+
+def test_coverage_beta_mode_resumes_bitwise(monkeypatch, tmp_path):
+    """efzy: the coverage controller's beta and the checkpoint step's pending
+    coverage reading round-trip through optim_*.pt, so a resumed closed-loop
+    run reproduces the uninterrupted run's beta trajectory bitwise.
+
+    The fake coverage reader is a PURE FUNCTION of the model weights: identical
+    model state yields identical readings (regardless of how often it is
+    called), so any beta divergence is controller state, not reader noise."""
+    import json as json_mod
+
+    def fake_coverage(model):
+        p = next(model.parameters()).detach().flatten()
+        return float((p[0].abs() * 997.0) % 1.0)
+
+    monkeypatch.setattr(train_mod, "_collect_tropical_route_coverage", fake_coverage)
+
+    def beta_series(run_id: str) -> dict[int, float]:
+        metrics = tmp_path / "artifacts" / "baseline" / "nanochat" / run_id / "metrics.jsonl"
+        out: dict[int, float] = {}
+        for line in metrics.read_text().splitlines():
+            rec = json_mod.loads(line)
+            if rec.get("type") == "step" and "semiring_beta" in rec:
+                out[rec["step"]] = rec["semiring_beta"]
+        return out
+
+    common = dict(
+        attention_type="tropical", semiring_beta="coverage:1:16:0.5",
+        tropical_record_margins=None, log_interval="1",
+    )
+    summary_a = _run_train(monkeypatch, tmp_path, "cov-uninterrupted", **common)
+    _run_train(monkeypatch, tmp_path, "cov-parent", checkpoint_interval=6, **common)
+
+    betas_a = beta_series("cov-uninterrupted")
+    assert len(set(betas_a.values())) > 1, "fake coverage must move beta or this test is vacuous"
+
+    state = torch.load(
+        _ckpt_dir(tmp_path, "cov-parent") / "optim_000005_rank0.pt", weights_only=False
+    )
+    assert "beta" in state["semiring_controller"]
+    assert "semiring_pending_coverage" in state
+
+    summary_b = _run_train(
+        monkeypatch, tmp_path, "cov-resumed",
+        resume_from=str(_ckpt_dir(tmp_path, "cov-parent")), resume_step=5, **common,
+    )
+    assert summary_b["results"]["start_step"] == 6
+    betas_b = beta_series("cov-resumed")
+    assert betas_b, "resumed run logged no beta telemetry"
+    for step in sorted(betas_b):
+        assert betas_b[step] == betas_a[step], (
+            f"beta diverged at step {step}: resumed {betas_b[step]} != uninterrupted {betas_a[step]}"
+        )
+    _assert_bitwise_trajectory(summary_b["results"]["losses"], summary_a["results"]["losses"][6:], offset=6)
+
+
+def test_stateful_beta_resume_refuses_missing_controller_state(monkeypatch, tmp_path):
+    """efzy: resuming a coverage/ordinal beta run from a checkpoint saved under
+    a DIFFERENT --semiring-beta mode (no controller state in the payload) must
+    fail loudly, not silently restart the beta trajectory at b0."""
+    _run_train(monkeypatch, tmp_path, "stateless-parent", checkpoint_interval=6,
+               attention_type="tropical", semiring_beta="linear:1:8",
+               tropical_record_margins=None)
+    _run_train(monkeypatch, tmp_path, "stateless-parent-ord", checkpoint_interval=6,
+               attention_type="tropical", semiring_beta="linear:1:8",
+               scheduler_type="ordinal")
+    cases = (
+        ("coverage:1:8:0.5", "stateless-parent", {"tropical_record_margins": None}),
+        ("ordinal:1:8", "stateless-parent-ord", {"scheduler_type": "ordinal"}),
+    )
+    for spec, parent, extra in cases:
         args = _train_args(
             tmp_path, f"stateful-resume-{spec.split(':')[0]}",
             attention_type="tropical", semiring_beta=spec,
-            resume_from=str(_ckpt_dir(tmp_path, "stateful-parent")), resume_step=5,
+            resume_from=str(_ckpt_dir(tmp_path, parent)), resume_step=5,
             **extra,
         )
-        with pytest.raises(ValueError, match="cannot resume yet"):
+        with pytest.raises(RuntimeError, match="no semiring_"):
             train_mod.train(args)
