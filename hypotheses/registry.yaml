@@ -1153,6 +1153,7 @@ hypotheses:
         (e1-depth-l2/-l8) swept over eval_weight_quant_bits in {8,6,4,3,2} +
         full anchors for the diagnostic; examples=24 x 3 eval seeds on hier;
         evidence from a clean tree.
-    status: open
+    status: supported
     evidence: []
-    verdict_history: []
+    verdict_history:
+      - {date: "2026-06-12", verdict: supported, artifacts: ["artifacts/bench/depth_curves/depth-curve-hier-s0/summary.json", "artifacts/bench/depth_curves/depth-curve-hier-s1/summary.json", "artifacts/bench/depth_curves/depth-curve-hier-s2/summary.json"], adjudicator: "engine:ci-v3", policy_version: "ci-v3", arms: {"ultrametric": {"budget_flops": null, "ci95": [-0.009922211614723545, 0.035110163246422466], "effect": 0.01259397581584946, "n_baseline": 0, "n_candidate": 3, "single_arm": true, "verdict": "supported"}}}
