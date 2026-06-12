@@ -4337,6 +4337,12 @@ def _load_eval_checkpoint(
     the merged config in the artifact so override arms are variant-selectable.
     The override may not change any parameter-shaping field (the state dict
     must still load strictly).
+
+    Annealed checkpoints (bead y2h9): when the meta records semiring_beta_live
+    (the schedule's live value at save time), construction uses it in place of
+    the recorded config's b0 and the returned meta's model_config reflects it,
+    so eval artifacts carry the beta the model actually ran at. An explicit
+    model_overrides semiring_beta still wins (applied after the fold).
     """
     import torch
 
@@ -4349,6 +4355,9 @@ def _load_eval_checkpoint(
     if meta.get("model_type", "gpt") != "gpt":
         raise ValueError(f"eval-tasks supports model_type=gpt checkpoints, got {meta.get('model_type')!r}")
     config_dict = dict(meta["model_config"])
+    if "semiring_beta_live" in meta:
+        config_dict["semiring_beta"] = meta["semiring_beta_live"]
+        meta = {**meta, "model_config": config_dict}
     if model_overrides:
         # validate against the CURRENT GPTConfig schema, not the checkpoint's
         # recorded dict: eval-time knobs (ultrametric_digits_k) legitimately

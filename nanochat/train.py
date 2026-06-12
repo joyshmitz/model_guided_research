@@ -1097,6 +1097,9 @@ def train(args) -> None:
             "seed": int(args.seed),
             "world_size": int(ddp_world_size),
             "batches_consumed": step + 1,
+            # the annealed beta these weights were saved at (y2h9); loaders
+            # must construct at this value, not model_config's schedule b0
+            "semiring_beta_live": last_semiring_beta,
             "budget": {
                 "max_steps": max_steps,
                 "target_flops": args.target_flops,
@@ -1164,6 +1167,13 @@ def train(args) -> None:
     # train artifact alone (metrics.jsonl streams are not engine-readable).
     route_coverage_first: float | None = None
     route_coverage_last: float | None = None
+    # Live semiring beta at the most recent step (bead y2h9): recorded into
+    # every checkpoint meta (semiring_beta_live) and the summary
+    # (results.semiring_beta_final) so post-hoc loaders reconstruct annealed
+    # models at the value they actually ran at - the recorded model_config
+    # keeps the schedule's b0, which is wrong for an annealed-to-32 endpoint.
+    _config_beta0 = getattr(config, "semiring_beta", None)
+    last_semiring_beta: float | None = float(_config_beta0) if _config_beta0 is not None else None
     step_times_s: list[float] = []
     last_log_step = -1
 
@@ -1225,6 +1235,7 @@ def train(args) -> None:
             else:
                 config_beta = getattr(config, "semiring_beta", None)
                 current_semiring_beta = float(config_beta) if config_beta is not None else None
+            last_semiring_beta = current_semiring_beta
 
             step_t0 = time.perf_counter()
 
@@ -1606,6 +1617,9 @@ def train(args) -> None:
             results["route_coverage_first"] = route_coverage_first
             results["route_coverage_final"] = route_coverage_last
             results["route_coverage_delta"] = route_coverage_last - route_coverage_first
+    # the beta the model ended training at (y2h9): null = exact tropical
+    # endpoint or a non-semiring model; mirrors checkpoint semiring_beta_live
+    results["semiring_beta_final"] = last_semiring_beta
     attn_entropy = _collect_attn_entropy_stats(raw_model)
     if attn_entropy is not None:
         results["attention_entropy"] = attn_entropy

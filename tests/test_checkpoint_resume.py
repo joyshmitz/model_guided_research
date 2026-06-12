@@ -549,6 +549,45 @@ def test_dequantization_annealing_schedule_telemetry(monkeypatch, tmp_path):
     assert summary["hparams"]["semiring_beta_spec"] == "linear:1:32"
 
 
+def test_annealed_checkpoint_reloads_at_live_beta(monkeypatch, tmp_path):
+    """y2h9: an annealed-to-32 checkpoint must reload at beta=32, not the
+    config's b0=1. The checkpoint meta records semiring_beta_live, the summary
+    records results.semiring_beta_final, and the eval loader constructs at the
+    live value (with the artifact-recorded model_config reflecting it); an
+    explicit model_overrides semiring_beta still wins."""
+    summary = _run_train(
+        monkeypatch, tmp_path, "anneal-reload",
+        attention_type="tropical",
+        semiring_beta="linear:1:32",
+        checkpoint_interval="6",
+    )
+    assert abs(summary["results"]["semiring_beta_final"] - 32.0) < 1e-6
+
+    from nanochat.checkpoint_manager import find_last_step
+    from nanochat.tropical_attention_torch import TropicalCausalSelfAttention
+
+    ckpt_dir = _ckpt_dir(tmp_path, "anneal-reload")
+    last = find_last_step(str(ckpt_dir))
+    meta = json.loads((ckpt_dir / f"meta_{last:06d}.json").read_text())
+    assert abs(meta["semiring_beta_live"] - 32.0) < 1e-6
+    # the recorded config keeps the schedule's b0 - the live value lives beside it
+    assert meta["model_config"]["semiring_beta"] == 1.0
+
+    from cli import _load_eval_checkpoint
+
+    model, loaded_meta, _step = _load_eval_checkpoint(ckpt_dir, None, torch.device("cpu"))
+    betas = [m.semiring_beta for m in model.modules() if isinstance(m, TropicalCausalSelfAttention)]
+    assert betas and all(abs(b - 32.0) < 1e-6 for b in betas), betas
+    # eval artifacts record the beta the model actually runs at (variant-selectable)
+    assert abs(loaded_meta["model_config"]["semiring_beta"] - 32.0) < 1e-6
+
+    model2, _meta2, _ = _load_eval_checkpoint(
+        ckpt_dir, None, torch.device("cpu"), model_overrides={"semiring_beta": 4.0}
+    )
+    betas2 = [m.semiring_beta for m in model2.modules() if isinstance(m, TropicalCausalSelfAttention)]
+    assert betas2 and all(abs(b - 4.0) < 1e-6 for b in betas2), betas2
+
+
 def test_coverage_beta_controller_transitions_exact():
     """9jzb closed-loop controller: raise/hold/back-off transitions are exact,
     bounds are respected, and beta is NEVER raised on a below-floor or missing

@@ -210,6 +210,12 @@ def build_model(checkpoint_dir, step, device, phase):
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
+    # annealed checkpoints (bead y2h9): the recorded config carries the
+    # schedule's b0, but the weights were saved at the live beta recorded
+    # beside them - construct at that value or an annealed-to-32 tropical
+    # model silently runs at beta=1
+    if "semiring_beta_live" in meta_data:
+        model_config_kwargs = {**model_config_kwargs, "semiring_beta": meta_data["semiring_beta_live"]}
     log0(f"Building model with config: {model_config_kwargs}")
 
     # Check if this is a synaptic model
