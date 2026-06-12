@@ -317,6 +317,85 @@ hypotheses:
     evidence: []
     verdict_history: []
 
+  - id: hyp-symplectic-nonorm-depth-tied
+    statement: >-
+      A LAYER-TIED symplectic reversible GPT (kick-kick coupling with
+      exact-gradient kicks, corrected sign, coercive confined potentials,
+      NO per-layer normalization) trains to within 5% of the normed standard
+      baseline's final validation CE at depth 16: shadow conservation of the
+      coercive Hamiltonian bounds activations across tied depth by theorem,
+      removing normalization's cause rather than its symptom.
+    mechanisms: [reversible]
+    source:
+      kind: model
+      provenance: >-
+        EPIC THEORY-II u55.5; theory note
+        markdown_documentation/symplectic_transformer.md sections 2-4 (claim
+        hierarchy item 2: tied is the theory-backed regime). Numerics at
+        registration: J^T Omega J = Omega exact in fp64; 256-tied-layer
+        energy band 0.007 at kick scale 0.05; coercivity bound holds along
+        trajectories (tests/test_mathematical_properties.py
+        TestSymplecticReversible).
+    date_registered: "2026-06-12"
+    prediction:
+      metric_path: "train:results.val_ce_final"
+      comparator: "<="
+      threshold_kind: ratio
+      threshold: 1.05
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      variant: {reversible_mode: "symplectic", reversible_tied: true}
+      scale_caveats: >-
+        REGISTERED 2026-06-12 BEFORE any symplectic training run existed
+        (the mode landed in code the same day; zero checkpoints). Protocol:
+        n_layer 16 both arms at matched width and equal FLOPs budget;
+        candidate = attention_type reversible with reversible_mode symplectic
+        + reversible_tied true (variant-selected from the recorded config),
+        no per-layer norms (the reversible path has none; trunk-boundary
+        norms retained in ALL arms); baseline = standard attention with its
+        usual per-layer norms. lambda_min 0.05 (the coercivity floor). The
+        depth-8/32 rungs, the untied arm (separate hypothesis), the
+        standard-no-norm expected-failure arm, and the lambda_min ablation
+        {0, 0.05, 0.5} ride as recorded diagnostics, not adjudicated here.
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-symplectic-nonorm-depth-untied
+    statement: >-
+      UNTIED (per-layer independent potentials) symplectic no-norm GPTs also
+      train to within 5% of the normed standard baseline at depth 16 - the
+      empirical bet that per-layer symplecticity plus volume preservation
+      suffice without the tied-map shadow theorem. If this fails while the
+      tied variant holds, that CONFIRMS the theory's account (the theorem is
+      about iterating the same map), not the program's failure.
+    mechanisms: [reversible]
+    source:
+      kind: model
+      provenance: >-
+        EPIC THEORY-II u55.5; theory note
+        markdown_documentation/symplectic_transformer.md section 2 claim
+        hierarchy item 4 (explicitly the empirical rung of the ladder,
+        registered separately from the theory-backed tied claim by design).
+    date_registered: "2026-06-12"
+    prediction:
+      metric_path: "train:results.val_ce_final"
+      comparator: "<="
+      threshold_kind: ratio
+      threshold: 1.05
+      baseline: {mechanism: standard, equal_flops: true}
+      min_seeds: 3
+      variant: {reversible_mode: "symplectic", reversible_tied: false}
+      scale_caveats: >-
+        REGISTERED 2026-06-12 BEFORE any symplectic training run existed.
+        Same protocol as hyp-symplectic-nonorm-depth-tied except
+        reversible_tied false (per-layer independent potentials; the
+        adiabatic-drift bound of the theory note applies only as far as
+        layers stay close, which nothing enforces in this arm).
+    status: open
+    evidence: []
+    verdict_history: []
+
   # ---------------------------------------------------------------------------
   # Algebraic structure (tropical / quaternion / octonion / simplicial)
   # ---------------------------------------------------------------------------
