@@ -1,0 +1,151 @@
+# New-Mechanism Merge Gate (Checklist)
+
+**Every new attention mechanism (an F-series implementation, e.g. mnn.2/3/5/6)
+passes this gate before it is believed.** The gate is the cheap correctness
+machinery that catches what benchmarks miss — and it has already paid off:
+the `mnn.4` hyperbolic design's c→0 reduction was *wrong as written* (raw
+distances reduce to a Laplacian kernel, not dot-product attention), and the
+reduction-test reasoning is exactly what exposed it before a line of the
+mechanism was implemented (see `gromov_product_and_the_ultrametric_hyperbolic_bridge.md` §3).
+
+A mechanism that ships without these is a mechanism whose benchmark numbers you
+cannot trust, because you have no independent check that it computes what it
+claims. Order matters: items 1–4 are *design-time* (do them before writing the
+torch module), 5–8 are *implementation-time*, 9 is *campaign-time* (and lives
+in `campaign_preregistration_template.md`).
+
+## The gate
+
+### 1. Exact reduction to a known mechanism — as a `mgr certify` check (the keystone)
+
+If the mechanism generalizes an existing one, there is a parameter regime where
+it must reproduce that one **exactly** (to fp32 tolerance). Derive it, validate
+it numerically *before writing the design*, and ship it as a certify check
+under the new mechanism's name.
+
+- Clifford restricted to the even subalgebra of Cl(3,0) == quaternion
+  (`mnn.1` §3; the basis convention i=e₂₃, j=−e₁₃, k=−e₁₂ verified against the
+  *implemented* `qmul` — a wrong guess fails silently, which is the point).
+- Hyperbolic at c→0 == standard attention — **but only the energy-form score**;
+  the raw-distance score reduces to a distance kernel (`8gk.6` §3, the caught
+  bug). The reduction test *is* the spec: it tells you which score form is
+  correct.
+- Hyperbolic rescaled c→∞ == ultrametric LCP attention (`8gk.6` §4).
+
+If the mechanism is genuinely novel (no sub-mechanism), substitute an **exact
+hand-computable special case** (e.g. tropical's β→∞ == hard-max with the
+LSE–max sandwich; ultrametric hard-digit == exact trie decode). The principle
+is the same: one input regime where the answer is known by other means.
+
+### 2. Structure-free placebo control (design the prediction now)
+
+If the mechanism claims to exploit a structure (hierarchy, brackets,
+composition, scale), its registry prediction must come with a placebo arm on
+structure-free data at equal budget. "Wins on placebo too" ⇒ the win is not
+about that structure. The mechanism's interpretability observable (item 6)
+should *collapse to trivial* on placebo (e.g. hyperbolic curvature → 0); that
+collapse is the honest null and is welcomed. (Campaign wiring: §6 of the
+pre-registration template.)
+
+### 3. Parameterization coordinate-check (`lab.1`)
+
+Before any matched-FLOPs comparison across widths, verify the mechanism's
+init/LR scaling with a coordinate check (activation- and update-scale flat in
+log-width). Non-CLT mechanisms (tropical/max-plus are extreme-value/Gumbel
+class, not Gaussian-sum) need different scalings than muP assumes; "X beats Y
+at matched FLOPs" can otherwise just mean "Y is mis-scaled at this width."
+This is the standing `lab.1` harness; a new mechanism registers its
+concentration class and gets one coordinate-check row.
+
+### 4. Validate every theory claim numerically before writing the design doc
+
+Build the algebra/geometry from first principles in a scratch script, assert
+the load-bearing identities, and put the receipts in the doc's appendix
+(the `mnn.1` Appendix A / `8gk.6` Appendix A pattern). Pins conventions and
+catches sign/limit errors that survive prose review.
+
+### 5. Numerics policy, explicit and certified
+
+State the saturation/overflow budget, the clamp thresholds, and the bf16
+policy (which products run in fp32 islands under autocast — the same class as
+tropical-LSE and the Lorentz-Minkowski products). Each policy gets a certify
+assertion (constraint residual, round-trip, etc.). A mechanism that "lives or
+dies on numerics" (hyperbolic, tropical) puts this section first.
+
+### 6. A first-class interpretability observable into the metrics stream
+
+The mechanism's learned-structure readout (tropical route coverage, hyperbolic
+per-head curvature, Clifford per-grade norms, braid conserved charges) streams
+to `metrics.jsonl` and into the run `summary.json` `results` block, so it is
+*adjudicable from the train artifact alone* (registry predictions can target
+`train:results.<observable>`). Not an afterthought — it is often the cleanest
+falsifiable claim the mechanism has.
+
+### 7. Goldens recapture in the SAME commit as any GPTConfig field
+
+Adding a `GPTConfig` field trips the attention-goldens config-drift guard.
+Recapture with `MGR_CAPTURE_ATTENTION_GOLDENS=1`, then **verify the diff is
+config-only** (one inserted line per fixture, zero trajectory change) in the
+same commit. The `eval_weight_quant_bits` field broke the gate for a day
+unnoticed (fixed in fdxb) — this line is the lesson.
+
+### 8. Standard invariant checks
+
+Causality (no future-token gradient — every mechanism already has
+`causality_no_future_grad`), plus the mechanism's algebra/conservation laws
+(norm preservation for rotor mechanisms, Lipschitz bounds for tropical, mass
+conservation for simplicial, charge conservation for braid). These are the
+existing certify family; a new mechanism adds its own.
+
+### 9. Off-floor campaign with pre-registered rung & stopping rule
+
+The mechanism's headline comparison follows `campaign_preregistration_template.md`:
+Phase-0 rung-finding, sample-efficiency vs asymptotic split, power-derived
+seeds, one pre-registered stopping rule, quarantined probes, single `-H`
+adjudication. **A floored win is not a structural win** (braid–Dyck).
+
+## Copy-paste block for an F-series mechanism bead
+
+```
+NEW-MECHANISM GATE (docs/new_mechanism_checklist.md) — mechanism <X>
+[ ] 1. Reduction to <known mechanism> in regime <...> == <known>, fp32, as a certify check  (validated in scratch: <receipt>)
+[ ] 2. Placebo control designed into the registry prediction; observable collapses to trivial on placebo
+[ ] 3. Concentration class declared; lab.1 coordinate-check row green
+[ ] 4. Theory claims validated-before-written; receipts in design-doc appendix
+[ ] 5. Numerics policy explicit (saturation/clamp/bf16 fp32-islands) + certify assertions
+[ ] 6. Interpretability observable in metrics.jsonl + summary.results (train:results.<obs> adjudicable)
+[ ] 7. Goldens recaptured in the GPTConfig-field commit; diff verified config-only
+[ ] 8. Causality + algebra/conservation certify checks
+[ ] 9. Off-floor campaign per the pre-registration template (rung found, claims split, one -H append)
+```
+
+## Audit: where the existing mechanisms stand (2026-06-13)
+
+Honest snapshot from `mgr certify` (run `fdxb-cert-refresh-all`, 50/50 pass)
+and the registry. ✓ present · ✗ gap · — N/A.
+
+| mechanism | causality | algebra/invariant laws | **reduction-to-known certify** | coordinate-check (lab.1) | goldens |
+|---|---|---|---|---|---|
+| standard | ✓ | ✓ (rope/rmsnorm/softmax) | — (is the baseline) | ✗ | ✓ |
+| tropical | ✓ | ✓ (Lipschitz, ffn-collapse, margin) | ✗ (β-endpoints only in tests) | ✗ | ✓ |
+| ultrametric | ✓ | ✓ (strong-triangle LCP) | ✗ (hard-digit==trie only in tests) | ✗ | ✓ |
+| quaternion | ✓ | ✓ (assoc, norm, rotor) | — (is a reduction *target*) | ✗ | ✓ |
+| octonion | ✓ | ✓ (alternativity, norm, non-assoc) | ✗ (⊃ quaternion subalgebra uncertified) | ✗ | ✓ |
+| braid | ✓ | ✓ (YBE, charges, r-matrix) | ✗ | ✗ | ✓ |
+| gauge | ✓ | ✓ (rotation roundtrip/additivity) | ✗ (→ standard at zero field uncertified) | ✗ | ✓ |
+| reversible | ✓ | ✓ (inverse roundtrip, autograd parity) | ✗ | ✗ | ✓ |
+| simplicial | ✓ | ✓ (mass conservation) | ✗ | ✗ | ✓ |
+| surreal | ✓ | ✓ (row-norm, linearity, equivariance) | ✗ | ✗ | ✓ |
+| fractal | ✓ | ✓ (router simplex) | ✗ | ✗ | ✓ |
+
+**The reduction-test column is empty across the board** — no existing
+mechanism certifies an exact reduction/special-case, even where one is known
+(tropical β-endpoints and ultrametric hard-digit==trie live in
+`tests/test_algebraic_properties.py` / the 33dd trie path, not in `mgr
+certify`). The coordinate-check column is empty because `lab.1` is open. These
+are the gaps; concrete promotion beads are filed (see the beads linked from
+`research_loop.md`). New mechanisms enter the gate green by construction;
+existing mechanisms get retrofitted where a reduction is known and cheap —
+highest value first: **octonion ⊃ quaternion subalgebra**, **tropical
+β-endpoints (promote tests → certify)**, **ultrametric hard-digit == trie
+(promote → certify)**, **gauge → standard at zero field**.

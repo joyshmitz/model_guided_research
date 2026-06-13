@@ -9,9 +9,23 @@ registry grows instead of the README accreting untracked claims.
 
 Everything below is enforced by tooling that exists today: the hypothesis
 registry (`hypotheses/registry.yaml`, append-only, validated against git
-HEAD), the verdict engine (`mgr adjudicate`, policy `ci-v4`), the campaign
+HEAD), the verdict engine (`mgr adjudicate`, policy `ci-v5`), the campaign
 launcher (`scripts/run_campaign.py`, frozen-worktree provenance), and the
 beads tracker (`br`).
+
+**Two companion documents make this loop reliable, and you should use them:**
+
+- `campaign_preregistration_template.md` — the form to fill (before evidence
+  exists) for any mechanism-vs-baseline comparison. It forces the
+  rung-finding probe, the sample-efficiency-vs-asymptotic split, the
+  power-derived seed count, and a single pre-registered stopping rule. **Use
+  it for every comparison** — it is the direct fix for the floored-win trap
+  that the braid–Dyck arc exposed (§7, worked example).
+- `new_mechanism_checklist.md` — the merge gate every new attention mechanism
+  passes before its numbers are trusted (exact reduction to a known
+  mechanism as a certify check, placebo control, parameterization
+  coordinate-check, validate-before-write, numerics policy, interpretability
+  observable, goldens recapture).
 
 ## The loop, step by step
 
@@ -92,6 +106,14 @@ links provenance with `--deps discovered-from:<parent-bead>`. Conventions:
 
 ### 5. Implement & run the campaign
 
+**Before launching, fill `campaign_preregistration_template.md` into the
+bead.** A comparison is only meaningful at a rung where the baseline clears
+the answer-prior floor, and "does X beat the baseline?" is really two claims
+(sample-efficiency at a floored rung vs asymptotic at an off-floor rung) that
+can have opposite answers. Phase 0 of the template is a quarantined
+**rung-finding sizing probe**; skipping it is how a floored win gets mistaken
+for a structural one (§7).
+
 ```bash
 uv run python scripts/run_campaign.py \
     --combo dyck:braid --combo dyck:standard --seeds 30,31,32,33 \
@@ -120,7 +142,7 @@ uv run mgr adjudicate -H hyp-braid-dyck-depth-extrapolation --dry-run  # inspect
 uv run mgr adjudicate -H hyp-braid-dyck-depth-extrapolation           # append
 ```
 
-The engine (policy `ci-v4`) is the only writer of verdicts. It refuses weak
+The engine (policy `ci-v5`) is the only writer of verdicts. It refuses weak
 evidence (BLOCKED with machine-readable reasons) rather than soft-ruling; it
 counts **one observation per trained checkpoint** (eval seeds are repeated
 measurements); it groups evidence into equal-FLOPs **budget cohorts** so
@@ -139,7 +161,17 @@ can move verdicts you weren't looking at.
 ### 7. Beliefs update → next proposals
 
 `mgr report --artifacts <dir>` rolls a campaign into arm tables (clean,
-lineage-deduped, the engine's own semantics). Verdicts feed the next round:
+lineage-deduped, the engine's own semantics).
+
+**The load-bearing lesson — a floored win is not a structural win.** The
+braid–Dyck claim was SUPPORTED at E1 (+0.144) and then REFUTED at E2 (−0.245,
+the ledger's first supersession with a status flip) once a larger budget let
+the *standard* baseline actually learn the task. The E1 win was real but it
+measured **sample efficiency** (braid reaches competence where standard is
+floored), not the **asymptotic** superiority the hypothesis claimed. Before
+believing any comparison: confirm at an off-floor rung, and register the two
+claims separately (`campaign_preregistration_template.md` §1). Verdicts then
+feed the next round:
 
 - **SUPPORTED** → scale rung up, or sharpen into a mechanism question
   (score-half vs aggregate-half, dose-response, ablations).
