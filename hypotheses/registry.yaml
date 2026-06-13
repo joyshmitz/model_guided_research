@@ -1325,3 +1325,96 @@ hypotheses:
     evidence: []
     verdict_history:
       - {date: "2026-06-12", verdict: supported, artifacts: ["artifacts/bench/depth_curves/depth-curve-hier-s0/summary.json", "artifacts/bench/depth_curves/depth-curve-hier-s1/summary.json", "artifacts/bench/depth_curves/depth-curve-hier-s2/summary.json"], adjudicator: "engine:ci-v3", policy_version: "ci-v3", arms: {"ultrametric": {"budget_flops": null, "ci95": [-0.009922211614723545, 0.035110163246422466], "effect": 0.01259397581584946, "n_baseline": 0, "n_candidate": 3, "single_arm": true, "verdict": "supported"}}}
+
+  # ---------------------------------------------------------------------------
+  # NSA width-scaling (bead lab.1). Theory note
+  # markdown_documentation/nonstandard_analysis_width_scaling.md; coordinate-check
+  # harness nanochat/parameterization.py. Predictions are coordinate-check
+  # observables (log-log slope of activation RMS vs width); they become
+  # engine-adjudicable once coord-check artifacts get a schema + engine
+  # ingestion (filed as the lab.1 follow-on). Registered prediction: null with
+  # the observable + thresholds specified, per the pre-harness convention.
+  # ---------------------------------------------------------------------------
+  - id: hyp-coordcheck-clt-flat
+    statement: >-
+      CLT-class mechanisms (standard, reversible) are correctly parameterized
+      by the existing muP rule: their coordinate-check activation-RMS-vs-width
+      log-log slope is flat (|slope| <= 0.05) over the width ladder, so a
+      width-varying A/B between two CLT-class arms at matched parameterization
+      is NOT confounded by scaling.
+    mechanisms: [reversible]
+    source:
+      kind: model
+      provenance: "EPIC THEORY-III lab.1; theory note nonstandard_analysis_width_scaling.md section 4"
+    date_registered: "2026-06-13"
+    prediction: null
+    operationalization_note: >-
+      Observable: nanochat.parameterization.coordinate_check(mechanism,
+      widths).loglog_slope over widths {64,128,256,512,1024,2048}; CLASS
+      acceptance is |slope| <= 0.05 (the muP coordinate-check flatness
+      standard). The harness EXISTS and the standard control already passes
+      (slope +0.003, validated in tests/test_parameterization.py). Blocked on
+      engine ingestion of a coordinate-check artifact schema
+      (mgr.bench.coord_curves.* with results.loglog_slope) - filed as the
+      lab.1 follow-on; until then this is verified by the unit test, not the
+      adjudication ledger. Single-arm, deterministic-seeded (no training
+      campaign needed - one forward per width at init).
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-tropical-evt-miscoupling
+    statement: >-
+      Tropical (max-plus) attention is an EXTREME-VALUE class, not CLT: its
+      coordinate-check slope drifts (|slope| >= 0.10) under the CLT-muP scaling
+      because the max-over-N score location grows with sqrt(2 ln N), and
+      flattens (|slope| <= 0.05) only under the derived per-stage Gumbel
+      location correction. The falsifiable content is the SEPARATION - a flat
+      line under both parameterizations would refute the EVT account.
+    mechanisms: [tropical]
+    source:
+      kind: model
+      provenance: "EPIC THEORY-III lab.1 (the novel EVT-class contribution); theory note sections 2a, 4"
+    date_registered: "2026-06-13"
+    prediction: null
+    operationalization_note: >-
+      Both-ways observable: coordinate_check('tropical', widths) under
+      --parameterization current (predict |slope| >= 0.10, score scale drifts)
+      vs --parameterization nsa (predict |slope| <= 0.05, the per-stage
+      exact-E[max] location shift flattens it). A test that cannot fail proves
+      nothing, so BOTH arms are required and the separation is the claim.
+      Blocked on (a) the --parameterization flag wiring (nsa multiplier table
+      into gpt.py/train.py) and (b) coord-check artifact engine ingestion -
+      both in the lab.1 follow-on. The EVT ingredient (exact E[max] within
+      0.2% of MC; asymptote ~33% high at N=16) is already validated
+      standalone in tests/test_parameterization.py.
+    status: open
+    evidence: []
+    verdict_history: []
+
+  - id: hyp-tropical-length-evt-signature
+    statement: >-
+      The extreme-value correction runs over the CONTEXT-LENGTH max-axis too:
+      tropical attention's effective routing temperature drifts with
+      sqrt(2 ln T) as eval context length T grows, so its margin (gamma)
+      statistics shift with ln T in a shape predictable BEFORE measurement
+      from the exact E[max] curve - a length-extrapolation effect CLT
+      reasoning misses entirely.
+    mechanisms: [tropical]
+    source:
+      kind: model
+      provenance: "EPIC THEORY-III lab.1 section 3 (the N-axes extension); cross-links C5/E3 length studies"
+    date_registered: "2026-06-13"
+    prediction: null
+    operationalization_note: >-
+      Observable: the tropical margin (gamma) statistics already logged by the
+      mechanism, evaluated across a context-length ladder T; fit the gamma
+      location vs ln T and test that the coefficient is positive and within a
+      CI of the exact-E[max] slope dE[max]/d(ln T). Registered BEFORE the
+      C5/E3 length sweeps so it is a genuine pre-registration. Blocked on the
+      C5/E3 length-eval harness emitting per-T gamma summaries the engine can
+      read; exact thresholds to be pinned from a sizing probe (probes/sizing/
+      quarantine) per the dzor policy.
+    status: open
+    evidence: []
+    verdict_history: []
