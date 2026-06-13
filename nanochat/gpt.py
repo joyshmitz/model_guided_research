@@ -663,7 +663,28 @@ class GPT(nn.Module):
         return self.transformer.wte.weight.device
 
     def estimate_flops(self):
-        """Return the estimated FLOPs per token for the model. Ref: https://arxiv.org/abs/2204.02311"""
+        """Return the estimated FLOPs per token for the model. Ref: https://arxiv.org/abs/2204.02311
+
+        The 6*N rule charges every matmul parameter 2 FLOPs in the forward and 4
+        in a SINGLE backward (6 = 2 + 4), plus 12*L*H*Q*T for the attention
+        score/value matmuls (their own fwd+bwd). Symplectic-reversible blocks
+        (u55.5) break the single-backward assumption: each exact-gradient kick
+        (SymplecticKick) evaluates a scalar potential phi, takes a FIRST backward
+        to form grad(phi) DURING the model forward (create_graph=True), then a
+        SECOND backward (autograd-of-autograd) at training time. In
+        forward-equivalent units (fwd=1, bwd=2) a kick costs phi-fwd(1) +
+        grad-phi(2) + double-bwd(~2*3=6) = 9 units versus a standard module's 3
+        -> a 3x multiplier on the block compute (the kick params AND the
+        attention living inside phi_F). Without this correction the estimator
+        rates a symplectic arm CHEAPER than standard (it sees only the half-width
+        block params), so equal-target-FLOPs budgeting silently trains it ~37%
+        more steps and confounds every equal-FLOPs A/B that contains a symplectic
+        arm (bead 7lba; the z4xx confound). Additive-reversible runs the eager
+        fwd+bwd path (the memory-saving ReversibleFunction recompute is unused),
+        so 6*N is unchanged for it. This is a leading-order analytic estimate;
+        for the strictest symplectic equal-compute contract, budget by matched
+        STEPS (train --max-steps without --target-flops) rather than FLOPs.
+        """
         nparams = sum(p.numel() for p in self.parameters())
         nparams_embedding = self.transformer.wte.weight.numel()
         l, h, q, t = (
@@ -672,7 +693,19 @@ class GPT(nn.Module):
             self.config.n_embd // self.config.n_head,
             self.config.sequence_len,
         )
-        num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
+        attn_flops_per_token = 12 * l * h * q * t
+        is_symplectic = self.config.attention_type == "reversible" and (
+            str(getattr(self.config, "reversible_mode", "additive")) == "symplectic"
+        )
+        if is_symplectic:
+            # Block params live inside the kicks (the double-backward path);
+            # lm_head and any other non-block, non-embedding params take the
+            # ordinary 6x. A tied block dedupes by identity in .parameters(),
+            # matching the global nparams count.
+            nparams_block = sum(p.numel() for p in self.transformer.h.parameters())
+            nparams_nonblock = (nparams - nparams_embedding) - nparams_block
+            return 6 * nparams_nonblock + 18 * nparams_block + 3 * attn_flops_per_token
+        num_flops_per_token = 6 * (nparams - nparams_embedding) + attn_flops_per_token
         return num_flops_per_token
 
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
