@@ -338,13 +338,12 @@ class TrainingDashboard:
         self.html_path = html_path
         self.console = console or Console()
         self._window = int(window)
-        self._mk: Any = lambda: deque(maxlen=self._window)
-        self._loss = self._mk()
-        self._grad = self._mk()
-        self._toks = self._mk()
-        self._tflops = self._mk()
+        self._loss: deque[float] = deque(maxlen=self._window)
+        self._grad: deque[float] = deque(maxlen=self._window)
+        self._toks: deque[float] = deque(maxlen=self._window)
+        self._tflops: deque[float] = deque(maxlen=self._window)
         self._val: list[tuple[int, float]] = []
-        self._diags: dict[str, Any] = {}  # name -> deque
+        self._diags: dict[str, deque[float]] = {}
         self._step = 0
         self._latest: dict[str, Any] = {}
         self._nan_seen = False
@@ -358,6 +357,7 @@ class TrainingDashboard:
 
     def observe(self, record: dict[str, Any]) -> None:
         import math as math_mod
+        from collections import deque as _deque
 
         rtype = record.get("type")
         if rtype == "step":
@@ -373,7 +373,7 @@ class TrainingDashboard:
             for key, val in record.items():
                 if key in _DASH_CORE_KEYS or not isinstance(val, (int, float)) or isinstance(val, bool):
                     continue
-                self._diags.setdefault(key, self._mk()).append(float(val))
+                self._diags.setdefault(key, _deque(maxlen=self._window)).append(float(val))
         elif rtype == "val":
             val = record.get("val_loss")
             if isinstance(val, (int, float)) and not isinstance(val, bool):
