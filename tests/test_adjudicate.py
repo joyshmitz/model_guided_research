@@ -126,7 +126,7 @@ def test_supported_when_ci_clears_threshold(tmp_path):
     arm = v["arms"]["ultrametric"]
     assert arm["ci95"][0] >= 0.05 and abs(arm["effect"] - 0.30) < 0.02
     assert arm["n_candidate"] == 3 and arm["n_baseline"] == 3  # one obs per trained model
-    assert v["policy_version"] == "ci-v4"
+    assert v["policy_version"] == "ci-v5"
 
 
 def test_refuted_when_ci_clears_opposite_side(tmp_path):
@@ -445,8 +445,8 @@ def test_ledger_append_preserves_comments_and_is_append_only(tmp_path, monkeypat
     assert entry["status"] == "supported"
     assert len(entry["verdict_history"]) == 1
     first = entry["verdict_history"][0]
-    assert first["verdict"] == "supported" and first["adjudicator"] == "engine:ci-v4"
-    assert first["policy_version"] == "ci-v4" and first["artifacts"]
+    assert first["verdict"] == "supported" and first["adjudicator"] == "engine:ci-v5"
+    assert first["policy_version"] == "ci-v5" and first["artifacts"]
 
     # second adjudication APPENDS; the first entry is untouched
     result = runner.invoke(cli.app, [
@@ -652,7 +652,7 @@ def test_single_arm_certify_supported_budget_exempt(tmp_path):
     assert arm["single_arm"] is True
     assert arm["budget_flops"] is None
     assert arm["n_candidate"] == 3 and arm["n_baseline"] == 0
-    assert v["policy_version"] == "ci-v4"
+    assert v["policy_version"] == "ci-v5"
 
 
 def test_single_arm_certify_refuted_and_seed_dedupe(tmp_path):
@@ -751,7 +751,7 @@ def test_two_arm_verdicts_unchanged_under_ci_v3(tmp_path):
     arm = v["arms"]["ultrametric"]
     assert "single_arm" not in arm
     assert arm["n_candidate"] == 3 and arm["n_baseline"] == 3
-    assert v["policy_version"] == "ci-v4"
+    assert v["policy_version"] == "ci-v5"
 
 
 def test_evaltasks_variant_selector_resolves_via_model_config(tmp_path):

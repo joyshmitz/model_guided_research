@@ -87,7 +87,16 @@ def run_one(wt: Path, args: argparse.Namespace, task: str, mech: str, seed: int)
         "--artifacts-dir", str(MAIN / "artifacts"),
         "--artifacts-kind", "campaigns", "--artifacts-topic", args.topic,
         "--run-id", run_id,
-    ] + (shlex.split(args.extra_args) if args.extra_args else [])
+    ] + (
+        # val cadence (z4xx fresh-eyes finding): train.py defaults
+        # val_interval to 0, so campaign artifacts recorded
+        # results.val_ce_final = null - any registration on that metric
+        # (hyp-symplectic-nonorm-*, hyp-ordinal-*) was unfulfillable by
+        # campaign evidence. Opt-in to preserve old campaign behavior.
+        ["--val-interval", str(args.val_interval), "--val-batches", str(args.val_batches)]
+        if args.val_interval > 0
+        else []
+    ) + (shlex.split(args.extra_args) if args.extra_args else [])
     env = dict(os.environ)
     env["OMP_NUM_THREADS"] = str(args.threads)
     with log.open("w") as fh:
@@ -119,6 +128,10 @@ def main() -> int:
     parser.add_argument("--sequence-len", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--checkpoint-interval", type=int, default=100_000)  # >0: final checkpoint always
+    parser.add_argument("--val-interval", type=int, default=0,
+                        help="validation cadence in steps (0 = off, the historical campaign default; "
+                             "REQUIRED >0 for any registration on train:results.val_ce_final)")
+    parser.add_argument("--val-batches", type=int, default=16, help="batches per validation evaluation")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--threads", type=int, default=6, help="OMP threads per trainer")
     parser.add_argument("--device", default="cpu")

@@ -344,19 +344,28 @@ hypotheses:
       threshold: 1.05
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
-      variant: {reversible_mode: "symplectic", reversible_tied: true}
+      candidate_variant: {reversible_mode: "symplectic", reversible_tied: true}
       scale_caveats: >-
         REGISTERED 2026-06-12 BEFORE any symplectic training run existed
-        (the mode landed in code the same day; zero checkpoints). Protocol:
-        n_layer 16 both arms at matched width and equal FLOPs budget;
-        candidate = attention_type reversible with reversible_mode symplectic
-        + reversible_tied true (variant-selected from the recorded config),
-        no per-layer norms (the reversible path has none; trunk-boundary
-        norms retained in ALL arms); baseline = standard attention with its
-        usual per-layer norms. lambda_min 0.05 (the coercivity floor). The
-        depth-8/32 rungs, the untied arm (separate hypothesis), the
-        standard-no-norm expected-failure arm, and the lambda_min ablation
-        {0, 0.05, 0.5} ride as recorded diagnostics, not adjudicated here.
+        (the mode landed in code the same day; zero checkpoints).
+        PRE-EVIDENCE OPERATIONALIZATION FIXES (fresh-eyes audit, still zero
+        evidence at fix time): (1) the selector key is candidate_variant -
+        the engine ignores an unknown "variant" key, which would have
+        silently pooled the tied, untied, and additive reversible arms into
+        one candidate pool; (2) campaign runs must pass --val-interval > 0
+        (run_campaign historically defaulted val OFF, so campaign artifacts
+        record val_ce_final = null and the registered metric was
+        unfulfillable; the z4xx campaign passes --val-interval 100
+        --val-batches 16). Protocol: n_layer 16 both arms at matched width
+        and equal FLOPs budget; candidate = attention_type reversible with
+        reversible_mode symplectic + reversible_tied true (selected from the
+        recorded config), no per-layer norms (the reversible path has none;
+        trunk-boundary norms retained in ALL arms); baseline = standard
+        attention with its usual per-layer norms. lambda_min 0.05 (the
+        coercivity floor). The depth-8/32 rungs, the untied arm (separate
+        hypothesis), the standard-no-norm expected-failure arm, and the
+        lambda_min ablation {0, 0.05, 0.5} ride as recorded diagnostics, not
+        adjudicated here.
     status: open
     evidence: []
     verdict_history: []
@@ -385,13 +394,14 @@ hypotheses:
       threshold: 1.05
       baseline: {mechanism: standard, equal_flops: true}
       min_seeds: 3
-      variant: {reversible_mode: "symplectic", reversible_tied: false}
+      candidate_variant: {reversible_mode: "symplectic", reversible_tied: false}
       scale_caveats: >-
         REGISTERED 2026-06-12 BEFORE any symplectic training run existed.
-        Same protocol as hyp-symplectic-nonorm-depth-tied except
-        reversible_tied false (per-layer independent potentials; the
-        adiabatic-drift bound of the theory note applies only as far as
-        layers stay close, which nothing enforces in this arm).
+        Same protocol and the same PRE-EVIDENCE OPERATIONALIZATION FIXES as
+        hyp-symplectic-nonorm-depth-tied (candidate_variant key; campaign
+        val cadence), except reversible_tied false (per-layer independent
+        potentials; the adiabatic-drift bound of the theory note applies
+        only as far as layers stay close, which nothing enforces here).
     status: open
     evidence: []
     verdict_history: []

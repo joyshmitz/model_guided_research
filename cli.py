@@ -7301,7 +7301,17 @@ def hypotheses_power(
 # evidence yields BLOCKED with a machine-readable reason, never a soft verdict.
 # =============================================================================
 
-_ADJ_POLICY_VERSION = "ci-v4"
+_ADJ_POLICY_VERSION = "ci-v5"
+# ci-v5 (bead qtdq) EXTENDS ci-v4 with the slope-path floor gate: a
+# length_slope verdict computed while BOTH arms' held-out exact-match means
+# sit at/below the recorded answer prior is downgraded to floor_effect
+# inconclusive in BOTH directions (supported and refuted are equally vacuous
+# when slopes are fit over floor noise - the o85g audit). All other verdicts
+# are computed exactly as under ci-v4. The gate is conservative: unrecorded
+# EM/prior leaves the mechanical verdict untouched. This is a
+# VERDICT-CHANGING policy step (unlike v3->v4's instrumentation-only step),
+# which is precisely why the version bumps: a ledger entry stamped ci-v5
+# is distinguishable from one an earlier engine would have stamped.
 # ci-v4 (bead hij.4) EXTENDS ci-v3 with statistical-integrity instrumentation;
 # every verdict's CI machinery, observation units, floor gate, and budget
 # cohorts are computed exactly as under ci-v3. Prior verdicts keep their

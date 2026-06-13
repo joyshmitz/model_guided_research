@@ -456,7 +456,9 @@ class TrainingDashboard:
             line = "  ".join(f"{k}={results[k]}" for k in summary_keys if k in results)
             if line:
                 rec_console.print(f"[dim]{line}[/dim]")
-        os.makedirs(os.path.dirname(str(self.html_path)), exist_ok=True)
+        parent = os.path.dirname(str(self.html_path))
+        if parent:  # a bare filename has no parent to create
+            os.makedirs(parent, exist_ok=True)
         rec_console.save_html(str(self.html_path))
 
 

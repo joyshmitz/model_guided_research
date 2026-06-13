@@ -1657,7 +1657,8 @@ def train(args) -> None:
         if metrics_stream is not None:
             metrics_stream.close()
         if dashboard is not None:
-            # stop the live view; the HTML export happens after results exist
+            # stops the live view and writes the HTML snapshot of the final
+            # dashboard state (crash-safe: runs even on KeyboardInterrupt)
             dashboard.close()
         compute_cleanup()
 
