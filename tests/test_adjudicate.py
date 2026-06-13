@@ -129,6 +129,35 @@ def test_supported_when_ci_clears_threshold(tmp_path):
     assert v["policy_version"] == "ci-v5"
 
 
+# ---------------------------------------------------------------------------
+# manual_hold: a human-frozen verdict the engine must refuse to re-stamp (srtf)
+
+
+def test_manual_hold_blocks_a_would_be_supported_hypothesis(tmp_path):
+    # Identical evidence to the supported case above: without the hold the
+    # engine rules SUPPORTED; WITH it, the engine refuses (blocked: manual_hold)
+    # so a mechanical -H/--all cannot clobber a hand-checked verdict by recency
+    # (the z4xx symplectic val-CE incommensurability case the bead motivates).
+    _arm_artifacts(tmp_path, "cand", "ultrametric", [0.80, 0.82, 0.81])
+    _arm_artifacts(tmp_path, "base", "standard", [0.50, 0.51, 0.52])
+    pool = _index(tmp_path)
+    assert cli._adjudicate_hypothesis(_hyp(), pool)["verdict"] == "supported"
+    held = cli._adjudicate_hypothesis(
+        _hyp(manual_hold={"held": True, "reason": "val-CE incommensurable; hand-checked INCONCLUSIVE"}), pool
+    )
+    assert held["verdict"] == "blocked"
+    assert held["reason_code"] == "manual_hold"
+    assert "incommensurable" in held["hold_reason"]
+
+
+def test_manual_hold_false_is_a_noop(tmp_path):
+    _arm_artifacts(tmp_path, "cand", "ultrametric", [0.80, 0.82, 0.81])
+    _arm_artifacts(tmp_path, "base", "standard", [0.50, 0.51, 0.52])
+    # held=false is a released/cleared hold: the engine adjudicates normally.
+    v = cli._adjudicate_hypothesis(_hyp(manual_hold={"held": False, "reason": "released"}), _index(tmp_path))
+    assert v["verdict"] == "supported"
+
+
 def test_refuted_when_ci_clears_opposite_side(tmp_path):
     # no floor info in fixture or prediction -> the gate stays out of the way
     _arm_artifacts(tmp_path, "cand", "ultrametric", [0.50, 0.51, 0.50])

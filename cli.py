@@ -7128,6 +7128,23 @@ def _validate_hypothesis_registry(
                     f"{where}: status {status!r} disagrees with the latest verdict {history[-1].get('verdict')!r}"
                 )
 
+        # manual_hold (srtf): optional human-control block. Toggling it is NOT
+        # an append-only violation (the governance check below guards only
+        # verdict_history/date_registered/statement) - it is the sanctioned way
+        # a human freezes a hand-checked verdict against mechanical re-stamping.
+        hold = h.get("manual_hold")
+        if hold is not None:
+            if not isinstance(hold, dict):
+                errors.append(f"{where}: manual_hold must be a mapping with held/reason")
+            else:
+                if not isinstance(hold.get("held"), bool):
+                    errors.append(f"{where}: manual_hold.held must be a boolean")
+                if hold.get("held") and (not isinstance(hold.get("reason"), str) or not hold["reason"].strip()):
+                    errors.append(f"{where}: manual_hold.held=true requires a non-empty reason (why the verdict is frozen)")
+                hd = hold.get("date")
+                if hd is not None and (not isinstance(hd, str) or not date_re.match(hd)):
+                    errors.append(f"{where}: manual_hold.date must be YYYY-MM-DD")
+
         if status == "blocked" and pred is not None and pred != "MISSING":
             warnings.append(f"{where}: blocked entries normally carry prediction: null until unblocked")
 
@@ -7263,6 +7280,12 @@ def hypotheses_show(
         f"source: {(match.get('source') or {}).get('kind', '?')} — {(match.get('source') or {}).get('provenance', '?')}",
         f"registered: {match.get('date_registered', '?')}",
     ]
+    hold = match.get("manual_hold")
+    if isinstance(hold, dict) and hold.get("held"):
+        lines.append(
+            f"[bold red]🔒 manual hold[/bold red]: {str(hold.get('reason', '')).strip()} "
+            f"(since {hold.get('date', '?')}, by {hold.get('by', '?')})"
+        )
     if match.get("theorem_refs"):
         lines.append(f"theorem refs: {', '.join(match['theorem_refs'])}")
     if isinstance(pred, dict):
@@ -7443,6 +7466,98 @@ def hypotheses_add(
         console.print("[bold red]add rolled back: the new entry failed validation.[/bold red]")
         raise typer.Exit(code=1)
     console.print(f"[bold green]Registered {hypothesis_id}[/bold green] → {path}")
+
+
+def _registry_set_manual_hold(path: Path, hyp_id: str, *, held: bool, reason: str, by: str) -> None:
+    """Textual surgery: set (held=True) or clear (held=False -> block removed) a
+    hypothesis's manual_hold block, preserving every hand-written comment. The
+    caller validates the result and rolls back on any error (mirrors `add` and
+    `_registry_append_verdict`)."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.strip() == f"- id: {hyp_id}")
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("- id: ")), len(lines))
+    # drop any existing manual_hold block (its 6-space-indented children)
+    mh = next((i for i in range(start, end) if lines[i].startswith("    manual_hold:")), None)
+    if mh is not None:
+        j = mh + 1
+        while j < end and lines[j].startswith("      "):
+            j += 1
+        del lines[mh:j]
+        end -= j - mh
+    if held:
+        status_idx = next(i for i in range(start, end) if lines[i].startswith("    status:"))
+        block = [
+            "    manual_hold:",
+            "      held: true",
+            f"      reason: {json.dumps(reason)}",
+            f'      date: "{time.strftime("%Y-%m-%d")}"',
+            f"      by: {json.dumps(by)}",
+        ]
+        lines[status_idx + 1 : status_idx + 1] = block
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _hypotheses_revalidate_or_rollback(path: Path, original: str, action: str) -> None:
+    """Re-run full registry validation after a textual edit; restore the saved
+    text and exit 1 if anything regressed."""
+    repo_root = Path(__file__).resolve().parent
+    new_data, load_errors = _load_hypothesis_registry(path)
+    parent = _load_parent_hypothesis_registry(repo_root)
+    errors, _w, _s = _validate_hypothesis_registry(new_data, load_errors, repo_root, parent=parent)
+    if errors:
+        path.write_text(original, encoding="utf-8")
+        for e in errors:
+            console.print(f"[red]{e}[/red]")
+        console.print(f"[bold red]{action} rolled back: the edit failed validation.[/bold red]")
+        raise typer.Exit(code=1)
+
+
+@hypotheses_app.command("hold")
+def hypotheses_hold(
+    hypothesis_id: Annotated[str, typer.Argument(help="Hypothesis id to freeze")],
+    reason: Annotated[str, typer.Option("--reason", help="Why the verdict is frozen (required)")],
+    by: Annotated[str, typer.Option("--by", help="Who placed the hold")] = "human",
+) -> None:
+    """Freeze a hypothesis's verdict: the engine refuses mechanical adjudication
+    (BLOCKED manual_hold) so a later `adjudicate -H`/`--all` cannot re-stamp a
+    hand-checked verdict by recency (srtf). Clear with `mgr hypotheses release`."""
+    if not reason.strip():
+        console.print("[bold red]--reason is required (document why the verdict is frozen).[/bold red]")
+        raise typer.Exit(code=2)
+    path = _hypotheses_registry_path()
+    data = _hypotheses_load_or_exit()
+    if not any(h.get("id") == hypothesis_id for h in data.get("hypotheses", [])):
+        console.print(f"[bold red]No hypothesis with id {hypothesis_id!r}.[/bold red] Try: mgr hypotheses list")
+        raise typer.Exit(code=1)
+    original = path.read_text(encoding="utf-8")
+    _registry_set_manual_hold(path, hypothesis_id, held=True, reason=reason, by=by)
+    _hypotheses_revalidate_or_rollback(path, original, "hold")
+    console.print(
+        f"[bold yellow]🔒 {hypothesis_id} held[/bold yellow] — the engine will refuse mechanical "
+        f"adjudication until `mgr hypotheses release {hypothesis_id}`."
+    )
+
+
+@hypotheses_app.command("release")
+def hypotheses_release(
+    hypothesis_id: Annotated[str, typer.Argument(help="Hypothesis id to release")],
+) -> None:
+    """Clear a manual hold (a deliberate human action) so the engine can
+    adjudicate the hypothesis again."""
+    path = _hypotheses_registry_path()
+    data = _hypotheses_load_or_exit()
+    match = next((h for h in data.get("hypotheses", []) if h.get("id") == hypothesis_id), None)
+    if match is None:
+        console.print(f"[bold red]No hypothesis with id {hypothesis_id!r}.[/bold red]")
+        raise typer.Exit(code=1)
+    hold = match.get("manual_hold")
+    if not (isinstance(hold, dict) and hold.get("held")):
+        console.print(f"[yellow]{hypothesis_id} is not on hold; nothing to release.[/yellow]")
+        return
+    original = path.read_text(encoding="utf-8")
+    _registry_set_manual_hold(path, hypothesis_id, held=False, reason="", by="")
+    _hypotheses_revalidate_or_rollback(path, original, "release")
+    console.print(f"[bold green]🔓 {hypothesis_id} released[/bold green] — mechanical adjudication re-enabled.")
 
 
 @hypotheses_app.command("power")
@@ -7642,6 +7757,7 @@ _ADJ_BLOCK_REASONS = {
     "insufficient_seeds": "no equal-FLOPs cohort gives both arms at least min_seeds (>= 2) training runs - mgr hypotheses power computes the seed count the registered effect actually needs",
     "budget_mismatch": "no equal-FLOPs cohort (5% tolerance) contains both arms, or an artifact cannot prove its planned budget",
     "metric_missing": "qualifying artifact lacks the metric at the registered path",
+    "manual_hold": "hypothesis is on manual hold - a human froze the verdict; the engine refuses to re-stamp it mechanically. Release with `mgr hypotheses release <id>` before adjudicating.",
 }
 
 
@@ -8105,6 +8221,17 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
     """One hypothesis -> a verdict record (verdict in supported/refuted/
     inconclusive) or a refusal (verdict 'blocked' + reason_code)."""
     hid = hyp.get("id")
+    # manual_hold (srtf): a human-frozen verdict. The mechanical engine reads
+    # the same evidence every run, so without this guard `adjudicate --all`
+    # silently RE-STAMPS a hand-checked verdict by recency (e.g. the z4xx
+    # symplectic val_ce ratio ~0.004 reads SUPPORTED, clobbering the
+    # INCONCLUSIVE metric-commensurability hand-check). A blocked verdict is
+    # report-only and never appended, so the status line and verdict_history
+    # are left untouched - for both `-H` and `--all` - until a human releases.
+    hold = hyp.get("manual_hold")
+    if isinstance(hold, dict) and bool(hold.get("held")):
+        return {"id": hid, "verdict": "blocked", "reason_code": "manual_hold",
+                "reason": _ADJ_BLOCK_REASONS["manual_hold"], "hold_reason": str(hold.get("reason", ""))}
     pred = hyp.get("prediction")
     if not isinstance(pred, dict):
         return {"id": hid, "verdict": "blocked", "reason_code": "prediction_not_operationalized",

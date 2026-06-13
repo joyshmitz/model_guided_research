@@ -106,6 +106,38 @@ def test_duplicate_ids_rejected():
     assert any("duplicate id" in e for e in errors)
 
 
+def test_manual_hold_schema():
+    # a well-formed hold validates clean
+    errors, _, _ = _validate(_registry(_entry(manual_hold={"held": True, "reason": "frozen by hand-check"})))
+    assert errors == [], errors
+    # held=false (released) needs no reason
+    errors, _, _ = _validate(_registry(_entry(manual_hold={"held": False})))
+    assert errors == [], errors
+    # malformed holds are rejected with actionable errors
+    cases = [
+        (_entry(manual_hold="frozen"), "must be a mapping"),
+        (_entry(manual_hold={"held": "yes", "reason": "x"}), "held must be a boolean"),
+        (_entry(manual_hold={"held": True}), "non-empty reason"),
+        (_entry(manual_hold={"held": True, "reason": "x", "date": "June 13"}), "manual_hold.date"),
+    ]
+    for entry, fragment in cases:
+        errors, _, _ = _validate(_registry(entry))
+        assert any(fragment in e for e in errors), f"expected {fragment!r}, got {errors}"
+
+
+def test_manual_hold_toggle_is_not_append_only_violation():
+    # A hold is a human control field, not a claim: adding it (and later
+    # clearing it) must pass append-only governance against the committed parent
+    # (srtf). Only verdict_history/date_registered/statement are guarded.
+    parent = _registry(_entry())
+    held = _registry(_entry(manual_hold={"held": True, "reason": "frozen pending re-test"}))
+    errors, _, _ = _validate(held, parent=parent)
+    assert errors == [], f"placing a hold must not trip append-only governance: {errors}"
+    # and releasing it (parent held -> child cleared) is likewise clean
+    errors, _, _ = _validate(_registry(_entry()), parent=held)
+    assert errors == [], f"releasing a hold must not trip governance: {errors}"
+
+
 def test_prediction_contract_enforced():
     bad_pred = dict(_entry()["prediction"])
     cases = [
