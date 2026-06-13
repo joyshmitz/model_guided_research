@@ -216,9 +216,19 @@ its honest failure-mode corrections. All artifacts are in-repo.
    adjudicate it.
 7. **Decisive campaign (8h0e)**: preregistered in the bead before launch —
    arms, seeds 30–33, *and the adaptive rule* (if wave-1 power < 80%, add
-   seeds 34–37 before adjudicating; adjudicate exactly once). The 3e14
-   cohort supersedes the floored E1 verdict automatically via the
-   budget-cohort rule.
+   seeds 34–37 before adjudicating; adjudicate exactly once). Outcome:
+   **REFUTED, −0.245 [−0.326, −0.164], n=8/8 at 3e14** — the 3e14 cohort
+   superseded the floored E1 SUPPORTED via the budget-cohort rule (the
+   ledger's first supersession with a status flip). At the off-floor rung
+   standard wins decisively; three braid seeds even fell *below* the 0.625
+   prior. The E1 win was real but it measured **sample efficiency**, not the
+   **asymptotic** superiority the hypothesis claimed — which is exactly why
+   the two are now registered as separate claims (§7,
+   `campaign_preregistration_template.md` §1). The verdict carried a
+   REFUTED-UNDERPOWERED stamp (power is measured against the registered +0.05
+   regardless of the observed sign; the refutation CI excludes the threshold
+   by >3×, so the flag is a conservative asterisk, not a weak verdict — see
+   bead 4b82).
 
 Compact second example (`9qk3`, dequantization annealing): theory note →
 operationalized prediction with **variant selectors** (both arms tropical,
