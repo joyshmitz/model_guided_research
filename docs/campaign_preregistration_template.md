@@ -80,7 +80,7 @@ uv run mgr hypotheses add --id hyp-<mech>-<task>-<claim> \
     --source-kind model --provenance "artifacts/proposals/<id>/scoring.md" \
     --metric-path "evaltasks:tasks.<task>.exact_match.greedy.held_out.mean" \
     --comparator ">=" --threshold 0.05 --threshold-kind absolute_delta \
-    --baseline-mechanism standard --min-seeds <power-derived, §4> \
+    --baseline-mechanism standard --min-seeds <fixed floor, never edited; §4> \
     --baseline-floor <task floor> --floor-source "<how computed>" \
     --scale-caveats "asymptotic claim: rung d128/L4 @ <off-floor budget> from probe <bead>; never adjudicate at a floored rung"
 uv run mgr hypotheses validate
@@ -95,27 +95,56 @@ uv run mgr hypotheses validate
 - **Non-inferiority** variant (when the claim is "X does not lose"): register
   a negative `--threshold` with `absolute_delta` ("loses by no more than ε").
 
-## 4. Phase 2 — power-derive `min_seeds`; treat high variance as a *rung* signal
+## 4. Phase 2 — size the campaign by power; diagnose *which arm* drives the variance
 
-`min_seeds: 3` is convention, not a power analysis. After Phase 0 you have
-pilot variance; let the engine size the campaign:
+`min_seeds: 3` is convention, not a power analysis. Two distinct knobs are
+easy to conflate:
+
+- **`min_seeds` (registry)** — a *fixed floor* the engine refuses to
+  adjudicate below, registered once and **never edited** (the governance
+  spirit: "claims should be retired and re-registered, not morphed"; 8h0e
+  kept `min_seeds: 3` throughout while actually running n=25 then n=8). Set it
+  pre-evidence to a sensible floor; you can always run *more*.
+- **How many seeds you actually run** — governed by the bead's pre-registered
+  adaptive rule (Phase 3), informed by the wave-1 power gate. *This* is what
+  power-sizing drives, not the registry field.
+
+The power gate cannot see the quarantined probe — `mgr hypotheses power` runs
+the verdict engine's collector, which *skips* `artifacts/probes/sizing/`. So
+the two-step is: (1) eyeball the probe's per-seed variance from its
+`summary.json` to pick a sane `min_seeds` floor at registration; (2) once
+wave-1 of the *non-quarantined* campaign lands, run the formal gate to drive
+the adaptive rule:
 
 ```bash
-uv run mgr hypotheses power -H hyp-<mech>-<task>-<claim>
+uv run mgr hypotheses power -H hyp-<mech>-<task>-<claim>   # reads indexed evidence only
 ```
 
-- It reports achieved power for the **registered effect size** at the observed
-  variance, and the per-arm seed count for 80%. Set `min_seeds` to that count.
-- **If the required n is absurd (≫10/arm), the rung is wrong, not the seed
-  count.** Large n almost always means floor bimodality inflating variance
-  (the `sm47` lesson: seed expansion could not resolve the +0.05 Dyck claim at
-  the floored rung). Move up a rung; the variance collapses. Grinding seeds at
-  a bad rung buys nothing.
-- Power is computed for the registered effect *regardless of observed sign*, so
-  a decisively-negative result can still read "underpowered" — see `4b82`
-  (sign-aware power adequacy for refutations) and `research_loop.md`; that flag
-  is a conservative asterisk, not a weak verdict, when the CI excludes the
-  threshold with margin.
+It reports achieved power for the **registered effect size** at the observed
+per-arm variance, and the per-arm seed count for 80% — the trigger for the
+Phase-3 adaptive rule.
+
+**A large required-n means high variance in *some* arm — diagnose which before
+reacting** (look at each arm's per-seed spread, not just the headline n):
+
+- **Baseline near the floor, bimodal** (some seeds learn, some sit at the
+  prior) → the *rung* is wrong. Move up; the variance collapses; do not grind
+  seeds. This is the `sm47` lesson (seed expansion could not resolve the +0.05
+  Dyck claim while the standard baseline was floored).
+- **Candidate arm wide while the baseline is tight and off-floor** → the
+  *mechanism* is unreliable at this task, and a rung change will **not** fix
+  it. That is itself a finding. Braid–Dyck E2 is exactly this: standard
+  sd 0.027 (tight, off-floor at 0.908), braid sd 0.096 (three seeds below the
+  0.625 prior), required n≈32 — driven by the candidate, not the baseline. The
+  right move was *not* more seeds and *not* a rung change: the effect was so
+  large (−0.245, CI excludes the threshold by >3×) that the refutation was
+  decisive at n=8 despite the "29% power" headline.
+
+Power is computed for the registered effect *regardless of observed sign*, so a
+decisively-negative result can still read "underpowered" — see `4b82`
+(sign-aware power adequacy for refutations) and `research_loop.md`; that flag
+is a conservative asterisk, not a weak verdict, when the CI excludes the
+threshold with margin.
 
 ## 5. Phase 3 — pre-register the adaptive / stopping rule (the only stopping rule)
 

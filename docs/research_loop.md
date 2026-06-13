@@ -183,8 +183,12 @@ feed the next round:
   pre-evidence, with the asymmetric knowledge disclosed — then SUPPORTED).
   Never morph the refuted entry; the ledger keeps both.
 - **INCONCLUSIVE / UNDERPOWERED** → `mgr hypotheses power` says how many
-  seeds the claim actually needs; if the answer is absurd, the right move is
-  a different rung, not more seeds (see below).
+  seeds the claim needs; if that is absurd, diagnose *which arm* is wide
+  (`campaign_preregistration_template.md` §4): a floored, bimodal baseline
+  means move the rung (not more seeds); a wide *candidate* arm with a tight
+  off-floor baseline means the mechanism is unreliable at this task — a
+  finding in itself, and if the effect is large the verdict can still be
+  decisive (braid–Dyck E2).
 
 ## Worked example: the braid–Dyck claim, end to end
 
