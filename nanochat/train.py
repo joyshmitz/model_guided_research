@@ -39,7 +39,14 @@ from nanochat.dataset import ensure_min_parquet_files, list_parquet_files
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.gpt_synaptic import GPTSynaptic, GPTSynapticConfig
 from nanochat.ordinal_scheduler import OrdinalLRScheduler
-from nanochat.report import MetricsStream, build_provenance, get_git_info, get_gpu_info, get_system_info
+from nanochat.report import (
+    MetricsStream,
+    TrainingDashboard,
+    build_provenance,
+    get_git_info,
+    get_gpu_info,
+    get_system_info,
+)
 from nanochat.synaptic import SynapticConfig
 from nanochat.tropical_attention_torch import set_semiring_beta
 
@@ -1121,6 +1128,7 @@ def train(args) -> None:
     # crashed run leaves an attributable artifact.
     provenance = build_provenance(asdict(config))
     metrics_stream: MetricsStream | None = None
+    dashboard: TrainingDashboard | None = None
     if ddp_rank == 0:
         run_dir.mkdir(parents=True, exist_ok=True)
         # append on resume: truncating would erase the parent process's step
@@ -1129,6 +1137,40 @@ def train(args) -> None:
         metrics_stream = MetricsStream(
             run_dir / "metrics.jsonl", provenance=provenance, append=resume_meta is not None
         )
+        if bool(getattr(args, "dashboard", False)):
+            # Live rich dashboard (bead nyp): renders the SAME records the
+            # metrics stream writes - zero overhead when the flag is off.
+            dash_html = getattr(args, "dashboard_html", None)
+            html_path = (
+                Path(dash_html)
+                if dash_html
+                else Path(args.artifacts_dir) / "dashboard" / f"{resolved_run_id}.html"
+            )
+            dash_flags: dict[str, Any] = {
+                "attention": config.attention_type,
+                "ffn": getattr(config, "ffn_type", "standard"),
+                "optimizer": str(args.optimizer_type),
+                "scheduler": str(args.scheduler_type),
+                "flex": bool(getattr(config, "use_flex_attention", False)),
+                "device": device.type,
+            }
+            if config.attention_type == "reversible":
+                dash_flags["mode"] = getattr(config, "reversible_mode", "additive")
+                dash_flags["tied"] = getattr(config, "reversible_tied", False)
+            if config.attention_type == "tropical" and getattr(args, "semiring_beta", None) is not None:
+                dash_flags["beta"] = str(args.semiring_beta)
+            if config.attention_type == "braid":
+                dash_flags["law"] = getattr(config, "braid_crossing_law", "restricted")
+            if config.attention_type == "standard" and getattr(config, "disable_block_norms", False):
+                dash_flags["no_norms"] = True
+            dashboard = TrainingDashboard(
+                run_id=resolved_run_id,
+                mechanism=config.attention_type if model_type == "gpt" else model_type,
+                max_steps=max_steps,
+                flags=dash_flags,
+                html_path=html_path,
+            )
+            dashboard.start()
 
     def _grad_norm() -> float:
         # Called in the log block AFTER opt.step() and BEFORE the next
@@ -1587,6 +1629,8 @@ def train(args) -> None:
                             symplectic_energy_last = sym_stats["shadow_energy_mean"]
                             symplectic_x_norm_last = sym_stats["x_norm_mean"]
                     metrics_stream.write(record)
+                    if dashboard is not None:
+                        dashboard.observe(record)
 
             # Periodic validation evaluation
             if val_loader is not None and val_interval > 0 and (step + 1) % val_interval == 0:
@@ -1603,11 +1647,18 @@ def train(args) -> None:
                             {"type": "val", "step": step, "val_loss": float(val_loss), "train_loss": loss_item}
                         )
                         metrics_stream.flush()  # val cadence is the bead's flush point
+                    if dashboard is not None:
+                        dashboard.observe(
+                            {"type": "val", "step": step, "val_loss": float(val_loss), "train_loss": loss_item}
+                        )
     finally:
         # Land the buffered metrics even on KeyboardInterrupt/crash, BEFORE
         # the process group teardown can get in the way.
         if metrics_stream is not None:
             metrics_stream.close()
+        if dashboard is not None:
+            # stop the live view; the HTML export happens after results exist
+            dashboard.close()
         compute_cleanup()
 
     # Final checkpoint so downstream consumers (eval C2, teachers C6) always
@@ -2074,6 +2125,22 @@ def build_parser() -> argparse.ArgumentParser:
             "Standard attention only: strip the per-layer norms - the expected-failure falsification "
             "arm of the symplectic no-norm program (bead z4xx)."
         ),
+    )
+    parser.add_argument(
+        "--dashboard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Live rich console dashboard (bead nyp): loss/val/grad-norm/throughput sparklines, feature "
+            "flags, and an auto-adopted mathematical-invariant drift panel rendered from the metrics "
+            "stream. HTML snapshot saved to artifacts/dashboard/<run_id>.html on close."
+        ),
+    )
+    parser.add_argument(
+        "--dashboard-html",
+        type=str,
+        default=None,
+        help="Override the dashboard HTML export path (default: <artifacts-dir>/dashboard/<run_id>.html).",
     )
     parser.add_argument(
         "--tropical-gauge-fix",

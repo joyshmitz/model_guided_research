@@ -231,6 +231,235 @@ def read_metrics_jsonl(path: Any) -> tuple[dict[str, Any] | None, list[dict[str,
     return header, records, problems
 
 
+# ---------------------------------------------------------------------------
+# Live training dashboard (bead nyp). Renders the SAME record dicts that
+# MetricsStream writes - no second telemetry path, no overhead when off (the
+# trainer simply never constructs one). Mechanism diagnostics (route_coverage,
+# braid_q1/q2, symplectic_*, certs.*) are auto-adopted: any numeric scalar in
+# a step record that is not a core key becomes a tracked sparkline with
+# trailing-band drift highlighting - the invariant-drift panel costs nothing
+# here because the telemetry beads produce the data; this only renders it.
+# ---------------------------------------------------------------------------
+
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+_DASH_CORE_KEYS = frozenset(
+    {
+        "type",
+        "step",
+        "loss",
+        "lr",
+        "lr_groups",
+        "grad_norm",
+        "tokens_per_s",
+        "tflops",
+        "peak_mem_gb",
+        "elapsed_s",
+        "val_loss",
+        "train_loss",
+    }
+)
+
+
+def sparkline(values: list[float], width: int = 32) -> str:
+    """Unicode block sparkline of the trailing `width` values; non-finite
+    points render as '✕' so a NaN excursion stays visible in the strip."""
+    import math as math_mod
+
+    tail = list(values)[-width:]
+    if not tail:
+        return ""
+    finite = [v for v in tail if math_mod.isfinite(v)]
+    if not finite:
+        return "✕" * len(tail)
+    lo, hi = min(finite), max(finite)
+    span = hi - lo
+    out = []
+    for v in tail:
+        if not math_mod.isfinite(v):
+            out.append("✕")
+        elif span <= 0:
+            out.append(_SPARK_CHARS[3])
+        else:
+            idx = int((v - lo) / span * (len(_SPARK_CHARS) - 1))
+            out.append(_SPARK_CHARS[max(0, min(idx, len(_SPARK_CHARS) - 1))])
+    return "".join(out)
+
+
+def _drift_flag(series: list[float], min_history: int = 8, k: float = 3.0) -> bool:
+    """True when the latest value departs the trailing band (mean ± k·std of
+    the PRIOR points) - the warn highlight of the invariant-drift panel."""
+    import math as math_mod
+    import statistics as stats_mod
+
+    finite = [v for v in series if math_mod.isfinite(v)]
+    if len(finite) < min_history:
+        return False
+    prior, last = finite[:-1], finite[-1]
+    mu = stats_mod.mean(prior)
+    sd = stats_mod.stdev(prior)
+    if sd <= 0 or not math_mod.isfinite(sd):
+        return False
+    return abs(last - mu) > k * sd
+
+
+class TrainingDashboard:
+    """Rich live console dashboard for a training run (bead nyp).
+
+    Usage from the trainer (rank 0 only):
+        dash = TrainingDashboard(run_id=..., mechanism=..., max_steps=..., flags={...},
+                                 html_path=artifacts/dashboard/<run_id>.html)
+        dash.start()
+        ... dash.observe(record) right after metrics_stream.write(record) ...
+        dash.close(results)   # stops the live view; writes the HTML export
+
+    Rendering is pull-free: observe() pushes the record and refreshes the
+    live view, so a disabled dashboard (never constructed) costs nothing.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        mechanism: str,
+        max_steps: int,
+        flags: dict[str, Any] | None = None,
+        html_path: Any = None,
+        console: Any = None,
+        window: int = 256,
+    ):
+        from collections import deque
+
+        from rich.console import Console
+
+        self.run_id = run_id
+        self.mechanism = mechanism
+        self.max_steps = max(1, int(max_steps))
+        self.flags = dict(flags or {})
+        self.html_path = html_path
+        self.console = console or Console()
+        self._window = int(window)
+        self._mk: Any = lambda: deque(maxlen=self._window)
+        self._loss = self._mk()
+        self._grad = self._mk()
+        self._toks = self._mk()
+        self._tflops = self._mk()
+        self._val: list[tuple[int, float]] = []
+        self._diags: dict[str, Any] = {}  # name -> deque
+        self._step = 0
+        self._latest: dict[str, Any] = {}
+        self._nan_seen = False
+        self._live: Any = None
+
+    def start(self) -> None:
+        from rich.live import Live
+
+        self._live = Live(self._render(), console=self.console, refresh_per_second=4, transient=False)
+        self._live.start()
+
+    def observe(self, record: dict[str, Any]) -> None:
+        import math as math_mod
+
+        rtype = record.get("type")
+        if rtype == "step":
+            self._step = int(record.get("step", self._step))
+            self._latest = record
+            for key, series in (("loss", self._loss), ("grad_norm", self._grad),
+                                ("tokens_per_s", self._toks), ("tflops", self._tflops)):
+                val = record.get(key)
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    series.append(float(val))
+                    if not math_mod.isfinite(float(val)):
+                        self._nan_seen = True
+            for key, val in record.items():
+                if key in _DASH_CORE_KEYS or not isinstance(val, (int, float)) or isinstance(val, bool):
+                    continue
+                self._diags.setdefault(key, self._mk()).append(float(val))
+        elif rtype == "val":
+            val = record.get("val_loss")
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                self._val.append((int(record.get("step", self._step)), float(val)))
+        if self._live is not None:
+            self._live.update(self._render())
+
+    def close(self, results: dict[str, Any] | None = None) -> None:
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+        if self.html_path is not None:
+            self._export_html(results)
+
+    # -- rendering ----------------------------------------------------------
+
+    def _render(self) -> Any:
+        from rich.console import Group
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+
+        pct = 100.0 * (self._step + 1) / self.max_steps
+        title = Text.assemble(
+            (f" {self.run_id} ", "bold white on blue"),
+            (f" {self.mechanism} ", "bold black on cyan"),
+            (f" step {self._step + 1}/{self.max_steps} ({pct:.0f}%) ", "bold"),
+            ((" NaN! ", "bold white on red") if self._nan_seen else (" ✓ finite ", "green")),
+        )
+
+        core = Table(box=None, show_header=False, padding=(0, 1))
+        core.add_column(justify="right", style="dim")
+        core.add_column(justify="left")
+
+        def _fmt(v: Any, spec: str = ".4f") -> str:
+            return format(v, spec) if isinstance(v, (int, float)) and not isinstance(v, bool) else "—"
+
+        core.add_row("loss", f"[bold]{_fmt(self._latest.get('loss'))}[/bold]  [cyan]{sparkline(list(self._loss))}[/cyan]")
+        if self._val:
+            vstep, vloss = self._val[-1]
+            core.add_row("val_ce", f"{vloss:.4f} @ {vstep}  [magenta]{sparkline([v for _, v in self._val])}[/magenta]")
+        core.add_row("grad_norm", f"{_fmt(self._latest.get('grad_norm'))}  [yellow]{sparkline(list(self._grad))}[/yellow]")
+        core.add_row("lr", _fmt(self._latest.get("lr"), ".2e"))
+        core.add_row("tok/s", f"{_fmt(self._latest.get('tokens_per_s'), ',.0f')}  [green]{sparkline(list(self._toks))}[/green]")
+        core.add_row("TFLOP/s", f"{_fmt(self._latest.get('tflops'), '.4f')}")
+        mem = self._latest.get("peak_mem_gb")
+        core.add_row("peak mem", f"{mem:.2f} GB" if isinstance(mem, (int, float)) else "— (cpu)")
+
+        panels: list[Any] = [Panel(core, title=title, border_style="blue")]
+
+        if self.flags:
+            flag_text = "  ".join(f"[dim]{k}[/dim]=[bold]{v}[/bold]" for k, v in self.flags.items() if v is not None)
+            panels.append(Panel(flag_text, title="feature flags", border_style="dim", height=3))
+
+        if self._diags:
+            diag = Table(box=None, show_header=False, padding=(0, 1))
+            diag.add_column(justify="right", style="dim", overflow="fold")
+            diag.add_column(justify="left")
+            for name in sorted(self._diags):
+                series = list(self._diags[name])
+                drift = _drift_flag(series)
+                style = "bold white on red" if drift else "cyan"
+                marker = " [bold red]⚠ band[/bold red]" if drift else ""
+                diag.add_row(name, f"{series[-1]:.5g}  [{style}]{sparkline(series)}[/{style}]{marker}")
+            panels.append(
+                Panel(diag, title="mathematical invariants · trailing-band drift watch", border_style="cyan")
+            )
+
+        return Group(*panels)
+
+    def _export_html(self, results: dict[str, Any] | None) -> None:
+        import os
+
+        from rich.console import Console
+
+        rec_console = Console(record=True, width=120, force_terminal=True)
+        rec_console.print(self._render())
+        if results:
+            summary_keys = ("train_ce_final", "val_ce_final", "measured_steps", "measured_tokens")
+            line = "  ".join(f"{k}={results[k]}" for k in summary_keys if k in results)
+            if line:
+                rec_console.print(f"[dim]{line}[/dim]")
+        os.makedirs(os.path.dirname(str(self.html_path)), exist_ok=True)
+        rec_console.save_html(str(self.html_path))
+
+
 def estimate_cost(gpu_info, runtime_hours=None):
     """Estimate training cost based on GPU type and runtime."""
 
