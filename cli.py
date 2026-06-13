@@ -7632,7 +7632,24 @@ def hypotheses_power(
 # evidence yields BLOCKED with a machine-readable reason, never a soft verdict.
 # =============================================================================
 
-_ADJ_POLICY_VERSION = "ci-v5"
+_ADJ_POLICY_VERSION = "ci-v6"
+# ci-v6 (bead 4b82) makes the UNDERPOWERED qualifier SIGN-AWARE. The ci-v4
+# power floor asks "could this design have CONFIRMED the registered effect?" -
+# the right adequacy lens for a SUPPORTED verdict, the WRONG one for a REFUTED
+# verdict. A REFUTED arm already carries a CI that EXCLUDES the threshold (that
+# IS the refutation's significance) and the floor gate already downgrades
+# powerless refutations to inconclusive; stamping it UNDERPOWERED because the
+# test had low power to confirm the OPPOSITE-sign +threshold effect reads as
+# "weak refutation" when it is decisive (8h0e: effect -0.245, CI excludes +0.05
+# by >3x, was stamped UNDERPOWERED at 29% power-to-confirm). Under ci-v6 the
+# UNDERPOWERED qualifier fires on SUPPORTED arms only (byte-identical to ci-v5);
+# a REFUTED arm instead records refutation_margin = |effect - threshold| /
+# CI-half-width (how many half-widths the interval sits past the threshold on
+# the failing side; > 1 by construction, larger = more decisive). `power` (the
+# power to confirm the registered effect) is still recorded on every arm as an
+# informational quantity. SUPPORTED/INCONCLUSIVE verdicts, p-values, FDR, floor
+# gates, and the registry status vocabulary are unchanged; the version bumps
+# because a ci-v6 entry's qualifier semantics differ from a ci-v5 entry's.
 # ci-v5 (bead qtdq) EXTENDS ci-v4 with the slope-path floor gate: a
 # length_slope verdict computed while BOTH arms' held-out exact-match means
 # sit at/below the recorded answer prior is downgraded to floor_effect
@@ -8419,11 +8436,23 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
         if power_info is not None:
             arm["power"] = power_info["power"]
             arm["n_for_80pct"] = power_info["n_for_80pct"]
-            if arm_verdict in ("supported", "refuted") and power_info["power"] < _ADJ_POWER_FLOOR:
-                # a clean-looking verdict from a test that could not have
-                # detected the registered effect is noise laundered as
-                # evidence - visibly qualified, never silently clean (hij.4)
+            # ci-v6: the registered-effect power floor is the SUPPORTED-side
+            # adequacy lens ("could this design have CONFIRMED the +threshold
+            # effect?") - noise laundered as evidence when low (hij.4). It is
+            # the WRONG lens for a refutation, so the UNDERPOWERED qualifier
+            # fires on SUPPORTED arms only (byte-identical to ci-v4/v5 there).
+            if arm_verdict == "supported" and power_info["power"] < _ADJ_POWER_FLOOR:
                 arm["underpowered"] = True
+        # ci-v6: a refutation's adequacy is its PRECISION - how decisively the
+        # CI excludes the threshold - not the power to confirm the opposite-sign
+        # effect. refutation_margin counts CI-half-widths from the effect to the
+        # threshold (> 1 by construction for a REFUTED arm; the floor gate has
+        # already removed powerless refutations), so a decisive refutation
+        # (large margin) is never misread as weak (bead 4b82).
+        if arm_verdict == "refuted":
+            half = (hi - lo) / 2.0
+            if half > 0.0:
+                arm["refutation_margin"] = abs(effect - threshold) / half
         arm["verdict"] = arm_verdict
         arms[mech] = arm
         used_paths.extend(sorted({a["path"] for a in cc + bb}))
@@ -9025,6 +9054,13 @@ def adjudicate(
                 + (
                     f" UNDERPOWERED(need n≈{a['n_for_80pct']})"
                     if a.get("underpowered")
+                    else ""
+                )
+                + (
+                    # ci-v6: a refutation's decisiveness is its CI-half-widths
+                    # past the threshold, not the (irrelevant) confirm-power
+                    f" refutation_margin={a['refutation_margin']:.1f}×"
+                    if a.get("refutation_margin") is not None
                     else ""
                 )
                 + (

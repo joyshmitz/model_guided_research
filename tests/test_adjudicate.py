@@ -126,7 +126,7 @@ def test_supported_when_ci_clears_threshold(tmp_path):
     arm = v["arms"]["ultrametric"]
     assert arm["ci95"][0] >= 0.05 and abs(arm["effect"] - 0.30) < 0.02
     assert arm["n_candidate"] == 3 and arm["n_baseline"] == 3  # one obs per trained model
-    assert v["policy_version"] == "ci-v5"
+    assert v["policy_version"] == "ci-v6"
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +164,25 @@ def test_refuted_when_ci_clears_opposite_side(tmp_path):
     _arm_artifacts(tmp_path, "base", "standard", [0.50, 0.50, 0.51])
     v = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path))
     assert v["verdict"] == "refuted", v  # effect ~0, CI well below the +0.05 claim
+
+
+def test_decisive_refutation_is_not_underpowered_civ6(tmp_path):
+    """ci-v6 (bead 4b82), 8h0e in miniature: a large OPPOSITE-sign effect whose
+    CI excludes the +0.05 threshold decisively, but with enough spread that the
+    power to DETECT the registered +0.05 is < 50%. Under ci-v5 this was stamped
+    UNDERPOWERED (the wrong lens - "could you have CONFIRMED +0.05?"); under
+    ci-v6 a refutation's adequacy is its precision, recorded as
+    refutation_margin, and the confirm-power qualifier no longer fires."""
+    _arm_artifacts(tmp_path, "cand", "ultrametric", [0.30, 0.36, 0.42])
+    _arm_artifacts(tmp_path, "base", "standard", [0.55, 0.60, 0.65])
+    v = cli._adjudicate_hypothesis(_hyp(), _index(tmp_path))
+    assert v["verdict"] == "refuted", v
+    arm = v["arms"]["ultrametric"]
+    assert arm["power"] < 0.5  # low power to CONFIRM the registered +0.05...
+    assert "underpowered" not in arm  # ...but a decisive refutation is NOT weak (ci-v6)
+    assert "underpowered" not in v
+    assert arm["refutation_margin"] > 1.5  # the CI sits well past the threshold
+    assert v["policy_version"] == "ci-v6"
 
 
 def test_inconclusive_when_ci_straddles(tmp_path):
@@ -474,8 +493,8 @@ def test_ledger_append_preserves_comments_and_is_append_only(tmp_path, monkeypat
     assert entry["status"] == "supported"
     assert len(entry["verdict_history"]) == 1
     first = entry["verdict_history"][0]
-    assert first["verdict"] == "supported" and first["adjudicator"] == "engine:ci-v5"
-    assert first["policy_version"] == "ci-v5" and first["artifacts"]
+    assert first["verdict"] == "supported" and first["adjudicator"] == "engine:ci-v6"
+    assert first["policy_version"] == "ci-v6" and first["artifacts"]
 
     # second adjudication APPENDS; the first entry is untouched
     result = runner.invoke(cli.app, [
@@ -681,7 +700,7 @@ def test_single_arm_certify_supported_budget_exempt(tmp_path):
     assert arm["single_arm"] is True
     assert arm["budget_flops"] is None
     assert arm["n_candidate"] == 3 and arm["n_baseline"] == 0
-    assert v["policy_version"] == "ci-v5"
+    assert v["policy_version"] == "ci-v6"
 
 
 def test_single_arm_certify_refuted_and_seed_dedupe(tmp_path):
@@ -780,7 +799,7 @@ def test_two_arm_verdicts_unchanged_under_ci_v3(tmp_path):
     arm = v["arms"]["ultrametric"]
     assert "single_arm" not in arm
     assert arm["n_candidate"] == 3 and arm["n_baseline"] == 3
-    assert v["policy_version"] == "ci-v5"
+    assert v["policy_version"] == "ci-v6"
 
 
 def test_evaltasks_variant_selector_resolves_via_model_config(tmp_path):
