@@ -7732,7 +7732,13 @@ def _adj_power(
     effect_size = abs(threshold - _adj_null_reference(threshold_kind))
     if effect_size == 0.0:
         return None
-    z975, z80 = 1.959963984540054, 0.8416212335729143
+    from scipy import stats as _scipy_stats
+
+    # z for the CI's two-sided alpha and z for the power TARGET - derived
+    # from the policy constant so the n_for_80pct column can never disagree
+    # with _ADJ_POWER_TARGET (norm.ppf(0.8) = 0.8416...)
+    z975 = 1.959963984540054
+    z80 = float(_scipy_stats.norm.ppf(_ADJ_POWER_TARGET))
     if threshold_kind == "absolute_delta":
         if single_arm:
             n_now = len(cand)
@@ -7750,8 +7756,6 @@ def _adj_power(
     se_now = (basis / n_now) ** 0.5
     if se_now == 0.0:
         return {"power": 1.0, "n_for_80pct": n_now}
-    from scipy import stats as _scipy_stats
-
     power = float(_scipy_stats.norm.cdf(effect_size / se_now - z975))
     n80 = math.ceil(basis * (z975 + z80) ** 2 / (effect_size * effect_size))
     return {"power": power, "n_for_80pct": max(n80, 2)}
@@ -8099,7 +8103,11 @@ def report(
             g["n_tainted"] += 1
         elif isinstance(r["train_ce_final"], (int, float)):
             g["ce"].append(float(r["train_ce_final"]))
-    for key in sorted(seen_tg):
+    # None-safe ordering: legacy artifacts may lack budget.target_flops
+    def _group_order(k: tuple[str, str, Any]) -> tuple[str, str, float]:
+        return (k[0], k[1], k[2] if k[2] is not None else -1.0)
+
+    for key in sorted(seen_tg, key=_group_order):
         g = seen_tg[key]
         g["train_ce_final"] = _report_mean_sd(g.pop("ce"))
         train_groups.append(g)
@@ -8125,7 +8133,7 @@ def report(
             g["em"].append(float(r["em_held_out"]))
         if isinstance(r["answer_prior"], (int, float)):
             g["prior"].append(float(r["answer_prior"]))
-    for key in sorted(seen_eg):
+    for key in sorted(seen_eg, key=_group_order):
         g = seen_eg[key]
         g["em_held_out"] = _report_mean_sd(g.pop("em"))
         priors = g.pop("prior")

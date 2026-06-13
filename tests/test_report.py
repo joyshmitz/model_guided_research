@@ -220,3 +220,96 @@ def _yaml_entry_status(h) -> str:
         "    verdict_history: []",
         "",
     ])
+
+
+def test_report_survives_mixed_none_flops(tmp_path):
+    """Fresh-eyes regression: legacy artifacts may lack budget.target_flops;
+    a None mixed with floats in the group-sort key must not TypeError."""
+    arts = tmp_path / "artifacts"
+    _train_summary(arts, "a", mechanism="braid", task="dyck", seed=0, ce=0.9, flops=3e14)
+    # same (task, mechanism) with a missing budget -> None group key member
+    run_dir = arts / "campaigns" / "t" / "b"
+    run_dir.mkdir(parents=True)
+    (run_dir / "summary.json").write_text(json.dumps({
+        "schema_version": "mgr.telemetry.v1",
+        "meta": {"run_id": "b", "argv": []},
+        "config": {"attention_type": "braid"},
+        "dataset": {"data_dir": "artifacts/diagnostics_e1/dyck"},
+        "budget": {},
+        "provenance": CLEAN_PROV,
+        "results": {"train_ce_final": 1.0, "measured_time_s": 60.0},
+    }))
+    result = runner.invoke(cli.app, [
+        "report", "--artifacts", str(arts), "--out", str(tmp_path / "r"), "--run-id", "mix",
+    ])
+    assert result.exit_code == 0, result.output
+    payload = json.loads((tmp_path / "r" / "mix" / "report.json").read_text())
+    flops_seen = {g["target_flops"] for g in payload["train_groups"]}
+    assert flops_seen == {3e14, None}
+
+
+# ---------------------------------------------------------------------------
+# Live training dashboard (bead nyp): the renderer half of nanochat.report.
+# No Live loop in tests - render through a recording console.
+
+
+def test_sparkline_shapes_and_nan_marker():
+    from nanochat.report import sparkline
+
+    assert sparkline([]) == ""
+    assert set(sparkline([1.0, 1.0, 1.0])) == {"▄"}  # constant series, mid block
+    s = sparkline([0.0, float("nan"), 1.0])
+    assert "✕" in s and len(s) == 3
+    assert sparkline(list(range(100)), width=16).startswith("▁") and len(sparkline(list(range(100)), width=16)) == 16
+
+
+def test_drift_flag_trailing_band():
+    from nanochat.report import _drift_flag
+
+    stable = [1.0, 1.001, 0.999, 1.0, 1.0005, 0.9995, 1.0, 1.0002, 1.0001]
+    assert not _drift_flag(stable)
+    excursion = stable[:-1] + [1.5]
+    assert _drift_flag(excursion)
+    assert not _drift_flag([1.0, 2.0])  # too little history
+
+
+def test_training_dashboard_renders_and_exports_html(tmp_path):
+    """End-to-end without Live: synthetic records (core keys + a symplectic
+    diagnostic + a val record) render all panels; close() writes the HTML
+    snapshot with the run header and the auto-adopted invariant."""
+    from rich.console import Console
+
+    from nanochat.report import TrainingDashboard
+
+    html = tmp_path / "dash" / "run-x.html"
+    dash = TrainingDashboard(
+        run_id="run-x", mechanism="reversible", max_steps=10,
+        flags={"attention": "reversible", "mode": "symplectic", "tied": True},
+        html_path=html,
+    )
+    for step in range(10):
+        dash.observe({
+            "type": "step", "step": step, "loss": 4.0 - 0.1 * step, "lr": 1e-3,
+            "grad_norm": 0.5, "tokens_per_s": 1000.0, "tflops": 0.04, "peak_mem_gb": None,
+            "elapsed_s": float(step), "symplectic_shadow_energy_mean": 0.01 * step,
+        })
+    dash.observe({"type": "val", "step": 9, "val_loss": 3.2, "train_loss": 3.1})
+
+    console = Console(record=True, width=120, force_terminal=True)
+    console.print(dash._render())
+    text = console.export_text()
+    for needle in ("run-x", "loss", "val_ce", "grad_norm", "feature flags",
+                   "symplectic_shadow_energy_mean", "invariants"):
+        assert needle in text, f"missing {needle!r} in rendered dashboard"
+    assert "NaN" not in text  # finite run shows the green check, not the NaN flag
+
+    dash.observe({"type": "step", "step": 10, "loss": float("nan"), "lr": 1e-3,
+                  "grad_norm": 0.5, "tokens_per_s": 1000.0, "tflops": 0.04,
+                  "peak_mem_gb": None, "elapsed_s": 10.0})
+    console2 = Console(record=True, width=120, force_terminal=True)
+    console2.print(dash._render())
+    assert "NaN" in console2.export_text()  # the NaN flag latches visibly
+
+    dash.close({"train_ce_final": 3.0, "val_ce_final": 3.2})
+    content = html.read_text()
+    assert "run-x" in content and "symplectic_shadow_energy_mean" in content
