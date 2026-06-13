@@ -384,6 +384,21 @@ the conventions (pre-evidence registration, budget cohorts, probe quarantine,
 power-derived seed counts, refuted→successor rules) and walks one hypothesis
 through the complete cycle with real in-repo artifacts.
 
+Two companion docs are mandatory reading for the work they govern:
+
+- **`docs/campaign_preregistration_template.md`** — fill it into the bead,
+  before evidence, for **every** mechanism-vs-baseline comparison. It forces
+  the rung-finding probe, the sample-efficiency-vs-asymptotic claim split,
+  the power-derived seed count, and a single pre-registered stopping rule.
+  This is the direct fix for the floored-win trap (braid–Dyck was SUPPORTED
+  at a floored rung, REFUTED at the off-floor rung — *a floored win is not a
+  structural win*).
+- **`docs/new_mechanism_checklist.md`** — the merge gate every new attention
+  mechanism (F-series) passes before its numbers are trusted: exact reduction
+  to a known mechanism as a certify check, placebo control, parameterization
+  coordinate-check, validate-before-write, numerics policy, interpretability
+  observable, goldens recapture.
+
 ---
 
 ## Landing the Plane (Session Completion)
