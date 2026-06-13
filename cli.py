@@ -3172,6 +3172,87 @@ def _run_certify_checks(
             detail="max relative grad diff: ReversibleFunction vs naive autograd",
         )
 
+        def _symplectic_block() -> tuple[Any, Any]:
+            from nanochat.gpt import GPTConfig
+
+            torch.manual_seed(seed)
+            base = _certify_tiny_config("reversible")
+            cfg = GPTConfig(**{**vars(base), "reversible_mode": "symplectic"})
+            block = Block(cfg, 0).to(device=device, dtype=torch.float64)
+            block.eval()
+            return block.special_block, cfg
+
+        def rev_symplectic_jacobian_measure() -> float:
+            # u55.5 (bead 7vwo): the SHIPPED kick-kick block is an exact
+            # symplectic map - J^T Omega J = Omega on the (x1, x2) phase
+            # space, fp64, through the real sub-attention energy head.
+            sb, cfg = _symplectic_block()
+            T = 3
+            half = cfg.n_embd // 2
+            cos_sin = _certify_cos_sin(T, 32, device, torch.float64)
+            dim = T * half
+
+            def chunked(z: torch.Tensor) -> torch.Tensor:
+                x1 = z[:dim].reshape(1, T, half)
+                x2 = z[dim:].reshape(1, T, half)
+                y = sb(torch.cat([x1, x2], dim=-1), cos_sin, None)
+                y1, y2 = torch.chunk(y, 2, dim=-1)
+                return torch.cat([y1.reshape(-1), y2.reshape(-1)])
+
+            z0 = torch.randn(2 * dim, device=device, dtype=torch.float64)
+            jac = torch.autograd.functional.jacobian(chunked, z0)
+            omega = torch.zeros(2 * dim, 2 * dim, device=device, dtype=torch.float64)
+            omega[:dim, dim:] = torch.eye(dim, device=device, dtype=torch.float64)
+            omega[dim:, :dim] = -torch.eye(dim, device=device, dtype=torch.float64)
+            return float((jac.T @ omega @ jac - omega).abs().max())
+
+        def rev_energy_drift_separation_measure() -> float:
+            # The load-bearing SIGN: the corrected kick-kick (y2 = x2 - grad)
+            # holds the coercive H = phi_F + phi_G in a band across 64 tied
+            # layers; the ++ form conserves only the non-coercive difference.
+            # Measure = band(corrected) / band(++) - far below 1 when the
+            # shipped sign is right, ~1 (or worse) if it ever regresses.
+            sb, cfg = _symplectic_block()
+            f_kick, g_kick = sb.f_block, sb.g_block
+            T = 3
+            half = cfg.n_embd // 2
+            cos_sin = _certify_cos_sin(T, 32, device, torch.float64)
+
+            def band(sign: float) -> float:
+                torch.manual_seed(seed + 7)
+                x1 = 0.5 * torch.randn(1, T, half, device=device, dtype=torch.float64)
+                x2 = 0.5 * torch.randn(1, T, half, device=device, dtype=torch.float64)
+                energies = []
+                for _ in range(64):
+                    y1 = x1 + f_kick(x2, cos_sin, None)
+                    y2 = x2 + sign * g_kick(y1)
+                    x1, x2 = y1.detach(), y2.detach()
+                    with torch.no_grad():
+                        energies.append(
+                            float(f_kick.energy(x2, cos_sin, None).mean() + g_kick.energy(x1).mean())
+                        )
+                e = torch.tensor(energies)
+                return float(e.max() - e.min())
+
+            return band(-1.0) / max(band(+1.0), 1e-12)
+
+        add_check(
+            "reversible",
+            "symplectic_jacobian",
+            "classical",
+            rev_symplectic_jacobian_measure,
+            tolerance=fp_tol(1e-9),
+            detail="max |J^T Omega J - Omega| of the shipped kick-kick block (fp64)",
+        )
+        add_check(
+            "reversible",
+            "energy_drift_separation",
+            "classical",
+            rev_energy_drift_separation_measure,
+            tolerance=0.2,
+            detail="energy band ratio over 64 tied layers: corrected sign / ++ sign",
+        )
+
     # ----- gauge: rotation orthogonality, inverse consistency, additivity -----
     if "gauge" in mechanisms:
 
@@ -6149,7 +6230,9 @@ _CERTIFY_NAMED_CHECKS: frozenset[str] = frozenset(
         "quaternion.qmul_norm_multiplicative",
         "quaternion.rotor_norm_preservation",
         "reversible.custom_autograd_grad_parity",
+        "reversible.energy_drift_separation",
         "reversible.forward_inverse_roundtrip",
+        "reversible.symplectic_jacobian",
         "simplicial.mass_conservation_two_hop",
         "standard.causal_mask_structure",
         "standard.rmsnorm_unit_rms",
@@ -7577,6 +7660,23 @@ def _adj_observations(art: dict[str, Any], dotted: str) -> list[float] | None:
     return None
 
 
+def _adj_slope_floor_paths(dotted: str) -> tuple[str, str] | None:
+    """For length_slope metric paths, derive the held-out EM and answer-prior
+    paths that decide whether the slopes were fit over floor noise (qtdq):
+    tasks.<t>.length_slope.<...> ->
+      (tasks.<t>.exact_match.greedy.held_out.mean,
+       tasks.<t>.answer_prior.held_out.mean).
+    None for non-slope metrics - they have their own gate (_adj_prior_path)."""
+    segs = dotted.split(".")
+    if "length_slope" not in segs:
+        return None
+    base = segs[: segs.index("length_slope")]
+    return (
+        ".".join(base + ["exact_match", "greedy", "held_out", "mean"]),
+        ".".join(base + ["answer_prior", "held_out", "mean"]),
+    )
+
+
 def _adj_prior_path(dotted: str) -> str | None:
     """Derive the recorded-floor path from an exact-match metric path:
     tasks.<t>.exact_match.<mode>.<region>.mean -> tasks.<t>.answer_prior.<region>.mean
@@ -7924,6 +8024,39 @@ def _adjudicate_hypothesis(hyp: dict[str, Any], artifacts: list[dict[str, Any]])
                 # effect here is evidence of NO POWER, not evidence of absence
                 arm_verdict = "inconclusive"
                 arm["floor_effect"] = True
+                floor_gated = True
+        # ---- slope-path floor gate (qtdq) ----
+        # A length-generalization slope fit while BOTH arms sit at/below the
+        # recorded answer-prior floor is fit over floor noise: a zero slope is
+        # flat-because-dead, a nonzero one is sign noise. Unlike the EM gate
+        # above this fires on supported AND refuted - both directions are
+        # equally vacuous - closing the hole where mechanical verdicts
+        # overrode the registered hand-checks by recency (o85g audit).
+        slope_paths = _adj_slope_floor_paths(dotted) if not single_arm else None
+        if slope_paths is not None and arm_verdict in ("supported", "refuted"):
+            em_path, em_prior_path = slope_paths
+
+            def _arm_mean(arts: list[dict[str, Any]], path: str) -> float | None:
+                vals = [_adj_walk_path(a["data"], path) for a in arts]
+                nums = [float(v) for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+                return (sum(nums) / len(nums)) if nums and len(nums) == len(arts) else None
+
+            cand_em = _arm_mean(cc, em_path)
+            base_em = _arm_mean(bb, em_path)
+            em_floor = _arm_mean(bb, em_prior_path)
+            if (
+                em_floor is not None
+                and cand_em is not None
+                and base_em is not None
+                and cand_em <= em_floor
+                and base_em <= em_floor
+            ):
+                arm_verdict = "inconclusive"
+                arm["floor_effect"] = True
+                arm["floor_source"] = "slope_em_floor"
+                arm["candidate_em_mean"] = cand_em
+                arm["baseline_em_mean"] = base_em
+                arm["em_floor"] = em_floor
                 floor_gated = True
         # ---- ci-v4 statistical integrity: p-value + power per arm ----
         arm["p_value"] = _adj_p_value(
@@ -8542,7 +8675,13 @@ def adjudicate(
                     else ""
                 )
                 + (
-                    f" FLOOR(base {a['baseline_mean']:.4g} <= {a['baseline_floor']:.4g}, no power)"
+                    # the EM gate records baseline_mean/floor in metric units;
+                    # the slope gate (qtdq) records em-vs-prior instead
+                    (
+                        f" FLOOR(em {a['baseline_em_mean']:.4g} <= prior {a['em_floor']:.4g}, slopes vacuous)"
+                        if a.get("floor_source") == "slope_em_floor"
+                        else f" FLOOR(base {a['baseline_mean']:.4g} <= {a['baseline_floor']:.4g}, no power)"
+                    )
                     if a.get("floor_effect")
                     else ""
                 )

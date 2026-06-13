@@ -823,6 +823,62 @@ def test_evaltasks_variant_selector_resolves_via_model_config(tmp_path):
     assert v2["verdict"] == "blocked" and v2["reason_code"] == "no_candidate_artifacts", v2
 
 
+def test_slope_floor_gate_vacuous_in_both_directions(tmp_path):
+    """qtdq (o85g audit): a length_slope verdict computed while BOTH arms sit
+    at/below the recorded answer prior is fit over floor noise - the gate
+    downgrades supported AND refuted to floor_effect inconclusive (the EM
+    gate only protects refutations). Off-floor arms pass through untouched,
+    and artifacts with no recorded EM/prior leave the gate conservative."""
+
+    def slope_eval(root, name, *, mechanism, slope, em, prior):
+        path = _evaltasks_artifact(root, name, mechanism=mechanism, per_seed=[em] * 3)
+        data = json.loads(path.read_text())
+        data["tasks"]["group"] = {
+            "exact_match": {"greedy": {"held_out": {"mean": em, "per_seed": [em] * 3},
+                                        "in_range": {"mean": em, "per_seed": [em] * 3}}},
+            "answer_prior": {"held_out": {"mean": prior}, "in_range": {"mean": prior}},
+            "length_slope": {"held_out": {"slope": slope, "ci95": [slope - 0.001, slope + 0.001],
+                                            "intercept": 1.0, "n_docs": 50, "basis": "test"},
+                              "by_category": {"s5": {"slope": slope,
+                                                       "ci95": [slope - 0.001, slope + 0.001],
+                                                       "intercept": 1.0, "n_docs": 20, "basis": "test"}}},
+        }
+        path.write_text(json.dumps(data))
+
+    # floored regime: the o85g shape - candidate slopes exactly 0, baseline
+    # slopes tiny-negative, every EM far below the 0.097 prior
+    for i in range(3):
+        slope_eval(tmp_path, f"cand{i}", mechanism="braid", slope=0.0, em=0.01, prior=0.097)
+        slope_eval(tmp_path, f"base{i}", mechanism="standard", slope=-0.002, em=0.008, prior=0.097)
+
+    spec = {"metric_path": "evaltasks:tasks.group.length_slope.by_category.s5.slope",
+            "comparator": "<=", "threshold_kind": "ratio", "threshold": 0.5}
+    v = cli._adjudicate_hypothesis(_hyp(spec, mechanisms=["braid"]), _index(tmp_path))
+    arm = v["arms"]["braid"]
+    assert v["verdict"] == "inconclusive", v
+    assert arm["floor_effect"] is True and arm["floor_source"] == "slope_em_floor"
+    assert abs(arm["em_floor"] - 0.097) < 1e-12 and arm["baseline_em_mean"] < 0.097
+
+    # the refuted direction is equally vacuous and equally gated
+    spec_rev = {**spec, "comparator": ">="}
+    hyp_rev = _hyp(spec_rev, mechanisms=["braid"])
+    hyp_rev["id"] = "hyp-rev"
+    v_rev = cli._adjudicate_hypothesis(hyp_rev, _index(tmp_path))
+    assert v_rev["verdict"] == "inconclusive", v_rev
+    assert v_rev["arms"]["braid"]["floor_source"] == "slope_em_floor"
+
+    # off-floor control: same slopes with both arms ABOVE the prior - the
+    # mechanical verdict stands (zero candidate slope vs negative baseline
+    # gives ratio -0 <= 0.5 -> supported, per the registered sign caveat)
+    off = tmp_path / "off"
+    for i in range(3):
+        slope_eval(off, f"cand{i}", mechanism="braid", slope=0.0, em=0.5, prior=0.097)
+        slope_eval(off, f"base{i}", mechanism="standard", slope=-0.002, em=0.4, prior=0.097)
+    v_off = cli._adjudicate_hypothesis(_hyp(spec, mechanisms=["braid"]), _index(off))
+    assert v_off["verdict"] == "supported", v_off
+    assert not v_off["arms"]["braid"].get("floor_effect")
+
+
 def test_training_taint_propagates_through_eval_artifacts(tmp_path):
     """dz9i (hqwi audit finding): a clean-time eval of a TAINTED-TRAINING
     checkpoint must be refused - the engine taints an evaltasks artifact when
