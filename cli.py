@@ -1141,6 +1141,54 @@ See `summary.json` for full details.
         console.print(f"[dim]Wrote artifacts → {run_dir}[/dim]")
 
 
+def _bench_welch_delta(cand: list[float], base: list[float]) -> dict[str, Any] | None:
+    """Two-sample Welch t-test of cand vs base (unequal variances) — the
+    standard A/B significance test for the feature-ablation suite (bead z7r).
+
+    Returns the mean difference cand-base, its 95% CI (Welch t interval with
+    Satterthwaite df), the t statistic, the two-sided p-value, and df. None
+    if either arm has < 2 observations (variance undefined at n=1).
+
+    This is a DESCRIPTIVE benchmark comparison, deliberately separate from the
+    preregistered mgr adjudicate engine (which tests a registered threshold
+    with floor/power gates): here H0 is simply 'equal means', the textbook
+    feature-vs-vanilla question. Zero-variance arms are handled explicitly
+    rather than trusting scipy's nan."""
+    import statistics as st
+
+    if len(cand) < 2 or len(base) < 2:
+        return None
+    mc, mb = st.mean(cand), st.mean(base)
+    vc, vb = st.variance(cand), st.variance(base)
+    nc, nb = len(cand), len(base)
+    delta = mc - mb
+    se = (vc / nc + vb / nb) ** 0.5
+    common = {"n_cand": nc, "n_base": nb, "mean_cand": mc, "mean_base": mb, "delta": delta}
+    if se <= 0.0:
+        # both arms have zero spread: a point comparison, no t distribution
+        if delta == 0.0:
+            return {**common, "ci95": [0.0, 0.0], "t_stat": 0.0, "p_value": 1.0, "df": float(nc + nb - 2)}
+        return {
+            **common,
+            "ci95": [delta, delta],
+            "t_stat": float("inf") if delta > 0 else float("-inf"),
+            "p_value": 0.0,
+            "df": float(nc + nb - 2),
+        }
+    from scipy import stats as sps
+
+    df = (vc / nc + vb / nb) ** 2 / ((vc / nc) ** 2 / (nc - 1) + (vb / nb) ** 2 / (nb - 1))
+    crit = float(sps.t.ppf(0.975, df))
+    res = sps.ttest_ind(cand, base, equal_var=False)
+    return {
+        **common,
+        "ci95": [delta - crit * se, delta + crit * se],
+        "t_stat": float(res.statistic),
+        "p_value": float(res.pvalue),
+        "df": float(df),
+    }
+
+
 @app.command("bench-fixed-flops")
 def bench_fixed_flops(
     attention_types: Annotated[
@@ -1170,9 +1218,35 @@ def bench_fixed_flops(
         int,
         typer.Option(
             "--seed",
-            help="Training seed (same seed used for each attention type).",
+            help="Training seed (single-seed mode; ignored when --seeds is given).",
         ),
     ] = 0,
+    seeds: Annotated[
+        str,
+        typer.Option(
+            "--seeds",
+            help=(
+                "Comma-separated seeds for multi-seed A/B with mean±std, 95% CI, and a Welch "
+                "t-test delta vs the baseline arm (bead z7r). Empty = single-seed via --seed."
+            ),
+        ),
+    ] = "",
+    val_interval: Annotated[
+        int,
+        typer.Option(
+            "--val-interval",
+            help="Validation cadence in steps (0 = off; >0 records results.val_ce_final, the A/B score metric).",
+            min=0,
+        ),
+    ] = 50,
+    val_batches: Annotated[
+        int,
+        typer.Option(
+            "--val-batches",
+            help="Batches per validation evaluation.",
+            min=1,
+        ),
+    ] = 10,
     score_tail: Annotated[
         int,
         typer.Option(
@@ -1331,6 +1405,7 @@ def bench_fixed_flops(
     """
     if not attention_types:
         raise typer.BadParameter("--attention-type must be provided at least once")
+    seed_list = [int(s) for s in seeds.split(",") if s.strip()] or [int(seed)]
 
     suite_run_id = run_id or _default_run_id()
     suite_dir = artifacts_dir / "bench" / "fixed_flops" / "nanochat" / suite_run_id
@@ -1351,6 +1426,9 @@ def bench_fixed_flops(
         "device": device,
         "target_flops": float(target_flops),
         "seed": int(seed),
+        "seeds": seed_list,
+        "val_interval": int(val_interval),
+        "val_batches": int(val_batches),
         "score_tail": int(score_tail),
         "train_config": {
             "batch_size": int(batch_size),
@@ -1369,9 +1447,9 @@ def bench_fixed_flops(
         "attention_types": list(attention_types),
     }
 
-    def _run_train(attn: str) -> dict[str, Any]:
+    def _run_train(attn: str, run_seed: int) -> dict[str, Any]:
         run_topic = f"fixed_flops/nanochat/{suite_run_id}/{attn}"
-        run_id_local = f"seed_{seed}"
+        run_id_local = f"seed_{run_seed}"
         train_cmd = [
             sys.executable,
             "-m",
@@ -1379,7 +1457,7 @@ def bench_fixed_flops(
             "--device",
             device,
             "--seed",
-            str(seed),
+            str(run_seed),
             "--batch-size",
             str(batch_size),
             "--sequence-len",
@@ -1413,6 +1491,9 @@ def bench_fixed_flops(
             "--run-id",
             run_id_local,
         ]
+        if val_interval > 0:
+            # val CE is the A/B score metric (bead z7r); train defaults val off
+            train_cmd += ["--val-interval", str(int(val_interval)), "--val-batches", str(int(val_batches))]
         if compile:
             train_cmd.append("--compile")
         if check_numerics:
@@ -1438,8 +1519,8 @@ def bench_fixed_flops(
             returncode = 124
         t1 = time.perf_counter()
 
-        stdout_path = logs_dir / f"nanochat_{attn}.stdout.txt"
-        stderr_path = logs_dir / f"nanochat_{attn}.stderr.txt"
+        stdout_path = logs_dir / f"nanochat_{attn}_seed{run_seed}.stdout.txt"
+        stderr_path = logs_dir / f"nanochat_{attn}_seed{run_seed}.stderr.txt"
         stdout_path.write_text(stdout, encoding="utf-8")
         stderr_path.write_text(stderr, encoding="utf-8")
 
@@ -1450,9 +1531,11 @@ def bench_fixed_flops(
         final_loss: float | None = None
         score: float | None = None
         ppl: float | None = None
+        val_ce_final: float | None = None
         tokens_s: float | None = None
         tflops_s: float | None = None
         peak_mem_gb: float | None = None
+        nan_inf_count: int | None = None
         if status == "ok":
             payload = json.loads(summary_path.read_text(encoding="utf-8"))
             res = payload.get("results", {})
@@ -1462,6 +1545,10 @@ def bench_fixed_flops(
                 tail = losses[-min(len(losses), int(score_tail)) :]
                 score = float(sum(tail) / len(tail))
                 ppl = float(math.exp(score))
+                # instability flag: NaN/Inf in the recorded train-loss stream
+                nan_inf_count = sum(1 for x in losses if not math.isfinite(x))
+            if isinstance(res.get("val_ce_final"), int | float) and math.isfinite(float(res["val_ce_final"])):
+                val_ce_final = float(res["val_ce_final"])
             if isinstance(res.get("tokens_per_second"), int | float):
                 tokens_s = float(res["tokens_per_second"])
             if isinstance(res.get("tflops_per_second_est"), int | float):
@@ -1471,6 +1558,7 @@ def bench_fixed_flops(
 
         return {
             "attention_type": attn,
+            "seed": int(run_seed),
             "status": status,
             "returncode": int(returncode),
             "duration_s": float(t1 - t0),
@@ -1481,13 +1569,15 @@ def bench_fixed_flops(
             "score": score,
             "final_loss": final_loss,
             "perplexity_est": ppl,
+            "val_ce_final": val_ce_final,
             "tokens_per_second": tokens_s,
             "tflops_per_second_est": tflops_s,
             "peak_memory_allocated_gb": peak_mem_gb,
+            "nan_inf_count": nan_inf_count,
         }
 
     results: list[dict[str, Any]] = []
-    total = len(attention_types)
+    total = len(attention_types) * len(seed_list)
     with Progress(
         TextColumn("[bold cyan]fixed-FLOPs bench[/bold cyan]"),
         BarColumn(),
@@ -1498,9 +1588,12 @@ def bench_fixed_flops(
     ) as prog:
         task = prog.add_task("runs", total=total)
         for attn in attention_types:
-            console.print(Panel(f"[bold]nanochat[/bold] attention_type={attn!r}", box=box.ROUNDED))
-            results.append(_run_train(attn))
-            prog.advance(task)
+            for run_seed in seed_list:
+                console.print(
+                    Panel(f"[bold]nanochat[/bold] attention_type={attn!r} seed={run_seed}", box=box.ROUNDED)
+                )
+                results.append(_run_train(attn, run_seed))
+                prog.advance(task)
 
     demo_certs: list[dict[str, Any]] = []
     if include_demo_certs:
@@ -1564,51 +1657,156 @@ def bench_fixed_flops(
             )
 
     baseline_attn = "standard" if "standard" in attention_types else attention_types[0]
-    baseline = next((r for r in results if r["attention_type"] == baseline_attn), None)
 
-    table = Table(title="Fixed-FLOPs nanochat benchmark (train loss)", box=box.ROUNDED)
+    # ---- per-attention aggregation across seeds (bead z7r) ----
+    import statistics as _st
+
+    def _finite(attn: str, field: str) -> list[float]:
+        return [
+            float(r[field])
+            for r in results
+            if r["attention_type"] == attn
+            and r.get("status") == "ok"
+            and isinstance(r.get(field), (int, float))
+            and math.isfinite(float(r[field]))
+        ]
+
+    # the A/B score metric: val CE when every arm recorded it, else train-tail
+    arms_ok = [a for a in attention_types if _finite(a, "score")]
+    metric_key = (
+        "val_ce_final" if arms_ok and all(_finite(a, "val_ce_final") for a in arms_ok) else "score"
+    )
+    metric_label = "val CE" if metric_key == "val_ce_final" else "train-loss tail"
+
+    def _mean_std(vals: list[float]) -> tuple[float | None, float | None]:
+        if not vals:
+            return None, None
+        return _st.mean(vals), (_st.stdev(vals) if len(vals) > 1 else 0.0)
+
+    aggregates: dict[str, dict[str, Any]] = {}
+    for attn in attention_types:
+        metric_vals = _finite(attn, metric_key)
+        m_mean, m_std = _mean_std(metric_vals)
+        tok_mean, _ = _mean_std(_finite(attn, "tokens_per_second"))
+        mem_mean, _ = _mean_std(_finite(attn, "peak_memory_allocated_gb"))
+        attn_runs = [r for r in results if r["attention_type"] == attn]
+        nan_total = sum(int(r["nan_inf_count"]) for r in attn_runs if isinstance(r.get("nan_inf_count"), int))
+        aggregates[attn] = {
+            "n_ok": len(metric_vals),
+            "n_total": len(attn_runs),
+            "metric_key": metric_key,
+            "metric_mean": m_mean,
+            "metric_std": m_std,
+            "metric_values": metric_vals,
+            "tokens_per_second_mean": tok_mean,
+            "peak_memory_allocated_gb_mean": mem_mean,
+            "nan_inf_total": nan_total,
+            "any_failed": any(r.get("status") != "ok" for r in attn_runs),
+        }
+
+    base_vals = aggregates.get(baseline_attn, {}).get("metric_values", [])
+    comparisons: dict[str, dict[str, Any]] = {}
+    for attn in attention_types:
+        if attn == baseline_attn:
+            continue
+        comparisons[attn] = _bench_welch_delta(aggregates[attn]["metric_values"], base_vals) or {
+            "delta": None,
+            "reason": "insufficient_seeds_for_welch (need >=2 per arm)",
+        }
+
+    table = Table(
+        title=f"Fixed-FLOPs A/B vs {baseline_attn!r} ({metric_label}, n={len(seed_list)} seed(s))", box=box.ROUNDED
+    )
     table.add_column("attention_type", style="bold")
-    table.add_column("status")
-    table.add_column("score", justify="right")
-    table.add_column("Δ vs baseline", justify="right")
+    table.add_column(f"{metric_label} (mean±std)", justify="right")
+    table.add_column("Δ vs base", justify="right")
+    table.add_column("95% CI", justify="right")
+    table.add_column("p (Welch)", justify="right")
     table.add_column("tokens/s", justify="right")
-    table.add_column("TFLOP/s(est)", justify="right")
-    table.add_column("peak_mem_gb", justify="right")
+    table.add_column("mem GB", justify="right")
+    table.add_column("NaN", justify="right")
 
-    for r in results:
-        score = r.get("score")
-        delta = None
-        if baseline and baseline.get("score") is not None and score is not None:
-            base = float(baseline["score"])
-            delta = (float(score) - base) / base if base != 0 else None
-
+    for attn in attention_types:
+        agg = aggregates[attn]
+        cmp = comparisons.get(attn)
+        mm, ms = agg["metric_mean"], agg["metric_std"]
+        if attn == baseline_attn:
+            delta_s = ci_s = p_s = "[dim]—[/dim]"
+        elif cmp and cmp.get("delta") is not None:
+            delta_s = f"{cmp['delta']:+.4f}"
+            ci_s = f"[{cmp['ci95'][0]:+.3f},{cmp['ci95'][1]:+.3f}]"
+            p = cmp["p_value"]
+            star = " *" if p < 0.05 else ""
+            p_s = f"{p:.3f}{star}"
+        else:
+            delta_s = ci_s = p_s = "n/a"
         table.add_row(
-            str(r["attention_type"]),
-            str(r["status"]),
-            f"{float(score):.6f}" if isinstance(score, int | float) else "n/a",
-            f"{float(delta):+.2%}" if isinstance(delta, int | float) else "n/a",
-            f"{float(r['tokens_per_second']):,.0f}" if isinstance(r.get("tokens_per_second"), int | float) else "n/a",
-            f"{float(r['tflops_per_second_est']):.2f}"
-            if isinstance(r.get("tflops_per_second_est"), int | float)
+            str(attn),
+            f"{mm:.4f}±{ms:.4f}" if isinstance(mm, float) else "n/a",
+            delta_s,
+            ci_s,
+            p_s,
+            f"{agg['tokens_per_second_mean']:,.0f}" if isinstance(agg["tokens_per_second_mean"], float) else "n/a",
+            f"{agg['peak_memory_allocated_gb_mean']:.2f}"
+            if isinstance(agg["peak_memory_allocated_gb_mean"], float)
             else "n/a",
-            f"{float(r['peak_memory_allocated_gb']):.2f}"
-            if isinstance(r.get("peak_memory_allocated_gb"), int | float)
-            else "n/a",
+            f"[red]{agg['nan_inf_total']}[/red]" if agg["nan_inf_total"] else "0",
         )
 
     console.print(table)
+    console.print(
+        f"[dim]score metric: {metric_label}"
+        f"{' (lower is better)' if True else ''} · * = Welch p<0.05 vs baseline · "
+        "descriptive A/B, distinct from mgr adjudicate's preregistered engine[/dim]"
+    )
 
     summary = {
-        "schema_version": "mgr.bench.fixed_flops.v1",
+        "schema_version": "mgr.bench.fixed_flops.v2",
         "meta": bench_meta,
         "baseline_attention_type": baseline_attn,
+        "score_metric": metric_key,
         "runs": results,
+        "aggregates": aggregates,
+        "comparisons": comparisons,
         "demo_certs": demo_certs,
     }
 
-    ok_runs = [r for r in results if r.get("status") == "ok" and isinstance(r.get("score"), (int, float))]
-    ok_runs_sorted = sorted(ok_runs, key=lambda r: float(r["score"]))
-    best = ok_runs_sorted[0] if ok_runs_sorted else None
+    # per-feature CSV (bead z7r): one row per non-baseline arm's delta vs base
+    csv_lines = ["attention_type,n_ok,metric,mean,std,delta_vs_base,ci95_lo,ci95_hi,welch_p,nan_inf,tokens_s_mean"]
+    for attn in attention_types:
+        agg = aggregates[attn]
+        cmp = comparisons.get(attn) if attn != baseline_attn else None
+        d = cmp.get("delta") if cmp else None
+        ci = cmp.get("ci95") if cmp and cmp.get("delta") is not None else None
+        p = cmp.get("p_value") if cmp and cmp.get("delta") is not None else None
+        csv_lines.append(
+            ",".join(
+                str(x)
+                for x in [
+                    attn,
+                    agg["n_ok"],
+                    metric_key,
+                    f"{agg['metric_mean']:.6f}" if isinstance(agg["metric_mean"], float) else "",
+                    f"{agg['metric_std']:.6f}" if isinstance(agg["metric_std"], float) else "",
+                    f"{d:.6f}" if isinstance(d, float) else "",
+                    f"{ci[0]:.6f}" if ci else "",
+                    f"{ci[1]:.6f}" if ci else "",
+                    f"{p:.6f}" if isinstance(p, float) else "",
+                    agg["nan_inf_total"],
+                    f"{agg['tokens_per_second_mean']:.3f}"
+                    if isinstance(agg["tokens_per_second_mean"], float)
+                    else "",
+                ]
+            )
+        )
+    (suite_dir / "feature_ablate.csv").write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
+
+    # rank arms by aggregate metric mean (lower CE is better)
+    ranked = sorted(
+        (a for a in attention_types if isinstance(aggregates[a]["metric_mean"], float)),
+        key=lambda a: aggregates[a]["metric_mean"],
+    )
+    best = {"attention_type": ranked[0], "metric_mean": aggregates[ranked[0]]["metric_mean"]} if ranked else None
 
     def _md_row(values: list[str]) -> str:
         return "| " + " | ".join(values) + " |"
@@ -1620,69 +1818,84 @@ def bench_fixed_flops(
     md_lines.append(f"- Baseline: `{baseline_attn}`")
     md_lines.append(f"- Device: `{device}`")
     md_lines.append(f"- Target FLOPs/run (est): `{float(target_flops):.3e}`")
-    md_lines.append(f"- Seed: `{seed}`")
+    md_lines.append(f"- Seeds: `{seed_list}`")
+    md_lines.append(f"- Score metric: `{metric_label}` (lower is better)")
     md_lines.append("")
-    md_lines.append("## Results")
+    md_lines.append("## A/B vs baseline (mean ± std over seeds, Welch t-test)")
     md_lines.append("")
     md_lines.append(
-        _md_row(["attention_type", "status", "score", "Δ vs baseline", "tokens/s", "TFLOP/s(est)", "peak_mem_gb"])
+        _md_row([f"attention_type ({metric_label})", "n_ok", "mean±std", "Δ vs base", "95% CI", "Welch p",
+                 "tokens/s", "mem GB", "NaN/Inf"])
     )
-    md_lines.append(_md_row(["---"] * 7))
+    md_lines.append(_md_row(["---"] * 9))
 
-    for r in results:
-        score = r.get("score")
-        delta = None
-        if baseline and baseline.get("score") is not None and score is not None:
-            base = float(baseline["score"])
-            delta = (float(score) - base) / base if base != 0 else None
+    for attn in attention_types:
+        agg = aggregates[attn]
+        cmp = comparisons.get(attn) if attn != baseline_attn else None
+        mm, ms = agg["metric_mean"], agg["metric_std"]
+        if attn == baseline_attn:
+            delta_s = ci_s = p_s = "—"
+        elif cmp and cmp.get("delta") is not None:
+            delta_s = f"{cmp['delta']:+.4f}"
+            ci_s = f"[{cmp['ci95'][0]:+.3f}, {cmp['ci95'][1]:+.3f}]"
+            p_s = f"{cmp['p_value']:.3f}" + (" \\*" if cmp["p_value"] < 0.05 else "")
+        else:
+            delta_s = ci_s = p_s = "n/a"
         md_lines.append(
             _md_row(
                 [
-                    str(r["attention_type"]),
-                    str(r["status"]),
-                    f"{float(score):.6f}" if isinstance(score, (int, float)) else "n/a",
-                    f"{float(delta):+.2%}" if isinstance(delta, (int, float)) else "n/a",
-                    f"{float(r['tokens_per_second']):,.0f}"
-                    if isinstance(r.get("tokens_per_second"), (int, float))
+                    str(attn),
+                    str(agg["n_ok"]),
+                    f"{mm:.4f}±{ms:.4f}" if isinstance(mm, float) else "n/a",
+                    delta_s,
+                    ci_s,
+                    p_s,
+                    f"{agg['tokens_per_second_mean']:,.0f}"
+                    if isinstance(agg["tokens_per_second_mean"], float)
                     else "n/a",
-                    f"{float(r['tflops_per_second_est']):.2f}"
-                    if isinstance(r.get("tflops_per_second_est"), (int, float))
+                    f"{agg['peak_memory_allocated_gb_mean']:.2f}"
+                    if isinstance(agg["peak_memory_allocated_gb_mean"], float)
                     else "n/a",
-                    f"{float(r['peak_memory_allocated_gb']):.2f}"
-                    if isinstance(r.get("peak_memory_allocated_gb"), (int, float))
-                    else "n/a",
+                    str(agg["nan_inf_total"]),
                 ]
             )
         )
 
+    md_lines.append("")
+    md_lines.append("`\\*` = Welch two-sample p < 0.05 vs baseline. This is a descriptive A/B benchmark, "
+                    "deliberately distinct from the preregistered `mgr adjudicate` engine (which tests a "
+                    "registered threshold with floor/power gates). Per-feature deltas in `feature_ablate.csv`.")
     md_lines.append("")
     md_lines.append("## Conclusions")
     md_lines.append("")
     if best is None:
         md_lines.append("- No successful runs; see `logs/` for stdout/stderr.")
     else:
-        md_lines.append(f"- Best (lowest score): `{best['attention_type']}` score=`{float(best['score']):.6f}`")
-        if baseline and baseline.get("score") is not None:
-            base = float(baseline["score"])
-            md_lines.append(
-                f"- Baseline `{baseline_attn}` score=`{base:.6f}`; best Δ=`{(float(best['score']) - base) / base:+.2%}`"
-            )
-        better = []
-        worse = []
-        if baseline and baseline.get("score") is not None:
-            base = float(baseline["score"])
-            for r in ok_runs_sorted:
-                if r["attention_type"] == baseline_attn:
-                    continue
-                d = (float(r["score"]) - base) / base if base != 0 else 0.0
-                (better if d < 0 else worse).append((r["attention_type"], d))
-        if better:
-            md_lines.append("- Better than baseline: " + ", ".join(f"`{a}` ({d:+.2%})" for a, d in better))
-        if worse:
-            md_lines.append("- Worse than baseline: " + ", ".join(f"`{a}` ({d:+.2%})" for a, d in worse))
-        failed = [r for r in results if r.get("status") != "ok"]
+        md_lines.append(
+            f"- Best (lowest {metric_label}): `{best['attention_type']}` mean=`{best['metric_mean']:.6f}`"
+        )
+        sig_better, sig_worse = [], []
+        for attn in attention_types:
+            cmp = comparisons.get(attn)
+            if attn == baseline_attn or not cmp or cmp.get("delta") is None:
+                continue
+            if cmp["p_value"] < 0.05:
+                (sig_better if cmp["delta"] < 0 else sig_worse).append((attn, cmp["delta"], cmp["p_value"]))
+        if sig_better:
+            md_lines.append("- Significantly BETTER than baseline (p<0.05): "
+                            + ", ".join(f"`{a}` (Δ{d:+.4f}, p={p:.3f})" for a, d, p in sig_better))
+        if sig_worse:
+            md_lines.append("- Significantly WORSE than baseline (p<0.05): "
+                            + ", ".join(f"`{a}` (Δ{d:+.4f}, p={p:.3f})" for a, d, p in sig_worse))
+        if not sig_better and not sig_worse:
+            md_lines.append("- No arm differs significantly from baseline at p<0.05 "
+                            f"(n={len(seed_list)} seed(s); widen seeds to gain power).")
+        unstable = [a for a in attention_types if aggregates[a]["nan_inf_total"] > 0]
+        if unstable:
+            md_lines.append("- Instability (NaN/Inf in train stream): " + ", ".join(f"`{a}`" for a in unstable))
+        failed = sorted({r["attention_type"] for r in results if r.get("status") != "ok"})
         if failed:
-            md_lines.append("- Failures: " + ", ".join(f"`{f['attention_type']}`" for f in failed))
+            md_lines.append("- Run failures: " + ", ".join(f"`{a}`" for a in failed))
 
     if demo_certs:
         md_lines.append("")
