@@ -38,16 +38,28 @@ question.**
 A comparison is only meaningful once you know where the baseline clears the
 floor. Run a **sizing probe**: a small budget ladder on the *standard*
 baseline for the target task, reporting the budget at which its held-out
-exact-match reliably exceeds the task's answer prior (floors: hier 0.014,
-arith 0.521, dyck 0.512, rel 0.059, rot 0.049, bag 0.336, needle 0.014,
-copyops 0.001 — and the engine prefers the artifact-recorded `answer_prior`
-over these registered fallbacks).
+exact-match reliably exceeds the answer prior.
+
+**Clear the *recorded* `answer_prior`, not the registered fallback — they
+differ, and the recorded one is usually higher (stricter).** The engine prefers
+the per-eval `answer_prior` an artifact records (the best constant-answer score
+on the exact docs scored) over the registered `validity.baseline_floor`
+fallback. For Dyck the gap is the whole lesson: registered fallback **0.512**
+vs recorded **0.625**, and standard's best E1 seed was **0.604** — *above* the
+fallback, *below* the recorded prior, i.e. **still floored** even though the
+registered number says otherwise. Read the recorded `answer_prior` straight
+from the probe's `summary.json` and clear *that*. (Registered fallbacks, for
+orientation only: hier 0.014, arith 0.521, dyck 0.512, rel 0.059, rot 0.049,
+bag 0.336, needle 0.014, copyops 0.001.)
 
 - Route probe runs to **`artifacts/probes/sizing/`** — the verdict engine
   refuses that path by construction (bead dzor), because a run that *selects*
-  a rung must never *adjudicate* it (selection bias). `scripts/run_campaign.py
-  --topic` then `git mv` into `probes/sizing/`, or point `--artifacts-dir`
-  there directly.
+  a rung must never *adjudicate* it (selection bias). `scripts/run_campaign.py`
+  always writes to `artifacts/campaigns/<topic>/` (it does not expose an
+  artifacts-dir flag), so either `git mv` the probe output into
+  `artifacts/probes/sizing/` afterward (what dzor did), or run the probe with
+  `python -m nanochat.train … --artifacts-dir artifacts/probes/sizing` (and
+  `mgr eval-tasks … --artifacts-dir artifacts/probes/sizing`) directly.
 - Read the per-seed EM **distribution shape**, not just the mean:
   - *unimodal, tight, above the prior* → off-floor rung found; good for the
     asymptotic claim.
