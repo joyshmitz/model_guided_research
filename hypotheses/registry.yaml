@@ -1343,7 +1343,7 @@ hypotheses:
       log-log slope is flat (|slope| <= 0.05) over the width ladder, so a
       width-varying A/B between two CLT-class arms at matched parameterization
       is NOT confounded by scaling.
-    mechanisms: [reversible]
+    mechanisms: [standard, reversible]
     source:
       kind: model
       provenance: "EPIC THEORY-III lab.1; theory note nonstandard_analysis_width_scaling.md section 4"

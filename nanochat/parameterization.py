@@ -12,8 +12,10 @@ correctly parameterized.
 This module is the canonical home for:
   * the extreme-value (Gumbel) primitives the max-plus class needs,
   * the per-mechanism width-scaling table (concentration class + exponents),
-  * a coordinate-check harness that measures activation/update scale vs width
-    and fits the log-log slope (the muP acceptance test).
+  * a coordinate-check harness that measures init-time activation scale vs
+    width and fits the log-log slope (the forward half of the muP acceptance
+    test; the multi-step update-scale check and the LR-transfer test are the
+    box-gated follow-on bp08).
 
 Theory note: markdown_documentation/nonstandard_analysis_width_scaling.md.
 All numerical claims here are validated in tests/test_parameterization.py.

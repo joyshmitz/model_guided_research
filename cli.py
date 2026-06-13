@@ -1235,10 +1235,14 @@ def bench_fixed_flops(
         int,
         typer.Option(
             "--val-interval",
-            help="Validation cadence in steps (0 = off; >0 records results.val_ce_final, the A/B score metric).",
+            help=(
+                "Validation cadence in steps. Default 0 = OFF (preserves the throughput-benchmark "
+                "behavior); pass >0 for the A/B quality use so runs record results.val_ce_final and "
+                "the suite scores on val CE instead of the train-loss tail (bead z7r)."
+            ),
             min=0,
         ),
-    ] = 50,
+    ] = 0,
     val_batches: Annotated[
         int,
         typer.Option(
@@ -1755,8 +1759,7 @@ def bench_fixed_flops(
 
     console.print(table)
     console.print(
-        f"[dim]score metric: {metric_label}"
-        f"{' (lower is better)' if True else ''} · * = Welch p<0.05 vs baseline · "
+        f"[dim]score metric: {metric_label} (lower is better) · * = Welch p<0.05 vs baseline · "
         "descriptive A/B, distinct from mgr adjudicate's preregistered engine[/dim]"
     )
 
