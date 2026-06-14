@@ -7574,9 +7574,12 @@ def hypotheses_power(
     count, and the per-arm seed count needed for 80%. Read-only: runs the
     verdict engine's evidence pipeline without touching the registry.
 
-    "3 seeds, 34% power - needs 8" is the actionable output: a SUPPORTED or
-    REFUTED verdict below the 50% power floor carries the UNDERPOWERED
-    qualifier in adjudication; this command tells you how many seeds fix it.
+    "3 seeds, 34% power - needs 8" is the actionable output for a SUPPORTED
+    verdict: a SUPPORTED arm below the 50% power-to-confirm floor carries the
+    UNDERPOWERED qualifier in adjudication (ci-v6), and this command tells you
+    how many seeds fix it. A REFUTED arm is adequate by its CI excluding the
+    threshold (refutation_margin), so low power-to-confirm is not a weakness
+    there.
     """
     data = _hypotheses_load_or_exit()
     entries = [h for h in data.get("hypotheses", []) if isinstance(h, dict)]
@@ -7612,9 +7615,21 @@ def hypotheses_power(
                 note = "power undefined: threshold is the no-effect point"
                 table.add_row(hid, mech, f"{a['n_candidate']}/{a['n_baseline']}", "-", "-", note)
                 continue
-            under = power < _ADJ_POWER_FLOOR
-            style_p = "red" if under else ("yellow" if power < _ADJ_POWER_TARGET else "green")
-            note = "UNDERPOWERED below verdict floor" if under else ""
+            # ci-v6: UNDERPOWERED is a SUPPORTED-side concern, so mirror exactly
+            # what adjudication stamped (arm["underpowered"]) rather than
+            # re-deriving power<floor - a REFUTED arm with low power-to-confirm
+            # is decisive (refutation_margin), not weak.
+            under = bool(a.get("underpowered"))
+            margin = a.get("refutation_margin")
+            if under:
+                note = "UNDERPOWERED: low power to confirm the registered effect"
+                style_p = "red"
+            elif margin is not None:
+                note = f"refuted decisively (margin {margin:.1f}×)"
+                style_p = "green" if power >= _ADJ_POWER_TARGET else "yellow"
+            else:
+                note = ""
+                style_p = "green" if power >= _ADJ_POWER_TARGET else "yellow"
             table.add_row(
                 hid,
                 mech,
@@ -7674,8 +7689,9 @@ _ADJ_POLICY_VERSION = "ci-v6"
 #     n_for_80pct: the per-arm seed count solving for 80% power under
 #     balanced-arm growth (ratio arms: 1/sqrt(n) scaling of the bootstrap
 #     SE by the smaller arm).
-#   - UNDERPOWERED qualifier: a SUPPORTED or REFUTED arm whose achieved
-#     power is below 0.5 carries underpowered: true - a visible asterisk,
+#   - UNDERPOWERED qualifier: a SUPPORTED or REFUTED arm (ci-v6 narrows this
+#     to SUPPORTED only - see the ci-v6 block above) whose achieved power is
+#     below 0.5 carries underpowered: true - a visible asterisk,
 #     never a clean verdict (a test that could not have detected the
 #     registered effect is noise laundered as evidence). The verdict STATUS
 #     is unchanged (the registry vocabulary stays supported/refuted/
@@ -7759,7 +7775,7 @@ _ADJ_POLICY_VERSION = "ci-v6"
 _ADJ_BUDGET_RTOL = 0.05
 _ADJ_BOOTSTRAP_SEED = 1234
 _ADJ_BOOTSTRAP_N = 10_000
-_ADJ_POWER_FLOOR = 0.5  # below this, supported/refuted arms carry the UNDERPOWERED qualifier (ci-v4)
+_ADJ_POWER_FLOOR = 0.5  # below this, SUPPORTED arms carry the UNDERPOWERED qualifier (ci-v6; supported/refuted in ci-v4)
 _ADJ_POWER_TARGET = 0.8  # the n_for_80pct column solves for this
 _ADJ_FDR_Q = 0.10  # Benjamini-Hochberg level for the ledger-family headline (ci-v4)
 _ADJ_ATTENTION_MECHS = frozenset(
