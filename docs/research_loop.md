@@ -9,7 +9,7 @@ registry grows instead of the README accreting untracked claims.
 
 Everything below is enforced by tooling that exists today: the hypothesis
 registry (`hypotheses/registry.yaml`, append-only, validated against git
-HEAD), the verdict engine (`mgr adjudicate`, policy `ci-v5`), the campaign
+HEAD), the verdict engine (`mgr adjudicate`, policy `ci-v6`), the campaign
 launcher (`scripts/run_campaign.py`, frozen-worktree provenance), and the
 beads tracker (`br`).
 
@@ -142,17 +142,21 @@ uv run mgr adjudicate -H hyp-braid-dyck-depth-extrapolation --dry-run  # inspect
 uv run mgr adjudicate -H hyp-braid-dyck-depth-extrapolation           # append
 ```
 
-The engine (policy `ci-v5`) is the only writer of verdicts. It refuses weak
+The engine (policy `ci-v6`) is the only writer of verdicts. It refuses weak
 evidence (BLOCKED with machine-readable reasons) rather than soft-ruling; it
 counts **one observation per trained checkpoint** (eval seeds are repeated
 measurements); it groups evidence into equal-FLOPs **budget cohorts** so
 bigger-budget campaigns supersede smaller ones by appending, never editing;
 it downgrades refutations of floored baselines to INCONCLUSIVE
 (`floor_effect`); and it stamps every arm with achieved **power**, a
-one-sided **p-value**, and the **UNDERPOWERED** qualifier when a clean-looking
-verdict came from a test that couldn't have detected the registered effect.
-Run-level reports add Benjamini–Hochberg q-values: the headline is always
-"N supported, of which M survive FDR at q=0.10".
+one-sided **p-value**, and — for **SUPPORTED** arms — the **UNDERPOWERED**
+qualifier when a clean-looking confirmation came from a test that couldn't
+have detected the registered effect. A **REFUTED** arm instead records
+**`refutation_margin`** = |effect − threshold| / CI-half-width (how decisively
+the CI excludes the threshold; > 1 by construction), because the
+power-to-*confirm* lens is the wrong adequacy measure for a refutation
+(ci-v6, bead 4b82). Run-level reports add Benjamini–Hochberg q-values: the
+headline is always "N supported, of which M survive FDR at q=0.10".
 
 Prefer `-H <id>` over `--all` unless you intend a full-ledger re-adjudication:
 `--all` recomputes *every* hypothesis against the grown evidence pool, which
@@ -228,11 +232,14 @@ its honest failure-mode corrections. All artifacts are in-repo.
    prior. The E1 win was real but it measured **sample efficiency**, not the
    **asymptotic** superiority the hypothesis claimed — which is exactly why
    the two are now registered as separate claims (§7,
-   `campaign_preregistration_template.md` §1). The verdict carried a
-   REFUTED-UNDERPOWERED stamp (power is measured against the registered +0.05
-   regardless of the observed sign; the refutation CI excludes the threshold
-   by >3×, so the flag is a conservative asterisk, not a weak verdict — see
-   bead 4b82).
+   `campaign_preregistration_template.md` §1). At adjudication time (ci-v5)
+   the verdict carried a misleading REFUTED-UNDERPOWERED stamp — power is
+   measured against the registered +0.05 regardless of the observed sign, so
+   a decisively-negative result read as 29% power. Bead 4b82 fixed exactly
+   this: under **ci-v6** the UNDERPOWERED qualifier fires on SUPPORTED arms
+   only, and a refutation instead records **`refutation_margin = 3.6×`** (how
+   many CI-half-widths the interval sits past the threshold) — the decisive
+   refutation is no longer mislabeled weak.
 
 Compact second example (`9qk3`, dequantization annealing): theory note →
 operationalized prediction with **variant selectors** (both arms tropical,

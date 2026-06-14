@@ -43,8 +43,15 @@ large.
 
 ## On the UNDERPOWERED qualifier (read this before citing the verdict)
 
-The verdict is stamped **REFUTED-UNDERPOWERED**. This is the ci-v4 power
-gate's *conservatism for an opposite-sign effect*, not a weakness of the
+> **Update (ci-v6, bead 4b82 landed):** the follow-on flagged below was
+> implemented. The ledger entry here stays stamped ci-v5 (append-only history);
+> but under the current engine a re-adjudication of this case produces
+> `refuted, refutation_margin=3.6×, no underpowered` — the UNDERPOWERED
+> qualifier now fires on SUPPORTED arms only, and a refutation records how
+> decisively its CI excludes the threshold instead. The reasoning below is why.
+
+The verdict was stamped **REFUTED-UNDERPOWERED** (under ci-v5). This was the
+power gate's *conservatism for an opposite-sign effect*, not a weakness of the
 refutation:
 
 - The gate computes power to detect the **registered** effect size (+0.05) at

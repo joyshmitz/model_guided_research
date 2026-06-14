@@ -140,11 +140,14 @@ reacting** (look at each arm's per-seed spread, not just the headline n):
   large (−0.245, CI excludes the threshold by >3×) that the refutation was
   decisive at n=8 despite the "29% power" headline.
 
-Power is computed for the registered effect *regardless of observed sign*, so a
-decisively-negative result can still read "underpowered" — see `4b82`
-(sign-aware power adequacy for refutations) and `research_loop.md`; that flag
-is a conservative asterisk, not a weak verdict, when the CI excludes the
-threshold with margin.
+Power is computed for the registered effect *regardless of observed sign*. The
+UNDERPOWERED qualifier (power-to-*confirm* below the floor) is therefore the
+adequacy lens for a **SUPPORTED** verdict only. A **REFUTED** verdict instead
+records **`refutation_margin`** = |effect − threshold| / CI-half-width (how
+decisively the CI excludes the threshold; > 1 by construction) — so a decisive
+refutation is never mislabeled "underpowered" (ci-v6, bead 4b82, which fixed
+exactly the 8h0e braid–Dyck case: REFUTED-UNDERPOWERED@29% under ci-v5 →
+`refuted, refutation_margin=3.6×` under ci-v6).
 
 ## 5. Phase 3 — pre-register the adaptive / stopping rule (the only stopping rule)
 
