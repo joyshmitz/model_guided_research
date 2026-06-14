@@ -3315,6 +3315,24 @@ def _run_certify_checks(
             imag_err = prod[..., 1:].abs().max()
             return float(torch.maximum(scalar_err, imag_err))
 
+        def o_reduces_to_quaternion_measure() -> float:
+            # Reduction-to-a-known-mechanism anchor (bead uvjq / the
+            # new-mechanism gate): octonion (q, 0) elements form a quaternion
+            # subalgebra under Cayley-Dickson, with omul((a,0),(c,0)) ==
+            # (qmul(a,c), 0). So octonion attention restricted to this
+            # subalgebra IS quaternion attention - the exact special case that
+            # makes the mechanism's numbers independently checkable.
+            from nanochat.quaternion_attention_torch import qmul
+
+            a, c, _ = _octs()
+            aq, cq = a[..., :4], c[..., :4]
+            za = torch.cat([aq, torch.zeros_like(aq)], dim=-1)
+            zc = torch.cat([cq, torch.zeros_like(cq)], dim=-1)
+            prod = omul(za, zc)
+            sub_err = (prod[..., :4] - qmul(aq, cq)).abs().max()  # matches qmul on the subalgebra
+            leak_err = prod[..., 4:].abs().max()  # stays in the subalgebra (no leakage into the (0,b) part)
+            return float(torch.maximum(sub_err, leak_err))
+
         add_check("octonion", "omul_norm_multiplicative", "classical", o_norm_mult_measure, tolerance=1e-9)
         add_check("octonion", "omul_alternativity", "classical", o_alternativity_measure, tolerance=1e-9)
         add_check(
@@ -3327,6 +3345,14 @@ def _run_certify_checks(
             detail="associator must be bounded AWAY from zero (guards against an associative shortcut)",
         )
         add_check("octonion", "o_times_conj_is_norm_squared", "classical", o_conj_scalar_measure, tolerance=1e-9)
+        add_check(
+            "octonion",
+            "reduces_to_quaternion_on_subalgebra",
+            "reduction",
+            o_reduces_to_quaternion_measure,
+            tolerance=1e-9,
+            detail="omul on the (q,0) Cayley-Dickson subalgebra == qmul (exact reduction to the quaternion mechanism)",
+        )
 
     # ----- reversible: round-trip + custom-autograd gradient parity -----
     if "reversible" in mechanisms:
@@ -6441,6 +6467,7 @@ _CERTIFY_NAMED_CHECKS: frozenset[str] = frozenset(
         "octonion.omul_alternativity",
         "octonion.omul_nonassociativity_witness",
         "octonion.omul_norm_multiplicative",
+        "octonion.reduces_to_quaternion_on_subalgebra",
         "quaternion.qconj_antihomomorphism",
         "quaternion.qmul_associativity",
         "quaternion.qmul_norm_multiplicative",
