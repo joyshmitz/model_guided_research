@@ -1,0 +1,87 @@
+{
+  "version": "1.0",
+  "generated": "2026-06-14",
+  "generated_by": "bead model_guided_research-2bx",
+  "purpose": "Ready-to-run, FLOPs-annotated nanochat training templates for FAIR mechanism A/B. Each template fixes (model dims, B, T, seed, fairness flags) and records the model's own estimate_flops()/token so equal-budget comparisons are reproducible. See configs/README.md.",
+  "source_of_truth": {
+    "flops_per_token": "nanochat/gpt.py:665 GPT.estimate_flops() (6N rule + 12LHQT attention; 3x block correction for reversible symplectic, bead 7lba)",
+    "canonical_rung": "scripts/run_campaign.py defaults (E1: L4/H4/KV2/D128/seq256/bs8 @ target_flops 1e14)",
+    "parity_basis": "docs/config_parity.md (wyf), docs/data_parity.md (6fl)"
+  },
+  "shared_defaults": {
+    "vocab_size": 50304,
+    "device": "cpu",
+    "optimizer_type": "adamw",
+    "scheduler_type": "none",
+    "learning_rate": 6e-4,
+    "checkpoint_interval": 100000,
+    "_comment": "checkpoint_interval>0 guarantees a final checkpoint (required to evaluate a run; run_campaign.py lesson). device=cpu here for portability; set cuda where available."
+  },
+  "fairness_flags": {
+    "grad_clip_norm": 1.0,
+    "_grad_clip_comment": "ours defaults to OFF; bio_inspired defaults to 1.0. Set 1.0 on every arm of a comparison (HOSS ignores it by design, train.py:1393).",
+    "compile": "match across arms (omit on all, or pass --compile on all). bio_inspired always compiles dynamic=False; ours is opt-in. compile changes throughput, not loss.",
+    "tokens_per_step_rule": "tokens_per_step = batch_size * sequence_len * ddp_world_size; keep identical across arms",
+    "lr_schedule_caveat": "scheduler_type=none holds LR flat (no warmdown). Within-repo A/B is fair; absolute val_ce is not comparable to bio until bead kj8s (--lr-warmdown-ratio) lands."
+  },
+  "flops_reference": {
+    "steps_formula": "est_steps = round(target_flops / (flops_per_token * batch_size * sequence_len * ddp_world_size))",
+    "key_lesson": "Matched MODEL DIMS do NOT give matched FLOPs/token across mechanisms. --target-flops auto-compensates by changing step count. For reversible symplectic the 3x double-backward correction makes equal-FLOPs subtle; prefer matched --max-steps for the strict symplectic contract (gpt.py:686)."
+  },
+  "templates": {
+    "baseline_standard": {
+      "description": "Vanilla baseline. Standard softmax attention at the canonical E1 rung, fixed-FLOPs. This is the reference arm every mechanism is compared against.",
+      "model": {"n_layer": 4, "n_head": 4, "n_kv_head": 2, "n_embd": 128, "sequence_len": 256, "vocab_size": 50304},
+      "train": {"attention_type": "standard", "ffn_type": "standard", "optimizer_type": "adamw", "use_flex_attention": false, "batch_size": 8, "learning_rate": 6e-4, "grad_clip_norm": 1.0, "seed": 42},
+      "horizon": {"mode": "target_flops", "target_flops": 1e14},
+      "measured": {"params": 13598720, "flops_per_token": 4.4532e7, "tokens_per_step": 2048, "est_steps_at_target_flops": 1097},
+      "run_train": "python -m nanochat.train --device cpu --attention-type standard --n-layer 4 --n-head 4 --n-kv-head 2 --n-embd 128 --sequence-len 256 --batch-size 8 --grad-clip-norm 1.0 --target-flops 1e14 --checkpoint-interval 100000 --seed 42 --run-id baseline_standard",
+      "caveats": "None. Reference arm."
+    },
+    "flex_off": {
+      "description": "FlexAttention A/B control: standard attention with the dense SDPA path (use_flex_attention=false). Mathematically identical to flex_on; the pair isolates the FlexAttention kernel's throughput, not its loss.",
+      "model": {"n_layer": 4, "n_head": 4, "n_kv_head": 2, "n_embd": 128, "sequence_len": 256, "vocab_size": 50304},
+      "train": {"attention_type": "standard", "ffn_type": "standard", "optimizer_type": "adamw", "use_flex_attention": false, "batch_size": 8, "learning_rate": 6e-4, "grad_clip_norm": 1.0, "seed": 42},
+      "horizon": {"mode": "target_flops", "target_flops": 1e14},
+      "measured": {"params": 13598720, "flops_per_token": 4.4532e7, "tokens_per_step": 2048, "est_steps_at_target_flops": 1097},
+      "run_train": "python -m nanochat.train --device cuda --attention-type standard --n-layer 4 --n-head 4 --n-kv-head 2 --n-embd 128 --sequence-len 256 --batch-size 8 --grad-clip-norm 1.0 --target-flops 1e14 --checkpoint-interval 100000 --seed 42 --run-id flex_off",
+      "caveats": "Identical estimate_flops() to flex_on (the estimator does not model kernel differences). Compare wall-clock/throughput, not loss."
+    },
+    "flex_on": {
+      "description": "FlexAttention A/B treatment: standard attention via the compiled FlexAttention kernel (torch>=2.5, CUDA). Skips cleanly to the dense path where unavailable.",
+      "model": {"n_layer": 4, "n_head": 4, "n_kv_head": 2, "n_embd": 128, "sequence_len": 256, "vocab_size": 50304},
+      "train": {"attention_type": "standard", "ffn_type": "standard", "optimizer_type": "adamw", "use_flex_attention": true, "compile_flex_attention": true, "batch_size": 8, "learning_rate": 6e-4, "grad_clip_norm": 1.0, "seed": 42},
+      "horizon": {"mode": "target_flops", "target_flops": 1e14},
+      "measured": {"params": 13598720, "flops_per_token": 4.4532e7, "tokens_per_step": 2048, "est_steps_at_target_flops": 1097},
+      "run_train": "python -m nanochat.train --device cuda --attention-type standard --use-flex-attention --n-layer 4 --n-head 4 --n-kv-head 2 --n-embd 128 --sequence-len 256 --batch-size 8 --grad-clip-norm 1.0 --target-flops 1e14 --checkpoint-interval 100000 --seed 42 --run-id flex_on",
+      "caveats": "Requires torch>=2.5 + CUDA; on CPU/older torch the flag is ignored and the dense path runs (see scripts/verify_flex_correctness.py, docs/flex_attention_edge_cases.md)."
+    },
+    "math_hybrid_tropical": {
+      "description": "Math-demo hybrid: tropical (max-plus) attention + tropical FFN — the certified 1-Lipschitz chain (8gk.8). Same dims/budget as baseline so the comparison is clean.",
+      "model": {"n_layer": 4, "n_head": 4, "n_kv_head": 2, "n_embd": 128, "sequence_len": 256, "vocab_size": 50304},
+      "train": {"attention_type": "tropical", "ffn_type": "tropical", "optimizer_type": "adamw", "use_flex_attention": false, "batch_size": 8, "learning_rate": 6e-4, "grad_clip_norm": 1.0, "seed": 42},
+      "horizon": {"mode": "target_flops", "target_flops": 1e14},
+      "measured": {"params": 13601280, "flops_per_token": 4.4547e7, "tokens_per_step": 2048, "est_steps_at_target_flops": 1096},
+      "run_train": "python -m nanochat.train --device cpu --attention-type tropical --ffn-type tropical --n-layer 4 --n-head 4 --n-kv-head 2 --n-embd 128 --sequence-len 256 --batch-size 8 --grad-clip-norm 1.0 --target-flops 1e14 --checkpoint-interval 100000 --seed 42 --run-id math_hybrid_tropical",
+      "caveats": "flops_per_token ~ baseline (+0.03%) at matched dims; equal-FLOPs holds cleanly. Optional Maslov smoothing via --semiring-beta / --ffn-beta (None = exact tropical endpoint)."
+    },
+    "math_reversible_symplectic": {
+      "description": "Math-demo hybrid demonstrating the FLOPs-budgeting caveat: reversible-symplectic blocks carry a 3x double-backward FLOPs charge (bead 7lba), so equal-target-FLOPs trains FEWER steps than standard.",
+      "model": {"n_layer": 4, "n_head": 4, "n_kv_head": 2, "n_embd": 128, "sequence_len": 256, "vocab_size": 50304},
+      "train": {"attention_type": "reversible", "reversible_mode": "symplectic", "optimizer_type": "adamw", "use_flex_attention": false, "batch_size": 8, "learning_rate": 6e-4, "grad_clip_norm": 1.0, "seed": 42},
+      "horizon": {"mode": "max_steps", "max_steps": 1097, "_comment": "match STEPS to baseline for the strict symplectic equal-compute contract (gpt.py:686), rather than target_flops"},
+      "measured": {"params": 13107720, "flops_per_token": 4.7490e7, "tokens_per_step": 2048, "est_steps_at_target_flops": 1028},
+      "run_train": "python -m nanochat.train --device cpu --attention-type reversible --reversible-mode symplectic --n-layer 4 --n-head 4 --n-kv-head 2 --n-embd 128 --sequence-len 256 --batch-size 8 --grad-clip-norm 1.0 --max-steps 1097 --checkpoint-interval 100000 --seed 42 --run-id math_reversible_symplectic",
+      "caveats": "At target_flops 1e14 this trains ~1028 steps vs baseline's ~1097 (it is dearer/token). For a fair symplectic A/B, match --max-steps instead of --target-flops. reversible additive is the opposite (cheaper/token, ~1180 steps at 1e14)."
+    },
+    "cpu_smoke": {
+      "description": "Fast deterministic smoke (not a fixed-FLOPs comparison): 20 steps on CPU. Use to verify the pipeline runs end-to-end before launching a real budget. A 2e9 FLOPs budget would be <1 step at this model size, so the smoke uses --max-steps.",
+      "model": {"n_layer": 4, "n_head": 4, "n_kv_head": 2, "n_embd": 128, "sequence_len": 256, "vocab_size": 50304},
+      "train": {"attention_type": "standard", "ffn_type": "standard", "optimizer_type": "adamw", "use_flex_attention": false, "batch_size": 8, "learning_rate": 6e-4, "grad_clip_norm": 1.0, "seed": 42},
+      "horizon": {"mode": "max_steps", "max_steps": 20},
+      "measured": {"params": 13598720, "flops_per_token": 4.4532e7, "tokens_per_step": 2048, "est_total_flops_at_20_steps": 1.82e12},
+      "run_train": "python -m nanochat.train --device cpu --attention-type standard --n-layer 4 --n-head 4 --n-kv-head 2 --n-embd 128 --sequence-len 256 --batch-size 8 --max-steps 20 --checkpoint-interval 100000 --seed 42 --run-id cpu_smoke",
+      "caveats": "Smoke only. Requires >=2 dataset shards present (train.py:865) or pass --data-dir to a local corpus."
+    }
+  }
+}
