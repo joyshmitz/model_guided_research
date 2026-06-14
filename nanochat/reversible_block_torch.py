@@ -234,15 +234,12 @@ class ReversibleFunction(torch.autograd.Function):
         y1, y2 = torch.chunk(y, 2, dim=-1)
         dy1, dy2 = torch.chunk(grad_y, 2, dim=-1)
 
-        # Reconstruct x
+        # Reconstruct x2 (the only input the gradient computation below needs).
+        # x1 = y1 - F(x2) is never used here, so its extra F forward is skipped;
+        # the requires_grad below is set on the detached clones, not these.
         with torch.no_grad():
             g_out = g_module(y1)
             x2 = y2 - g_out
-            f_out = f_module(x2, cos_sin, kv_cache)
-            x1 = y1 - f_out
-
-        x1.requires_grad = True
-        x2.requires_grad = True
 
         # Now recompute gradients
         # Backward G
