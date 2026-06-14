@@ -47,9 +47,14 @@ MECHS = [
 
 def _build_block(attention_type: str, ffn_type: str, n_embd: int, n_head: int, n_kv_head: int, seq: int):
     cfg = GPTConfig(
-        sequence_len=seq, vocab_size=50304, n_layer=1,
-        n_head=n_head, n_kv_head=n_kv_head, n_embd=n_embd,
-        attention_type=attention_type, ffn_type=ffn_type,
+        sequence_len=seq,
+        vocab_size=50304,
+        n_layer=1,
+        n_head=n_head,
+        n_kv_head=n_kv_head,
+        n_embd=n_embd,
+        attention_type=attention_type,
+        ffn_type=ffn_type,
     )
     with contextlib.redirect_stdout(io.StringIO()):
         model = GPT(cfg)
@@ -72,8 +77,9 @@ def _time(fn, *, warmup: int, iters: int, device: str) -> float:
     return sorted(ts)[len(ts) // 2] * 1000.0  # median ms
 
 
-def bench_op(kind: str, label: str, attn_t: str, ffn_t: str, *, B, T, n_embd, n_head, n_kv_head,
-             dtype, device, warmup, iters):
+def bench_op(
+    kind: str, label: str, attn_t: str, ffn_t: str, *, B, T, n_embd, n_head, n_kv_head, dtype, device, warmup, iters
+):
     torch.manual_seed(0)
     block, cos_sin = _build_block(attn_t, ffn_t, n_embd, n_head, n_kv_head, T)
     block = block.to(device=device, dtype=dtype)
@@ -100,10 +106,19 @@ def bench_op(kind: str, label: str, attn_t: str, ffn_t: str, *, B, T, n_embd, n_
     score_elems = B * n_head * T * T
     interm = score_elems * (head_dim if (kind == "attn" and attn_t == "tropical") else 1)
     return {
-        "op": kind, "mech": label, "attn_type": attn_t, "ffn_type": ffn_t,
-        "B": B, "T": T, "n_embd": n_embd, "n_head": n_head, "head_dim": head_dim,
-        "dtype": str(dtype).replace("torch.", ""), "device": device,
-        "ms_fwd": round(ms_fwd, 4), "ms_fwd_bwd": round(ms_fb, 4),
+        "op": kind,
+        "mech": label,
+        "attn_type": attn_t,
+        "ffn_type": ffn_t,
+        "B": B,
+        "T": T,
+        "n_embd": n_embd,
+        "n_head": n_head,
+        "head_dim": head_dim,
+        "dtype": str(dtype).replace("torch.", ""),
+        "device": device,
+        "ms_fwd": round(ms_fwd, 4),
+        "ms_fwd_bwd": round(ms_fb, 4),
         "peak_intermediate_elems": interm,
     }
 
@@ -132,15 +147,28 @@ def main() -> int:
     for T in seqs:
         for kind in ("attn", "ffn"):
             for label, attn_t, ffn_t in MECHS:
-                rows.append(bench_op(
-                    kind, label, attn_t, ffn_t,
-                    B=args.batch_size, T=T, n_embd=args.n_embd, n_head=args.n_head,
-                    n_kv_head=args.n_kv_head, dtype=dtype, device=args.device,
-                    warmup=args.warmup, iters=args.iters,
-                ))
+                rows.append(
+                    bench_op(
+                        kind,
+                        label,
+                        attn_t,
+                        ffn_t,
+                        B=args.batch_size,
+                        T=T,
+                        n_embd=args.n_embd,
+                        n_head=args.n_head,
+                        n_kv_head=args.n_kv_head,
+                        dtype=dtype,
+                        device=args.device,
+                        warmup=args.warmup,
+                        iters=args.iters,
+                    )
+                )
 
-    table = Table(title=f"per-op microbench — {args.device}/{args.dtype} "
-                        f"(B={args.batch_size}, D={args.n_embd}, H={args.n_head})", border_style="cyan")
+    table = Table(
+        title=f"per-op microbench — {args.device}/{args.dtype} (B={args.batch_size}, D={args.n_embd}, H={args.n_head})",
+        border_style="cyan",
+    )
     for col in ("op", "mech", "T", "ms_fwd", "ms_fwd+bwd", "peak_interm_elems", "vs_standard"):
         table.add_column(col, justify="right" if col not in ("op", "mech") else "left")
     # relative slowdown vs the standard arm of the same (op,T)
@@ -149,17 +177,31 @@ def main() -> int:
         b = base.get((r["op"], r["T"]))
         rel = f"{r['ms_fwd_bwd'] / b:.2f}x" if b else "-"
         style = "yellow" if (b and r["ms_fwd_bwd"] / b > 1.5) else ""
-        table.add_row(r["op"], r["mech"], str(r["T"]), f"{r['ms_fwd']:.2f}",
-                      f"{r['ms_fwd_bwd']:.2f}", f"{r['peak_intermediate_elems']:,}",
-                      f"[{style}]{rel}[/{style}]" if style else rel)
+        table.add_row(
+            r["op"],
+            r["mech"],
+            str(r["T"]),
+            f"{r['ms_fwd']:.2f}",
+            f"{r['ms_fwd_bwd']:.2f}",
+            f"{r['peak_intermediate_elems']:,}",
+            f"[{style}]{rel}[/{style}]" if style else rel,
+        )
     console.print(table)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "config": {"device": args.device, "dtype": args.dtype, "B": args.batch_size,
-                   "n_embd": args.n_embd, "n_head": args.n_head, "n_kv_head": args.n_kv_head,
-                   "seqs": seqs, "warmup": args.warmup, "iters": args.iters},
+        "config": {
+            "device": args.device,
+            "dtype": args.dtype,
+            "B": args.batch_size,
+            "n_embd": args.n_embd,
+            "n_head": args.n_head,
+            "n_kv_head": args.n_kv_head,
+            "seqs": seqs,
+            "warmup": args.warmup,
+            "iters": args.iters,
+        },
         "rows": rows,
     }
     out.write_text(json.dumps(payload, indent=2))
