@@ -72,7 +72,6 @@ class OrdinalLRScheduler:
                 # Decay LR
                 for param_group in self.optimizer.param_groups:
                     param_group["lr"] = max(self.min_lr, param_group["lr"] * self.gamma)
-                    param_group["lr"]
                 # Reset best loss to allow new exploration (JAX: "reset best metric")
                 self.best_loss = float("inf")
 

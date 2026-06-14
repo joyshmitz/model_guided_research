@@ -175,9 +175,16 @@ def measure_activation_scale(
     # reversible halves query heads and needs even head count; round to even
     if attention_type == "reversible" and heads % 2 == 1:
         heads += 1
+    # n_kv_head must divide n_head (GPTConfig invariant). Aim for ~half the
+    # heads to exercise GQA, then walk down to the nearest divisor of n_head -
+    # heads//2 does NOT divide odd head counts >= 5 (e.g. width=80 -> heads=5
+    # -> kv=2 -> 5 % 2 != 0), which would otherwise crash the coordinate check.
     kv = max(1, heads // 2)
+    while heads % kv != 0:
+        kv -= 1
     if attention_type == "reversible":
-        # n_kv_head must divide n_head//2
+        # reversible's inner attention runs on heads//2 query heads, so
+        # n_kv_head must additionally divide heads//2.
         half = heads // 2
         kv = max(1, half)
         while half % kv != 0:
