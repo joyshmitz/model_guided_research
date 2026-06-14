@@ -3197,6 +3197,36 @@ def _run_certify_checks(
             detail="recorded gamma vs sort-based runner-up gap (+ count of inf mismatches)",
         )
 
+        def trop_endpoint_measure() -> float:
+            # Reduction to the known special case (bead uvjq): finite-beta
+            # (Maslov) tropical attention converges to the EXACT (beta=None)
+            # tropical endpoint, with |y_beta - y_inf|_inf bounded by the
+            # LSE-max sandwich (log D + log m)/beta (thm-lse-max-sandwich). The
+            # measure is the gap as a fraction of the bound (<= 1). fp64: the
+            # inequality is exact in real arithmetic.
+            torch.manual_seed(seed)
+            qd = torch.randn(1, 2, 8, 16, dtype=torch.float64, device=device)
+            kd = torch.randn(1, 2, 8, 16, dtype=torch.float64, device=device)
+            vd = torch.randn(1, 2, 8, 16, dtype=torch.float64, device=device)
+            y_inf, _ = tropical_max_plus_attention(
+                qd, kd, vd, gauge_fix=False, score_center=True, return_margins=False, beta=None
+            )
+            beta = 32.0
+            y_b, _ = tropical_max_plus_attention(
+                qd, kd, vd, gauge_fix=False, score_center=True, return_margins=False, beta=beta
+            )
+            bound = (math.log(qd.size(-1)) + math.log(kd.size(2))) / beta
+            return float((y_b - y_inf).abs().max() / bound)
+
+        add_check(
+            "tropical",
+            "maslov_endpoint_within_sandwich",
+            "reduction",
+            trop_endpoint_measure,
+            tolerance=1.0 + 1e-6,
+            detail="finite-beta tropical attention -> exact tropical endpoint, gap within the LSE-max sandwich",
+        )
+
         # --- tropical FFN (bead 8gk.8): the certified chain's MLP piece ---
         def _ffn_tiny(ffn_type: str, dtype_=None):
             from nanochat.gpt import GPTConfig as _Cfg
@@ -6489,6 +6519,7 @@ _CERTIFY_NAMED_CHECKS: frozenset[str] = frozenset(
         "tropical.lipschitz_1_sup_norm_q",
         "tropical.lipschitz_1_sup_norm_v",
         "tropical.margin_matches_bruteforce",
+        "tropical.maslov_endpoint_within_sandwich",
         "tropical.score_center_pure_gauge_shift",
         "ultrametric.strong_triangle_inequality_lcp",
     }
